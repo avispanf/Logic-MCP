@@ -1263,24 +1263,29 @@ def keys_send(command: str, repeat: int = 1) -> dict:
 
 @tool
 def transport(action: str) -> dict:
-    """Drive Logic's transport. Actions: play_stop toggles playback, stop returns to the
-    start, go_to_start moves the playhead to bar one, cycle toggles the cycle region.
-    Playback state is not readable from here, so a toggle is a toggle."""
+    """Drive Logic's transport by pressing the real Control Bar buttons and reporting the
+    state each one reported. Actions: play, stop, go_to_start, restart, cycle. Logic swaps
+    the Go to Beginning button for a Stop button while playing, so play and stop are
+    separate buttons rather than one toggle, and the button that is not currently present
+    will report that it could not be found."""
     mapping = {
-        "play_stop": ["play_stop"],
-        "stop": ["play_stop"],
-        "go_to_start": ["go_to_start"],
-        "restart": ["go_to_start", "play_stop"],
-        "cycle": ["cycle"],
+        "play": [("press", "Play")],
+        "stop": [("press", "Stop")],
+        "play_stop": [("press", "Play")],
+        "go_to_start": [("press", "Go to Beginning")],
+        "restart": [("press", "Go to Beginning"), ("press", "Play")],
+        "cycle": [("press", "Cycle")],
     }
     if action not in mapping:
         return {"ok": False, "error": f"unknown action, expected one of {sorted(mapping)}"}
-    for step in mapping[action]:
-        result = keys_send(step)
+    sent = []
+    for _, button in mapping[action]:
+        result = transport_press(button)
+        sent.append({"button": button, **{k: result[k] for k in ("ok", "before", "after", "changed") if k in result}})
         if not result.get("ok"):
-            return result
-        time.sleep(0.15)
-    return {"ok": True, "action": action, "sent": mapping[action]}
+            return {"ok": False, "action": action, "sent": sent, "error": result.get("error")}
+        time.sleep(0.2)
+    return {"ok": True, "action": action, "sent": sent}
 
 
 @tool
@@ -1300,20 +1305,58 @@ def meter_watch(
     paths: list,
     seconds: float = 8.0,
     interval: float = 0.5,
+    expect_plugin: str = "",
 ) -> dict:
     """Poll named control paths in an open plugin window over a period of time and report
-    the series plus the minimum, maximum and final value of each. Use it while transport is
-    running to capture meter readings, which are only populated when audio flows."""
+    the series plus the minimum, maximum and final value of each. Every path is resolved
+    once before polling starts and an unresolvable path is reported as an error rather than
+    as an empty reading, because a silent meter and a wrong window look identical
+    otherwise. Pass expect_plugin to assert which plugin the window should hold; the call
+    fails closed if the window holds something else, which happens whenever Logic reorders
+    or closes plugin editors."""
     process = require_logic()
     if not paths:
         return {"ok": False, "error": "give at least one path from plugin_snapshot"}
-    references = {}
+    try:
+        title = osa(
+            f'tell application "System Events" to tell process "{process}" to '
+            f"return name of window {int(window_index)} as string"
+        )
+    except ProbeError as exc:
+        return {"ok": False, "error": f"window {window_index} does not resolve: {exc}"}
+    if expect_plugin:
+        snapshot = plugin_snapshot(int(window_index), max_depth=3, seconds=20)
+        found = snapshot.get("plugin", "")
+        if expect_plugin.lower() not in found.lower():
+            return {
+                "ok": False,
+                "error": f"window {window_index} holds {found!r}, not {expect_plugin!r}",
+                "window_title": title,
+                "advice": "plugin editors move and close, especially with an MCU surface "
+                "attached. Re-read ax_windows and plugin_snapshot before polling",
+            }
+    references, unresolved = {}, {}
     for path in paths:
         text = str(path)
         if not all(part.strip().isdigit() for part in text.split(".") if part.strip()):
-            return {"ok": False, "error": f"path must be dotted integers, got {text!r}"}
-        references[text] = element_reference(text, int(window_index))
+            unresolved[text] = "path must be dotted integers"
+            continue
+        reference = element_reference(text, int(window_index))
+        try:
+            read_value(process, reference)
+            references[text] = reference
+        except ProbeError as exc:
+            unresolved[text] = str(exc)
+    if not references:
+        return {
+            "ok": False,
+            "error": "no path resolved in this window",
+            "window_index": window_index,
+            "window_title": title,
+            "unresolved": unresolved,
+        }
     series: dict[str, list] = {path: [] for path in references}
+    errors: dict[str, int] = {path: 0 for path in references}
     deadline = time.time() + max(0.5, min(float(seconds), 120.0))
     tick = max(0.1, float(interval))
     samples = 0
@@ -1323,6 +1366,7 @@ def meter_watch(
                 series[path].append(read_value(process, reference))
             except ProbeError:
                 series[path].append("")
+                errors[path] += 1
         samples += 1
         time.sleep(tick)
     summary = {}
@@ -1330,12 +1374,21 @@ def meter_watch(
         numbers = [n for n in (as_number(v) for v in values) if n is not None]
         summary[path] = {
             "samples": len(values),
+            "read_errors": errors[path],
             "final": values[-1] if values else "",
-            "min": f"{min(numbers):g}" if numbers else "",
-            "max": f"{max(numbers):g}" if numbers else "",
+            "min": f"{min(numbers):g}" if numbers else None,
+            "max": f"{max(numbers):g}" if numbers else None,
+            "moved": bool(numbers) and len(set(numbers)) > 1,
             "series": values[:40],
         }
-    return {"window_index": window_index, "samples": samples, "meters": summary}
+    return {
+        "ok": True,
+        "window_index": window_index,
+        "window_title": title,
+        "samples": samples,
+        "unresolved": unresolved,
+        "meters": summary,
+    }
 
 
 @tool
@@ -1346,6 +1399,459 @@ def window_find(title_contains: str) -> dict:
     needle = title_contains.lower()
     matches = [w for w in listing["windows"] if needle in w["title"].lower()]
     return {"query": title_contains, "matches": matches, "total_windows": listing["count"]}
+
+
+@tool
+def ax_press(path: str, window_index: int = 1, settle: float = 0.6) -> dict:
+    """Press any accessibility element addressed by its dotted path and report the window
+    list before and after, so the effect of the press is visible. Pressing an insert slot
+    in the mixer is how a plugin editor is opened without touching the mouse."""
+    process = require_logic()
+    if not all(part.strip().isdigit() for part in path.split(".") if part.strip()):
+        return {"ok": False, "error": f"path must be dotted integers, got {path!r}"}
+    reference = element_reference(path, int(window_index))
+    try:
+        role = osa(
+            f'tell application "System Events" to tell process "{process}" to '
+            f"return role of {reference} as string"
+        )
+    except ProbeError as exc:
+        return {"ok": False, "error": f"path does not resolve: {exc}"}
+    before = ax_windows()
+    try:
+        osa(
+            f'tell application "System Events" to tell process "{process}" to '
+            f'perform action "AXPress" of {reference}',
+            timeout=30,
+        )
+    except ProbeError as exc:
+        return {"ok": False, "error": f"press failed: {exc}", "role": role}
+    time.sleep(max(0.1, min(float(settle), 5.0)))
+    after = ax_windows()
+    opened = [w for w in after["windows"] if w["title"] not in {b["title"] for b in before["windows"]}]
+    closed = [w for w in before["windows"] if w["title"] not in {a["title"] for a in after["windows"]}]
+    return {
+        "ok": True,
+        "path": path,
+        "role": role,
+        "windows_before": before["count"],
+        "windows_after": after["count"],
+        "opened": opened,
+        "closed": closed,
+    }
+
+
+def parse_db(text: str):
+    match = re.search(r"(-?[\d.,]+)\s*dB", text or "")
+    if not match:
+        return None
+    return as_number(match.group(1))
+
+
+NON_SEND_DESCRIPTIONS = (
+    "insert bar",
+    "audio plug-in",
+    "midi plug-in",
+    "send button",
+    "name",
+    "mute",
+    "solo",
+    "record",
+    "monitoring",
+    "volume fader",
+    "volume fader level",
+    "peak level meter",
+    "pan",
+    "group",
+)
+
+
+def is_automation(text: str) -> bool:
+    return bool(text) and text.split(",")[0].strip() in (
+        "Read",
+        "Write",
+        "Touch",
+        "Latch",
+        "Trim",
+        "Off",
+    )
+
+
+DESTRUCTIVE_MENU_WORDS = (
+    "delete",
+    "remove",
+    "clear",
+    "erase",
+    "quit",
+    "revert",
+    "close project",
+    "empty",
+    "reset",
+    "restore",
+    "replace",
+    "overwrite",
+)
+
+
+def menu_reference(path: list) -> str:
+    if not path:
+        raise ProbeError("menu path is empty")
+    reference = f'menu bar item "{path[0]}" of menu bar 1'
+    for title in path[1:]:
+        reference = f'menu item "{title}" of menu 1 of {reference}'
+    return reference
+
+
+@tool
+def menu_list(path: list = None) -> dict:
+    """List Logic's menus. With no path it returns the menu bar titles; with a path such as
+    ["Logic Pro", "Control Surfaces"] it returns the items inside that menu, marking which
+    ones open a submenu and which are currently enabled. Menu titles carry typographic
+    ellipses and other characters that are easy to mistype, so read them here rather than
+    assuming."""
+    process = require_logic()
+    path = list(path or [])
+    if not path:
+        raw = osa(
+            f'tell application "System Events" to tell process "{process}"\n'
+            'set out to ""\n'
+            "repeat with mbi in menu bar items of menu bar 1\n"
+            "try\n"
+            'set out to out & (name of mbi as string) & "|:|"\n'
+            "end try\n"
+            "end repeat\n"
+            "return out\n"
+            "end tell"
+        )
+        return {"level": "menu bar", "items": split_records(raw)}
+    reference = menu_reference(path)
+    try:
+        raw = osa(
+            f'tell application "System Events" to tell process "{process}"\n'
+            'set out to ""\n'
+            f"repeat with mi in menu items of menu 1 of {reference}\n"
+            "try\n"
+            "set nm to (name of mi as string)\n"
+            "on error\n"
+            'set nm to "-"\n'
+            "end try\n"
+            "set sub to 0\n"
+            "try\n"
+            "if (count of menus of mi) > 0 then set sub to 1\n"
+            "end try\n"
+            "set en to 0\n"
+            "try\n"
+            "if enabled of mi then set en to 1\n"
+            "end try\n"
+            'set mk to ""\n'
+            "try\n"
+            "set mk to (value of attribute \"AXMenuItemMarkChar\" of mi) as string\n"
+            "end try\n"
+            'set out to out & nm & "~" & (sub as string) & "~" & (en as string) & "~" & mk & "|:|"\n'
+            "end repeat\n"
+            "return out\n"
+            "end tell",
+            timeout=30,
+        )
+    except ProbeError as exc:
+        return {"error": f"menu path {path} does not resolve: {exc}"}
+    items = []
+    for record in split_records(raw):
+        parts = (record.split("~") + ["", "", "", ""])[:4]
+        mark = clean(parts[3])
+        items.append(
+            {
+                "title": parts[0],
+                "submenu": parts[1] == "1",
+                "enabled": parts[2] == "1",
+                "checked": bool(mark),
+            }
+        )
+    return {
+        "level": " > ".join(path),
+        "count": len(items),
+        "items": [i for i in items if i["title"] != "missing value"],
+        "separators": sum(1 for i in items if i["title"] == "missing value"),
+    }
+
+
+@tool
+def menu_click(path: list, allow_destructive: bool = False) -> dict:
+    """Click a Logic menu item addressed by its full path, for example
+    ["Logic Pro", "Control Surfaces", "Setup..."]. Items whose titles suggest a destructive
+    action are refused unless allow_destructive is set, because a mistyped menu path can
+    land on a neighbouring item. Read exact titles with menu_list first."""
+    process = require_logic()
+    path = list(path or [])
+    if not path:
+        return {"ok": False, "error": "menu path is empty"}
+    target = path[-1].lower()
+    if not allow_destructive and any(word in target for word in DESTRUCTIVE_MENU_WORDS):
+        return {
+            "ok": False,
+            "refused": True,
+            "path": path,
+            "error": f"{path[-1]!r} looks destructive; pass allow_destructive to proceed",
+        }
+    reference = menu_reference(path)
+    before = ax_windows()
+    try:
+        osa(
+            f'tell application "{process}" to activate\n'
+            "delay 0.2\n"
+            f'tell application "System Events" to tell process "{process}" to '
+            f"click {reference}",
+            timeout=30,
+        )
+    except ProbeError as exc:
+        return {"ok": False, "error": f"click failed: {exc}", "path": path}
+    time.sleep(0.8)
+    after = ax_windows()
+    opened = [w for w in after["windows"] if w["title"] not in {b["title"] for b in before["windows"]}]
+    return {
+        "ok": True,
+        "path": path,
+        "windows_before": before["count"],
+        "windows_after": after["count"],
+        "opened": opened,
+    }
+
+
+SURFACE_BYPASS_PATH = ["Logic Pro", "Control Surfaces", "Bypass All Control Surfaces"]
+
+
+def read_menu_item(path: list) -> dict:
+    parent = menu_list(path[:-1])
+    if "error" in parent:
+        return parent
+    for item in parent.get("items", []):
+        if item["title"] == path[-1]:
+            return item
+    return {"error": f"{path[-1]!r} not found under {' > '.join(path[:-1])}"}
+
+
+@tool
+def surfaces_bypass(state: str = "read") -> dict:
+    """Read or set Logic's Bypass All Control Surfaces switch, which silences every control
+    surface including the MCU without disturbing its port assignment. State is read, on to
+    bypass surfaces, off to re-enable them, or toggle. Because the port assignment is left
+    intact, re-enabling does not need Logic to be restarted the way re-assigning ports does.
+    Bypassing is worth doing during heavy manual editing, when the constant feedback traffic
+    to a surface is unwanted."""
+    if state not in ("read", "on", "off", "toggle"):
+        return {"ok": False, "error": "state must be read, on, off or toggle"}
+    require_logic()
+    item = read_menu_item(SURFACE_BYPASS_PATH)
+    if "error" in item:
+        return {"ok": False, **item}
+    bypassed = item["checked"]
+    if state == "read":
+        return {"ok": True, "bypassed": bypassed, "surfaces_active": not bypassed}
+    wanted = (not bypassed) if state == "toggle" else (state == "on")
+    if wanted == bypassed:
+        return {
+            "ok": True,
+            "bypassed": bypassed,
+            "surfaces_active": not bypassed,
+            "changed": False,
+            "note": "already in the requested state",
+        }
+    clicked = menu_click(SURFACE_BYPASS_PATH)
+    if not clicked.get("ok"):
+        return {"ok": False, "error": clicked.get("error"), "bypassed": bypassed}
+    time.sleep(0.4)
+    after = read_menu_item(SURFACE_BYPASS_PATH)
+    if "error" in after:
+        return {"ok": False, "error": "clicked but could not read the state back"}
+    return {
+        "ok": after["checked"] == wanted,
+        "verified": after["checked"] == wanted,
+        "bypassed": after["checked"],
+        "surfaces_active": not after["checked"],
+        "changed": after["checked"] != bypassed,
+        "requested": state,
+    }
+
+
+def locate_mixer(process: str, hint: str = "") -> dict:
+    if hint:
+        try:
+            role = osa(
+                f'tell application "System Events" to tell process "{process}" to '
+                f"return role of {element_reference(hint, 1)} as string"
+            )
+            if role == "AXLayoutArea":
+                return {"found": True, "path": hint, "source": "hint"}
+        except ProbeError:
+            pass
+    try:
+        elements = walk_window(process, 1, 2, budget=600, seconds=30)
+    except ProbeError as exc:
+        return {"found": False, "reason": f"could not read the main window: {exc}"}
+    areas = [
+        e
+        for e in elements
+        if e["role"] == "AXLayoutArea" and "mixer" in (e["description"] or "").lower()
+    ]
+    if not areas:
+        panes = [e for e in elements if "mixer" in (e["description"] or "").lower()]
+        return {
+            "found": False,
+            "reason": "no mixer layout area in the main window",
+            "mixer_like_elements": [{"path": e["path"], "role": e["role"], "description": e["description"]} for e in panes[:6]],
+            "advice": "open the Mixer pane in Logic, for example with keys_send toggle_mixer, "
+            "then try again",
+        }
+    best = None
+    for area in areas:
+        try:
+            count = osa(
+                f'tell application "System Events" to tell process "{process}" to '
+                f"return count of UI elements of {element_reference(area['path'], 1)} as string",
+                timeout=15,
+            )
+            strips = int(float(count.replace(",", ".")))
+        except (ProbeError, ValueError):
+            strips = 0
+        if best is None or strips > best[1]:
+            best = (area["path"], strips)
+    if best is None or best[1] == 0:
+        return {"found": False, "reason": "mixer area found but it holds no channel strips"}
+    return {"found": True, "path": best[0], "strip_count": best[1], "source": "discovered"}
+
+
+@tool
+def mixer_locate(hint: str = "") -> dict:
+    """Find where the Mixer pane currently sits in the main window's accessibility tree.
+    Element indices shift whenever Logic's layout changes or the application restarts, so
+    a path that worked earlier can silently point at nothing. Every mixer tool calls this
+    unless given an explicit path."""
+    return locate_mixer(require_logic(), hint)
+
+
+def parse_strip(label: str, path: str, kids: list) -> dict:
+    row: dict = {"path": path, "name": label}
+    send_levels, output = [], None
+    bars = [i for i, k in enumerate(kids) if k["description"] == "insert bar"]
+    first_bar = min(bars) if bars else len(kids)
+    sends, inserts = [], []
+    for position, kid in enumerate(kids):
+        what = (kid["description"] or "").strip()
+        role = kid["role"]
+        if what == "name" and kid["value"]:
+            row["name"] = kid["value"]
+        elif what == "volume fader":
+            row["fader_raw"] = kid["value"]
+        elif what == "volume fader level":
+            row["fader_db"] = parse_db(kid["name"])
+        elif what == "pan":
+            row["pan"] = as_number(kid["value"])
+        elif what == "peak level meter":
+            row["clipping"] = "clipping off" not in (kid["value"] or "")
+        elif what in ("mute", "solo", "record", "monitoring"):
+            row[what] = kid["value"]
+        elif is_automation(what):
+            row["automation"] = what.split(",")[0].strip()
+        elif role == "AXSlider" and what == "send knob":
+            send_levels.append(kid["value"])
+        elif role == "AXGroup" and what and not is_automation(what):
+            (sends if position < first_bar else inserts).append(what)
+        elif role == "AXButton" and what and what not in NON_SEND_DESCRIPTIONS:
+            output = output or what
+    row["sends"] = [
+        {"bus": bus, "level": send_levels[i] if i < len(send_levels) else None}
+        for i, bus in enumerate(sends)
+    ]
+    row["inserts"] = inserts
+    row["output"] = output
+    return row
+
+
+@tool
+def mixer_strips(mixer_path: str = "") -> dict:
+    """List the channel strips in the open Mixer with their names and paths, without
+    reading their contents. This is the cheap index that mixer_survey walks through, and
+    it is how the size of the job is known before starting it. The mixer is located
+    automatically unless a path is given, because element indices move between sessions."""
+    process = require_logic()
+    located = locate_mixer(process, mixer_path)
+    if not located.get("found"):
+        return located
+    mixer_path = located["path"]
+    elements = walk_window(process, 1, 1, budget=400, seconds=25, root=mixer_path)
+    strips = [
+        {"index": i, "path": e["path"], "name": e["description"] or e["name"]}
+        for i, e in enumerate(elements)
+        if e["role"] == "AXLayoutItem"
+    ]
+    return {
+        "mixer_path": mixer_path,
+        "located_by": located.get("source"),
+        "count": len(strips),
+        "strips": strips,
+    }
+
+
+@tool
+def mixer_survey(
+    offset: int = 0,
+    strip_limit: int = 12,
+    mixer_path: str = "",
+    total_seconds: int = 150,
+    per_strip_seconds: int = 12,
+) -> dict:
+    """Survey channel strips in the open Mixer: name, fader level in decibels, pan, mute
+    and solo, whether the peak meter shows clipping, the output bus, sends with their
+    buses, and the insert chain. Each strip is walked on its own, so offset genuinely skips
+    work and a large mixer can be read in slices without re-reading what came before. The
+    Mixer pane must be visible. Strips that overrun their allowance are reported as
+    incomplete rather than returned half-parsed."""
+    process = require_logic()
+    index = mixer_strips(mixer_path)
+    if not index.get("count"):
+        return index
+    strips = index["strips"]
+    window = strips[int(offset) : int(offset) + int(strip_limit)]
+    deadline = time.time() + max(15, min(int(total_seconds), 600))
+    report, incomplete = [], []
+    for strip in window:
+        remaining = deadline - time.time()
+        if remaining <= 4:
+            incomplete.append({**strip, "reason": "survey deadline reached"})
+            continue
+        allowance = int(min(max(4, remaining - 2), int(per_strip_seconds)))
+        try:
+            kids = walk_window(
+                process, 1, 1, budget=300, seconds=allowance, root=strip["path"]
+            )
+        except ProbeError as exc:
+            incomplete.append({**strip, "reason": str(exc)})
+            continue
+        if len(kids) < 6:
+            incomplete.append({**strip, "children_read": len(kids), "reason": "strip read was cut short"})
+            continue
+        report.append(parse_strip(strip["name"], strip["path"], kids))
+
+    clipping = [r["name"] for r in report if r.get("clipping")]
+    muted = [r["name"] for r in report if r.get("mute") == "on"]
+    faders = [r["fader_db"] for r in report if isinstance(r.get("fader_db"), float)]
+    outputs: dict[str, int] = {}
+    for r in report:
+        if r.get("output"):
+            outputs[r["output"]] = outputs.get(r["output"], 0) + 1
+    return {
+        "mixer_path": index["mixer_path"],
+        "strips_total": index["count"],
+        "offset": offset,
+        "strips_parsed": len(report),
+        "strips_incomplete": incomplete,
+        "next_offset": int(offset) + len(window),
+        "clipping_strips": clipping,
+        "muted_strips": muted,
+        "fader_range_db": [min(faders), max(faders)] if faders else None,
+        "outputs": dict(sorted(outputs.items(), key=lambda kv: -kv[1])),
+        "channels": report,
+    }
 
 
 @tool

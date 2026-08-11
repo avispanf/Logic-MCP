@@ -263,6 +263,80 @@ class PluginWriteSafetyTests(unittest.TestCase):
         self.assertEqual(result["resolved_path"], "2.4.1.7.1.2")
         self.assertEqual(write.call_args.kwargs["expected_plugin"], "Ozone 9 Elements")
 
+    def test_wrapped_slider_steps_by_display_not_encoded_raw_value(self):
+        displays = iter(["-0.10", "199", "-1.10", "189", "-1.00", "190"])
+        with (
+            mock.patch.object(
+                plugins,
+                "resolve_group_control",
+                return_value=("UI element 1 of group", "AXSlider"),
+            ),
+            mock.patch.object(plugins, "read_value", side_effect=lambda *_: next(displays)),
+            mock.patch.object(plugins, "osa") as osa,
+            mock.patch.object(plugins, "send_value") as send_value,
+            mock.patch.object(plugins.time, "sleep"),
+        ):
+            result = plugins.write_group_display_control(
+                "Logic Pro",
+                "group",
+                "10.1.109.1.2",
+                "-1.00",
+                dry_run=False,
+                max_steps=64,
+            )
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["after"], "-1.00")
+        self.assertEqual(result["steps"], 2)
+        self.assertEqual(result["method"], "calibrated raw stepping")
+        self.assertIn("AXDecrement", osa.call_args.args[0])
+        send_value.assert_called_once_with(
+            "Logic Pro", "UI element 1 of group", "190", numeric=True
+        )
+
+
+class PluginOpenTests(unittest.TestCase):
+    def test_insert_open_presses_exact_child_button(self):
+        strip = {
+            "name": "Stereo Out",
+            "inserts": ["Ozone 9 El"],
+            "insert_controls": [
+                {"name": "Ozone 9 El", "path": "9.2.8.15", "role": "AXGroup"}
+            ],
+        }
+        identity = {
+            "plugin": "Ozone 9 El",
+            "channel": "Stereo Out",
+            "view_selector": "Editor",
+        }
+        with (
+            mock.patch.object(plugins, "require_logic", return_value="Logic Pro"),
+            mock.patch.object(plugins, "main_window_index", return_value=1),
+            mock.patch.object(plugins, "parse_strip", return_value=strip),
+            mock.patch.object(
+                plugins,
+                "walk_window",
+                side_effect=[[], [{"path": "9.2.8.15.2", "role": "AXButton", "name": "open"}]],
+            ),
+            mock.patch.object(
+                plugins,
+                "ax_windows",
+                side_effect=[{"count": 1}, {"count": 2}],
+            ),
+            mock.patch.object(plugins, "read_plugin_identity", return_value=identity),
+            mock.patch.object(plugins, "osa") as osa,
+            mock.patch.object(plugins.time, "sleep"),
+        ):
+            result = plugins.plugin_open_insert(
+                "9.2.8",
+                0,
+                "Stereo Out",
+                expected_plugin="Ozone 9 El",
+                dry_run=False,
+            )
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["open_path"], "9.2.8.15.2")
+        self.assertIn("UI element 2 of UI element 15", osa.call_args.args[0])
+
 
 class MeterReadTests(unittest.TestCase):
     def test_plugin_title_alone_is_not_a_measurement(self):

@@ -1408,6 +1408,15 @@ def plugin_write_path(
         role, current = read_role_and_value(process, reference)
     except ProbeError as exc:
         return {"ok": False, "error": f"path does not resolve: {exc}"}
+    if role == "AXGroup":
+        return write_group_display_control(
+            process,
+            reference,
+            path,
+            value,
+            dry_run=dry_run,
+            max_steps=max_steps,
+        )
     if role not in WRITABLE_ROLES and role not in NUMERIC_ROLES:
         return {
             "ok": False,
@@ -1527,6 +1536,214 @@ def plugin_write_path(
         "after": observed,
         "steps": steps,
         "trail": trail[:12],
+        "note": reason,
+    }
+
+
+def resolve_group_control(process: str, group_reference: str) -> tuple[str, str]:
+    """Resolve the single writable child of a Controls-table display group."""
+    raw = osa(
+        f'tell application "System Events" to tell process "{process}"\n'
+        f"set g to {group_reference}\n"
+        "set n to count of UI elements of g\n"
+        'if n is not 1 then return (n as string) & "~"\n'
+        'return (n as string) & "~" & (role of UI element 1 of g as string)\n'
+        "end tell",
+        timeout=20,
+    )
+    count, _, role = raw.partition("~")
+    if count != "1" or role not in WRITABLE_ROLES + NUMERIC_ROLES:
+        raise ProbeError(
+            f"parameter display group has {count or 'unknown'} children and role {role!r}; "
+            "refusing to guess a writable control"
+        )
+    return f"UI element 1 of {group_reference}", role
+
+
+def write_group_display_control(
+    process: str,
+    group_reference: str,
+    path: str,
+    value: str,
+    *,
+    dry_run: bool,
+    max_steps: int,
+) -> dict:
+    """Write a wrapped Controls-table parameter while verifying its display value.
+
+    Third-party Audio Units often expose a parent AXGroup whose value is the musical
+    display (-1.00 dB) and a child AXSlider whose raw value is an unrelated encoded
+    number (for example 190). Directional AXIncrement/AXDecrement on the child plus
+    read-back from the parent is the only safe mapping-free write.
+    """
+    before = read_value(process, group_reference)
+    try:
+        control_reference, control_role = resolve_group_control(process, group_reference)
+    except ProbeError as exc:
+        return {
+            "ok": False,
+            "verified": False,
+            "write_attempted": False,
+            "path": path,
+            "before": before,
+            "requested": value,
+            "error": str(exc),
+        }
+    preview = {
+        "path": path,
+        "control_path": f"{path}.1",
+        "role": "AXGroup",
+        "control_role": control_role,
+        "before": before,
+        "requested": value,
+        "verification_source": "parent display value",
+    }
+    if values_match(value, before):
+        return {"ok": True, "verified": True, "changed": False, **preview, "after": before}
+    if dry_run:
+        return {
+            "ok": True,
+            "verified": False,
+            "dry_run": True,
+            "write_attempted": False,
+            **preview,
+            "write_mode": "display-directed control action",
+            "note": "nothing was changed",
+        }
+    if control_role in ("AXCheckBox", "AXRadioButton"):
+        action = "AXPress"
+        budget = 3
+        control_raw = None
+    else:
+        current_number, target_number = as_number(before), as_number(value)
+        if current_number is None or target_number is None:
+            return {
+                "ok": False,
+                "verified": False,
+                "write_attempted": False,
+                **preview,
+                "error": "display value is not numeric, so a direction cannot be proven",
+            }
+        action = "AXIncrement" if target_number > current_number else "AXDecrement"
+        budget = max(1, min(int(max_steps), 256))
+        control_raw = read_value(process, control_reference)
+    trail = [before]
+    raw_trail = [control_raw] if control_raw is not None else []
+    observed = before
+    for step in range(1, budget + 1):
+        previous = observed
+        try:
+            osa(
+                f'tell application "System Events" to tell process "{process}" to '
+                f'perform action "{action}" of {control_reference}',
+                timeout=20,
+            )
+            time.sleep(0.12)
+            observed = read_value(process, group_reference)
+            observed_raw = (
+                read_value(process, control_reference)
+                if control_role not in ("AXCheckBox", "AXRadioButton")
+                else None
+            )
+        except ProbeError as exc:
+            return {
+                "ok": False,
+                "verified": False,
+                "write_attempted": True,
+                **preview,
+                "after": observed,
+                "steps": step,
+                "trail": trail[:16],
+                "error": str(exc),
+            }
+        trail.append(observed)
+        if observed_raw is not None:
+            raw_trail.append(observed_raw)
+        if values_match(value, observed):
+            return {
+                "ok": True,
+                "verified": True,
+                "write_attempted": True,
+                "changed": True,
+                "method": action,
+                **preview,
+                "after": observed,
+                "steps": step,
+                "trail": trail[:16],
+                "raw_trail": raw_trail[:16],
+            }
+        if observed == previous:
+            reason = "display stopped moving before the requested value"
+            break
+        if control_role not in ("AXCheckBox", "AXRadioButton"):
+            previous_number = as_number(previous)
+            observed_number = as_number(observed)
+            target_number = as_number(value)
+            if None in (previous_number, observed_number, target_number):
+                reason = "display stopped being numeric"
+                break
+            crossed = (target_number - previous_number) * (
+                target_number - observed_number
+            ) < 0
+            if crossed:
+                previous_raw = as_number(raw_trail[-2])
+                current_raw = as_number(raw_trail[-1])
+                if previous_raw is None or current_raw is None or current_raw == previous_raw:
+                    reason = "target was crossed but raw slider calibration was unavailable"
+                    break
+                slope = (observed_number - previous_number) / (current_raw - previous_raw)
+                if slope == 0:
+                    reason = "target was crossed but display-to-raw slope was zero"
+                    break
+                target_raw = previous_raw + (target_number - previous_number) / slope
+                target_raw_text = f"{target_raw:g}"
+                for fine_step in range(step + 1, budget + 1):
+                    prior_raw = raw_trail[-1]
+                    try:
+                        send_value(process, control_reference, target_raw_text, numeric=True)
+                        time.sleep(0.12)
+                        observed = read_value(process, group_reference)
+                        observed_raw = read_value(process, control_reference)
+                    except ProbeError as exc:
+                        reason = f"calibrated raw stepping failed: {exc}"
+                        break
+                    trail.append(observed)
+                    raw_trail.append(observed_raw)
+                    if values_match(value, observed):
+                        return {
+                            "ok": True,
+                            "verified": True,
+                            "write_attempted": True,
+                            "changed": True,
+                            "method": "calibrated raw stepping",
+                            **preview,
+                            "after": observed,
+                            "steps": fine_step,
+                            "calibrated_raw_target": target_raw,
+                            "trail": trail[:16],
+                            "raw_trail": raw_trail[:16],
+                        }
+                    if observed_raw == prior_raw:
+                        reason = "raw control reached the calibrated target but display did not match"
+                        break
+                else:
+                    reason = "step budget exhausted during calibrated raw stepping"
+                break
+            if abs(observed_number - target_number) >= abs(previous_number - target_number):
+                reason = "display moved away from the requested value"
+                break
+    else:
+        reason = "step budget exhausted"
+    return {
+        "ok": False,
+        "verified": False,
+        "write_attempted": True,
+        "method": action,
+        **preview,
+        "after": observed,
+        "steps": len(trail) - 1,
+        "trail": trail[:16],
+        "raw_trail": raw_trail[:16],
         "note": reason,
     }
 
@@ -2915,9 +3132,25 @@ def plugin_open_insert(
         }
     before = ax_windows()
     try:
+        descendants = walk_window(
+            process, main, 1, budget=20, seconds=10, root=target["path"]
+        )
+        open_buttons = [
+            entry
+            for entry in descendants
+            if entry["role"] == "AXButton" and entry["name"].casefold() == "open"
+        ]
+        if len(open_buttons) != 1:
+            return {
+                "ok": False,
+                "write_attempted": False,
+                **preview,
+                "error": f"insert exposes {len(open_buttons)} exact Open buttons; refusing to guess",
+            }
+        open_path = open_buttons[0]["path"]
         osa(
             f'tell application "System Events" to tell process "{process}" to '
-            f'perform action "AXPress" of {element_reference(target["path"], main)}',
+            f'perform action "AXPress" of {element_reference(open_path, main)}',
             timeout=30,
         )
     except ProbeError as exc:
@@ -2942,6 +3175,7 @@ def plugin_open_insert(
         "ok": verified,
         "verified": verified,
         **preview,
+        "open_path": open_path,
         "window_index": 1,
         "identity": identity,
         "windows_before": before["count"],
@@ -3389,7 +3623,15 @@ def prepare_safe_output_dir(path: Path) -> str | None:
     existing = path
     while not existing.exists() and existing != existing.parent:
         existing = existing.parent
-    if existing.is_symlink() or not existing.is_dir():
+    if existing.is_symlink():
+        # `/tmp` is the OS-owned compatibility alias for `/private/tmp` on macOS.
+        # Permit only this exact, stable system alias; arbitrary symlink ancestors
+        # remain refused so a planned output cannot be redirected elsewhere.
+        if existing == Path("/tmp") and existing.resolve() == Path("/private/tmp"):
+            existing = existing.resolve()
+        else:
+            return "artifact_output_dir_unsafe"
+    if not existing.is_dir():
         return "artifact_output_dir_unsafe"
     try:
         path.mkdir(parents=True, exist_ok=True)

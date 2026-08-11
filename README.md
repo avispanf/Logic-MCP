@@ -120,7 +120,7 @@ code update so its long-running stdio process registers the current tool set.
 
 The companion MCU server used for the verified three-server setup is the patched
 [avispanf/logic-pro-mcp](https://github.com/avispanf/logic-pro-mcp) fork at commit
-`c6f7e7e`. It coalesces overlapping background/explicit AX refreshes, gives the measured
+`14f6828`. It coalesces overlapping background/explicit AX refreshes, gives the measured
 full-cache operation a bounded 90-second deadline, and returns schema-valid structured
 content even for legacy prose responses. Give each concurrently running MCP client
 its own stable MIDI namespace:
@@ -140,6 +140,29 @@ identity, so Logic reconnects after the MCP process restarts without rebuilding 
 control surface. The patched `set_master_volume` also verifies through the Control Bar
 AX slider when Logic does not echo the master-fader move over MCU; it does not report a
 successful write without that independent read-back.
+
+### Unattended mix-audit runner
+
+`run_mix_audit.py` is a local client for long audits. It starts fresh instances of all
+three servers, keeps their stdio sessions alive for the complete run, journals every
+full response, and always schedules state restoration. This lets edited server code be
+tested without restarting the desktop MCP host. Live isolation and bounce still require
+the explicit `--confirmed` flag:
+
+```bash
+~/dev/venv/bin/python run_mix_audit.py \
+  --scope all --selector '' --confirmed \
+  --output-root ~/Desktop/Logic-MCP-Audits/nightly
+```
+
+Give the runner its own persistent Logic Control surface by assigning both ports to
+`LogicProMCP-MCU-Internal [standalone-audit]`. The runner rejects the generic `Track 1…8`
+bank that appears during MCU startup and asks the patched core for a full AX refresh
+before planning. Each target is isolated and independently read back, bounced to a new
+non-overwriting WAV, measured with BS.1770, and restored before the next target. Full
+evidence is stored in `runner.jsonl`; `summary.json` and bounded stdout contain compact
+progress and results. Off-screen tracks whose insert names Logic does not expose are
+still measured, but their plugin chains are recorded as unreadable rather than guessed.
 
 macOS permissions: Accessibility must be granted to the process that launches the
 server, not to the script. Automation for Logic Pro and System Events is also required.

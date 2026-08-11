@@ -81,6 +81,27 @@ class TransportPositionTests(unittest.TestCase):
 
 
 class BounceSafetyTests(unittest.TestCase):
+    def test_accessible_bounce_opens_directly_with_command_b(self):
+        with tempfile.TemporaryDirectory() as directory:
+            staging = Path(directory)
+            with (
+                mock.patch.object(plugins, "require_logic", return_value="Logic Pro"),
+                mock.patch.object(plugins, "send_key") as send_key,
+                mock.patch.object(
+                    plugins,
+                    "press_front_button",
+                    side_effect=plugins.ProbeError("stop after opening"),
+                ),
+                mock.patch.object(plugins, "cancel_bounce_ui"),
+                mock.patch.object(plugins, "menu_click") as menu_click,
+            ):
+                result = plugins.run_accessible_bounce(
+                    staging / "target.wav", 60, staging=staging
+                )
+        send_key.assert_called_once_with("Logic Pro", "code", 11, ["cmd"])
+        menu_click.assert_not_called()
+        self.assertFalse(result["bounce_fired"])
+
     def test_bounce_is_dry_run_until_confirmed(self):
         project = Path("/tmp/Test.logicx")
         target = Path("/tmp/logic-audit-test/master.wav")
@@ -442,6 +463,64 @@ class PluginOpenTests(unittest.TestCase):
             )
         self.assertTrue(result["verified"])
         self.assertIn("AXShowMenu", osa.call_args_list[0].args[0])
+
+    def test_set_editor_view_accepts_unique_plugin_named_menu_item(self):
+        identities = iter(
+            [
+                {"plugin": "Pro-DS", "channel": "Lead", "view_selector": "Controls"},
+                {"plugin": "Pro-DS", "channel": "Lead", "view_selector": "Editor"},
+            ]
+        )
+        shallow = [
+            {"path": "4", "role": "AXMenuButton", "name": "Controls", "value": "", "description": "view"}
+        ]
+        menu_items = [
+            {"path": "4.1.1", "role": "AXMenuItem", "name": "Controls", "value": "", "description": ""},
+            {"path": "4.1.2", "role": "AXMenuItem", "name": "Pro-DS", "value": "", "description": ""},
+        ]
+        with (
+            mock.patch.object(plugins, "require_logic", return_value="Logic Pro"),
+            mock.patch.object(plugins, "read_plugin_identity", side_effect=lambda *_: next(identities)),
+            mock.patch.object(plugins, "walk_window", side_effect=[shallow, menu_items]),
+            mock.patch.object(plugins, "osa"),
+            mock.patch.object(plugins.time, "sleep"),
+        ):
+            result = plugins.plugin_set_view(
+                1, "Editor", expected_plugin="Pro-DS", expected_channel="Lead"
+            )
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["selected_menu_item"], "Pro-DS")
+
+    def test_set_view_retries_with_press_when_show_menu_is_empty(self):
+        identities = iter(
+            [
+                {"plugin": "UADx Oxide", "channel": "Lead", "view_selector": "Editor"},
+                {"plugin": "UADx Oxide", "channel": "Lead", "view_selector": "Controls"},
+            ]
+        )
+        shallow = [
+            {"path": "4", "role": "AXMenuButton", "name": "Editor", "value": "", "description": "view"}
+        ]
+        controls = [
+            {"path": "4.1.1", "role": "AXMenuItem", "name": "Controls", "value": "", "description": ""}
+        ]
+        with (
+            mock.patch.object(plugins, "require_logic", return_value="Logic Pro"),
+            mock.patch.object(plugins, "read_plugin_identity", side_effect=lambda *_: next(identities)),
+            mock.patch.object(
+                plugins,
+                "walk_window",
+                side_effect=[shallow, [], [], controls],
+            ),
+            mock.patch.object(plugins, "osa") as osa,
+            mock.patch.object(plugins.time, "sleep"),
+        ):
+            result = plugins.plugin_set_view(
+                1, "Controls", expected_plugin="UADx Oxide", expected_channel="Lead"
+            )
+        self.assertTrue(result["verified"])
+        self.assertTrue(any("key code 53" in call.args[0] for call in osa.call_args_list))
+        self.assertTrue(any('AXPress' in call.args[0] for call in osa.call_args_list))
 
     def test_insert_open_reuses_unique_verified_editor_without_toggling_it_closed(self):
         strip = {

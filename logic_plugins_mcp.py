@@ -1192,6 +1192,9 @@ def plugin_set_view(
     plugins that draw themselves, so this is the gate to every parameter operation. The
     change is verified by reading the view menu back."""
     process = require_logic()
+    if view not in ("Controls", "Editor"):
+        return {"ok": False, "error": "view must be 'Controls' or 'Editor'"}
+    identity = None
     if expected_plugin or expected_channel:
         try:
             identity = read_plugin_identity(process, int(window_index))
@@ -1216,15 +1219,49 @@ def plugin_set_view(
     if menu is None:
         return {"ok": False, "error": "this window has no view menu; it may not be a plugin editor"}
     current = menu["name"] or menu["value"]
-    if current == view:
+    current_view = identity.get("view_selector") if identity else (
+        "Controls" if current == "Controls" else "Editor"
+    )
+    if current_view == view:
         return {
             "ok": True,
             "verified": True,
-            "view": current,
+            "view": current_view,
+            "raw_view": current,
             "changed": False,
             "note": "already in that view",
         }
     reference = element_reference(menu["path"], int(window_index))
+
+    def read_view_items() -> list[dict]:
+        scoped = walk_window(
+            process,
+            int(window_index),
+            2,
+            budget=240,
+            seconds=12,
+            root=menu["path"],
+        )
+        found = [
+            e for e in scoped if e["role"] == "AXMenuItem" and (e["name"] or "").strip()
+        ]
+        if found:
+            return found
+        # Some third-party AU windows expose the popup menu as a transient window
+        # sibling rather than a descendant of the AXMenuButton.
+        whole_window = walk_window(
+            process,
+            int(window_index),
+            3,
+            budget=360,
+            seconds=12,
+        )
+        return [
+            e
+            for e in whole_window
+            if e["role"] == "AXMenuItem" and (e["name"] or "").strip()
+        ]
+
     try:
         try:
             osa(
@@ -1239,15 +1276,36 @@ def plugin_set_view(
                 timeout=30,
             )
         time.sleep(0.6)
-        items = walk_window(process, int(window_index), 2, budget=200, seconds=20, root=menu["path"])
+        menu_items = read_view_items()
+        if not menu_items:
+            # AXShowMenu can report success without opening this control. Dismiss any
+            # transient state, then use the ordinary press action and read it again.
+            osa(
+                f'tell application "System Events" to tell process "{process}" to key code 53',
+                timeout=10,
+            )
+            time.sleep(0.2)
+            osa(
+                f'tell application "System Events" to tell process "{process}" to '
+                f'perform action "AXPress" of {reference}',
+                timeout=30,
+            )
+            time.sleep(0.6)
+            menu_items = read_view_items()
     except ProbeError as exc:
         return {"ok": False, "error": f"could not open the view menu: {exc}"}
-    target = next(
-        (e for e in items if e["role"] == "AXMenuItem" and (e["name"] or "").strip() == view),
-        None,
-    )
+    target = next((e for e in menu_items if (e["name"] or "").strip() == view), None)
+    # Third-party Audio Units commonly label their native editor with the plugin
+    # name (for example "Pro-DS") rather than the generic word "Editor".  When
+    # returning from Controls, the sole non-Controls item is that editor.
+    if target is None and view == "Editor":
+        editor_items = [
+            e for e in menu_items if (e["name"] or "").strip() != "Controls"
+        ]
+        if len(editor_items) == 1:
+            target = editor_items[0]
     if target is None:
-        offered = [e["name"] for e in items if e["role"] == "AXMenuItem" and e["name"]]
+        offered = [e["name"] for e in menu_items]
         return {"ok": False, "error": f"{view!r} not offered", "available": offered}
     try:
         osa(
@@ -1268,6 +1326,7 @@ def plugin_set_view(
         "verified": now == view,
         "view": now,
         "was": current,
+        "selected_menu_item": target["name"],
         "changed": now != current,
     }
 
@@ -3819,9 +3878,11 @@ def run_accessible_bounce(target: Path, timeout_seconds: int, staging: Path | No
         "driver": "logic_12_3_accessibility",
     }
     try:
-        opened = menu_click(["File", "Bounce", "Project or Section…"])
-        if not opened.get("ok"):
-            raise ProbeError(f"bounce settings did not open: {opened.get('error', opened)}")
+        # Opening this through nested File menus is not reliable: Logic may leave the
+        # File menu overlay in front of the Bounce dialog, making the dialog's controls
+        # invisible to the AX walker even though the window exists. Physical key code
+        # 11 is B on Apple keyboards and Cmd-B opens Project or Section Bounce directly.
+        send_key(process, "code", 11, ["cmd"])
         press_front_button(process, "OK", timeout=20)
 
         # Logic 12.3 exposes the standard save panel's filename AXTextField. The Search

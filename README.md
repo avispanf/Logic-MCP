@@ -110,6 +110,26 @@ and `args` at the scripts inside this checkout (for example,
 servers accept `--check` for a readiness report. Restart/reload the MCP client after a
 code update so its long-running stdio process registers the current tool set.
 
+The companion MCU server used for the verified three-server setup is the patched
+[avispanf/logic-pro-mcp](https://github.com/avispanf/logic-pro-mcp) fork at commit
+`a80ef0d`. Give each concurrently running MCP client its own stable MIDI namespace:
+
+```toml
+[mcp_servers.logic-pro]
+command = "/absolute/path/to/LogicProMCP"
+
+[mcp_servers.logic-pro.env]
+LOGIC_PRO_MCP_MIDI_INSTANCE_ID = "codex"
+LOGIC_PRO_MCP_SHARE_DIR = "/opt/homebrew/opt/logic-pro-mcp/share/logic-pro-mcp"
+```
+
+In Logic Pro > Control Surfaces > Setup, assign both input and output to
+`LogicProMCP-MCU-Internal [codex]` once. The endpoint keeps a deterministic CoreMIDI
+identity, so Logic reconnects after the MCP process restarts without rebuilding the
+control surface. The patched `set_master_volume` also verifies through the Control Bar
+AX slider when Logic does not echo the master-fader move over MCU; it does not report a
+successful write without that independent read-back.
+
 macOS permissions: Accessibility must be granted to the process that launches the
 server, not to the script. Automation for Logic Pro and System Events is also required.
 

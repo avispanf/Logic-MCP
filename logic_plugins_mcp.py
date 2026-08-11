@@ -11,6 +11,7 @@ import signal
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 
 import logic_mix_audit as mix_audit
@@ -1772,7 +1773,12 @@ def send_key(process: str, kind: str, key, modifiers: list[str]) -> None:
         using = f" using {{{names}}}"
     action = f"key code {key}{using}" if kind == "code" else f'keystroke "{key}"{using}'
     osa(
-        f'tell application "System Events" to tell process "{process}" to {action}',
+        'tell application "System Events"\n'
+        f'tell process "{process}"\n'
+        "set frontmost to true\n"
+        f"{action}\n"
+        "end tell\n"
+        "end tell",
         timeout=30,
     )
 
@@ -1794,12 +1800,18 @@ def read_value(process: str, reference: str) -> str:
 
 
 def send_value(process: str, reference: str, value: str, numeric: bool) -> None:
-    literal = value if numeric else f'"{value}"'
+    literal = value if numeric else apple_script_string(value)
     osa(
         f'tell application "System Events" to tell process "{process}" to '
         f"set value of {reference} to {literal}",
         timeout=60,
     )
+
+
+def apple_script_string(value: str) -> str:
+    """Quote user-controlled text for an AppleScript string literal."""
+    escaped = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
 def probe_window_size(process: str, window: int, seconds: int = 8) -> dict:
@@ -2003,6 +2015,96 @@ def transport(action: str) -> dict:
             return {"ok": False, "action": action, "sent": sent, "error": result.get("error")}
         time.sleep(0.2)
     return {"ok": True, "action": action, "sent": sent}
+
+
+def normalise_logic_position(value: str) -> str | None:
+    parts = re.findall(r"\d+", str(value or ""))
+    if len(parts) < 4:
+        return None
+    values = [int(part) for part in parts[:4]]
+    if any(value < 1 for value in values):
+        return None
+    return ".".join(str(value) for value in values)
+
+
+def close_goto_position_dialog(process: str) -> None:
+    try:
+        osa(
+            f'tell application "System Events" to tell process "{process}" to '
+            'click first button of front window whose name is "Cancel"',
+            timeout=10,
+        )
+    except ProbeError:
+        pass
+
+
+@tool
+def transport_goto_position(position: str, dry_run: bool = True) -> dict:
+    """Set an exact bar.beat.division.tick position through Logic's own Go To Position
+    dialog and independently reopen the dialog to read Current back. This avoids an
+    abandoned mature-server operation continuing after its timeout. Dry-run is default."""
+    requested = normalise_logic_position(position)
+    if requested is None or requested != str(position).strip():
+        return {
+            "ok": False,
+            "verified": False,
+            "write_attempted": False,
+            "error": "position must be four positive dot-separated integers",
+            "requested": position,
+        }
+    preview = {"requested": requested, "method": "logic_go_to_position_dialog"}
+    if dry_run:
+        return {"ok": True, "verified": False, "dry_run": True, **preview}
+    process = require_logic()
+    opened = menu_click(["Navigate", "Go To", "Position…"])
+    if not opened.get("ok") or not any(
+        window.get("title") == "Go To Position" for window in opened.get("opened", [])
+    ):
+        return {
+            "ok": False,
+            "verified": False,
+            "write_attempted": False,
+            **preview,
+            "error": "Go To Position dialog did not open",
+            "open_result": opened,
+        }
+    try:
+        # The editable New position field is focused on open. Selecting the complete
+        # segmented value and typing the dotted form fills all four segments atomically;
+        # AXSlider writes only move one encoded step and cannot safely set this control.
+        send_key(process, "key", "a", ["cmd"])
+        send_key(process, "key", requested, [])
+        send_key(process, "code", 36, [])
+        time.sleep(0.7)
+        reopened = menu_click(["Navigate", "Go To", "Position…"])
+        if not reopened.get("ok"):
+            raise ProbeError("verification dialog did not reopen")
+        current_raw = osa(
+            f'tell application "System Events" to tell process "{process}" to '
+            "return value of UI element 4 of front window as string",
+            timeout=15,
+        )
+        observed = normalise_logic_position(current_raw)
+    except ProbeError as exc:
+        close_goto_position_dialog(process)
+        return {
+            "ok": False,
+            "verified": False,
+            "write_attempted": True,
+            **preview,
+            "error": str(exc),
+        }
+    close_goto_position_dialog(process)
+    verified = observed == requested
+    return {
+        "ok": verified,
+        "verified": verified,
+        "write_attempted": True,
+        **preview,
+        "observed": observed,
+        "observed_raw": current_raw,
+        **({"error": "position readback did not match"} if not verified else {}),
+    }
 
 
 @tool
@@ -3179,12 +3281,258 @@ def mix_project_identity(expected_project_path: str = "") -> dict:
     return result
 
 
-def logic_bounce_script() -> Path | None:
-    binary = shutil.which("LogicProMCP")
-    if not binary:
-        return None
-    candidate = Path(binary).resolve().parents[1] / "share" / "logic-pro-mcp" / "logic_bounce.py"
-    return candidate if candidate.is_file() else None
+def find_front_element(
+    process: str,
+    role: str,
+    *,
+    name: str = "",
+    value: str = "",
+    exclude_names: tuple[str, ...] = (),
+    timeout: float = 20.0,
+) -> dict:
+    """Resolve one element in the front Logic window, retrying while sheets animate."""
+    deadline = time.monotonic() + timeout
+    last_matches: list[dict] = []
+    while time.monotonic() < deadline:
+        try:
+            elements = walk_window(process, 1, 5, budget=500, seconds=12)
+        except ProbeError:
+            time.sleep(0.4)
+            continue
+        matches = [entry for entry in elements if entry["role"] == role]
+        if name:
+            matches = [entry for entry in matches if entry["name"] == name]
+        if value:
+            matches = [entry for entry in matches if entry["value"] == value]
+        if exclude_names:
+            excluded = {item.casefold() for item in exclude_names}
+            matches = [
+                entry
+                for entry in matches
+                if not any(
+                    excluded_name in f'{entry["name"]} {entry["description"]}'.casefold()
+                    for excluded_name in excluded
+                )
+            ]
+        last_matches = matches
+        if len(matches) == 1:
+            return matches[0]
+        time.sleep(0.4)
+    detail = [entry["path"] for entry in last_matches[:8]]
+    raise ProbeError(
+        f"expected one front-window {role} name={name!r} value={value!r}; "
+        f"found {len(last_matches)} at {detail}"
+    )
+
+
+def press_front_button(process: str, name: str, timeout: float = 20.0) -> dict:
+    target = find_front_element(process, "AXButton", name=name, timeout=timeout)
+    reference = element_reference(target["path"], 1)
+    osa(
+        f'tell application "System Events" to tell process "{process}" to '
+        f'perform action "AXPress" of {reference}',
+        timeout=20,
+    )
+    return target
+
+
+def front_window_titles() -> list[str]:
+    try:
+        return [str(item.get("title", "")) for item in ax_windows().get("windows", [])]
+    except ProbeError:
+        return []
+
+
+def cancel_bounce_ui(process: str, bounce_fired: bool) -> None:
+    """Best-effort cleanup. Cmd-period cancels rendering; Cancel closes preflight sheets."""
+    if bounce_fired:
+        try:
+            send_key(process, "key", ".", ["cmd"])
+        except ProbeError:
+            pass
+        return
+    try:
+        # Escape closes a nested Go to Folder sheet first, or the save/settings
+        # sheet itself when no nested sheet is present.
+        send_key(process, "code", 53, [])
+        time.sleep(0.3)
+    except ProbeError:
+        pass
+    for _ in range(2):
+        try:
+            press_front_button(process, "Cancel", timeout=2)
+        except ProbeError:
+            break
+        time.sleep(0.3)
+
+
+def find_staged_artifact(staging: Path, staged_name: str, min_mtime: float) -> Path | None:
+    candidates = []
+    for candidate in staging.glob(f"{staged_name}.*"):
+        try:
+            stat = candidate.stat()
+        except OSError:
+            continue
+        if (
+            candidate.is_symlink()
+            or not candidate.is_file()
+            or candidate.parent.resolve(strict=False) != staging.resolve(strict=False)
+            or stat.st_mtime < min_mtime
+        ):
+            continue
+        candidates.append((stat.st_mtime, candidate))
+    candidates.sort(reverse=True)
+    return candidates[0][1] if candidates else None
+
+
+def prepare_safe_output_dir(path: Path) -> str | None:
+    existing = path
+    while not existing.exists() and existing != existing.parent:
+        existing = existing.parent
+    if existing.is_symlink() or not existing.is_dir():
+        return "artifact_output_dir_unsafe"
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        return f"artifact_output_dir_create_failed: {exc}"
+    if path.is_symlink() or not path.is_dir():
+        return "artifact_output_dir_unsafe"
+    return None
+
+
+def move_staged_artifact_no_overwrite(staged: Path, final: Path) -> str | None:
+    directory_error = prepare_safe_output_dir(final.parent)
+    if directory_error:
+        return directory_error
+    try:
+        source = staged.open("rb")
+    except OSError as exc:
+        return f"artifact_stage_unreadable: {exc}"
+    directory_flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        directory_flags |= os.O_DIRECTORY
+    if hasattr(os, "O_NOFOLLOW"):
+        directory_flags |= os.O_NOFOLLOW
+    create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_NOFOLLOW"):
+        create_flags |= os.O_NOFOLLOW
+    try:
+        directory_fd = os.open(final.parent, directory_flags)
+        destination_fd = os.open(final.name, create_flags, 0o644, dir_fd=directory_fd)
+    except FileExistsError:
+        source.close()
+        if "directory_fd" in locals():
+            os.close(directory_fd)
+        return "artifact_already_exists"
+    except OSError as exc:
+        source.close()
+        if "directory_fd" in locals():
+            os.close(directory_fd)
+        return f"artifact_move_failed: {exc}"
+    try:
+        with source, os.fdopen(destination_fd, "wb") as destination:
+            shutil.copyfileobj(source, destination)
+        staged.unlink()
+    except OSError as exc:
+        try:
+            os.unlink(final.name, dir_fd=directory_fd)
+        except OSError:
+            pass
+        return f"artifact_move_failed: {exc}"
+    finally:
+        os.close(directory_fd)
+    return None
+
+
+def run_accessible_bounce(target: Path, timeout_seconds: int, staging: Path | None = None) -> dict:
+    """Drive Logic 12.3's AX-exposed Bounce sheets without screen coordinates."""
+    process = require_logic()
+    staging = (staging or (Path.home() / "Downloads")).expanduser()
+    if staging.is_symlink() or not staging.is_dir():
+        return {"success": False, "bounce_fired": False, "error": "staging_directory_unsafe"}
+    staged_name = f"{target.stem}--logic-mcp-{uuid.uuid4().hex[:10]}"
+    result: dict = {
+        "success": False,
+        "bounce_fired": False,
+        "staging": str(staging),
+        "staged_name": staged_name,
+        "driver": "logic_12_3_accessibility",
+    }
+    try:
+        opened = menu_click(["File", "Bounce", "Project or Section…"])
+        if not opened.get("ok"):
+            raise ProbeError(f"bounce settings did not open: {opened.get('error', opened)}")
+        press_front_button(process, "OK", timeout=20)
+
+        # Logic 12.3 exposes the standard save panel's filename AXTextField. The Search
+        # field is excluded explicitly, then the exact value is read back before Bounce.
+        filename = find_front_element(process, "AXTextField", name="Save As:", timeout=25)
+        filename_ref = element_reference(filename["path"], 1)
+        send_value(process, filename_ref, staged_name, numeric=False)
+        if read_value(process, filename_ref) != staged_name:
+            raise ProbeError("save panel filename readback did not match")
+
+        # Go to Folder is reliable even when the save panel lives on an off-screen
+        # display. Its text field accepts an absolute AX value, avoiding input-source
+        # and keyboard-layout corruption of Cyrillic or punctuation.
+        # Physical key code 5 is G on the hardware layout. `keystroke "g"` is
+        # layout-dependent and failed to open this sheet on the Spanish system.
+        send_key(process, "code", 5, ["cmd", "shift"])
+        folder = find_front_element(
+            process,
+            "AXTextField",
+            exclude_names=("Search", "Save As"),
+            timeout=12,
+        )
+        folder_ref = element_reference(folder["path"], 1)
+        send_value(process, folder_ref, str(staging.resolve()), numeric=False)
+        if read_value(process, folder_ref) != str(staging.resolve()):
+            raise ProbeError("Go to Folder path readback did not match")
+        send_key(process, "code", 36, [])
+        time.sleep(0.8)
+        if read_value(process, filename_ref) != staged_name:
+            raise ProbeError("save panel filename changed after folder navigation")
+        where = find_front_element(process, "AXPopUpButton", name="Where:", timeout=12)
+        if Path(where.get("value", "")).name.casefold() != staging.name.casefold():
+            raise ProbeError(
+                f"save panel location readback was {where.get('value')!r}, expected {staging.name!r}"
+            )
+
+        started_at = time.time()
+        press_front_button(process, "Bounce", timeout=15)
+        result["bounce_fired"] = True
+        deadline = time.monotonic() + max(60, min(int(timeout_seconds), 3600))
+        stable_path: Path | None = None
+        stable_size = -1
+        stable_reads = 0
+        while time.monotonic() < deadline:
+            candidate = find_staged_artifact(staging, staged_name, started_at - 2)
+            if candidate is not None:
+                try:
+                    size = candidate.stat().st_size
+                except OSError:
+                    size = -1
+                if candidate == stable_path and size > 0 and size == stable_size:
+                    stable_reads += 1
+                else:
+                    stable_path, stable_size, stable_reads = candidate, size, 0
+                bouncing = any("bouncing" in title.casefold() for title in front_window_titles())
+                if stable_reads >= 2 and not bouncing:
+                    final = target.with_suffix(candidate.suffix)
+                    move_error = move_staged_artifact_no_overwrite(candidate, final)
+                    if move_error:
+                        return {**result, "error": move_error, "artifact": str(final)}
+                    return {
+                        **result,
+                        "success": True,
+                        "artifact": str(final),
+                        "size_bytes": final.stat().st_size,
+                    }
+            time.sleep(1)
+        raise ProbeError("bounce timed out before a stable artifact was verified")
+    except ProbeError as exc:
+        cancel_bounce_ui(process, bool(result["bounce_fired"]))
+        return {**result, "error": str(exc)}
 
 
 @tool
@@ -3196,8 +3544,9 @@ def mix_bounce_target(
 ) -> dict:
     """Bounce the currently isolated target to a planned non-existing path. This is the
     measurement bridge used after a mature-server solo/isolation step. It refuses unless
-    the exact open project matches and confirmed is true; the packaged bounce driver uses
-    exclusive file creation and never overwrites an artifact."""
+    the exact open project matches and confirmed is true. Logic 12.3's AX-exposed save
+    controls are used without screen coordinates; the artifact is copied with exclusive
+    creation and is never overwritten."""
     target = Path(target_path).expanduser()
     expected = Path(expected_project_path).expanduser()
     if not target.is_absolute() or not expected.is_absolute():
@@ -3222,43 +3571,16 @@ def mix_bounce_target(
             **preview,
             "error": "planned artifact already exists; refusing to overwrite",
         }
-    script = logic_bounce_script()
-    if script is None:
-        return {"ok": False, **preview, "error": "packaged logic_bounce.py was not found"}
     if not confirmed:
         return {
             "ok": True,
             "dry_run": True,
             "confirmation_required": True,
             **preview,
-            "driver": str(script),
+            "driver": "logic_12_3_accessibility",
             "note": "no UI action or file write occurred",
         }
-    process = subprocess.Popen(
-        [sys.executable, str(script), "--target-path", str(target)],
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        start_new_session=True,
-    )
-    try:
-        out, err = process.communicate(timeout=max(60, min(int(timeout_seconds), 3600)))
-    except subprocess.TimeoutExpired:
-        try:
-            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            process.kill()
-        process.communicate()
-        return {"ok": False, **preview, "error": "bounce timed out and its process group was killed"}
-    line = next((line for line in reversed(out.splitlines()) if line.strip()), "")
-    try:
-        result = json.loads(line)
-    except json.JSONDecodeError:
-        return {
-            "ok": False,
-            **preview,
-            "error": (err or line or "bounce driver returned no result").strip(),
-        }
+    result = run_accessible_bounce(target, timeout_seconds)
     artifact = Path(str(result.get("artifact") or ""))
     verified = bool(
         result.get("success")

@@ -282,10 +282,11 @@ class PlanTests(unittest.TestCase):
         locate = next(
             step
             for step in plan["steps"]
-            if step["operation"] == "logic_transport"
-            and step["arguments"].get("command") == "goto_position"
+            if step["operation"] == "transport_goto_position"
         )
-        self.assertEqual(locate["arguments"]["params"], {"position": "1.1.1.1"})
+        self.assertEqual(locate["server"], "logic-plugins")
+        self.assertEqual(locate["arguments"], {"position": "1.1.1.1", "dry_run": False})
+        self.assertTrue(locate["requires_verified_result"])
 
     def test_mixer_only_aux_uses_verified_ax_solo_not_track_index(self):
         inventory = audit.normalise_inventory(
@@ -471,12 +472,13 @@ class RestoreTests(unittest.TestCase):
         transport_dispatches = [
             item
             for item in restore["dispatches"]
-            if item["operation"] in {"logic_transport", "ensure_resource_state"}
+            if item["operation"] in {"transport_goto_position", "ensure_resource_state"}
         ]
         self.assertEqual(
             transport_dispatches[0]["arguments"],
-            {"command": "goto_position", "params": {"position": "101.3.1.1"}},
+            {"position": "101.3.1.1", "dry_run": False},
         )
+        self.assertEqual(transport_dispatches[0]["server"], "logic-plugins")
         self.assertEqual(len(transport_dispatches), 3)
         self.assertTrue(restore["complete"])
 
@@ -526,12 +528,21 @@ class RestoreTests(unittest.TestCase):
         mature_commands = [
             item["arguments"].get("command")
             for item in result["dispatches"]
-            if item["operation"] in {"logic_tracks", "logic_transport"}
+            if item["operation"] == "logic_tracks"
         ]
         self.assertIn("solo", mature_commands)
         self.assertIn("mute", mature_commands)
         self.assertIn("select", mature_commands)
-        self.assertIn("goto_position", mature_commands)
+        position_restore = next(
+            item
+            for item in result["dispatches"]
+            if item["operation"] == "transport_goto_position"
+        )
+        self.assertEqual(position_restore["server"], "logic-plugins")
+        self.assertEqual(
+            position_restore["arguments"],
+            {"position": "9.1.1.1", "dry_run": False},
+        )
         self.assertEqual(
             sum(
                 1

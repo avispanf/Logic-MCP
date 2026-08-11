@@ -1,6 +1,7 @@
 import unittest
 from unittest import mock
 from pathlib import Path
+import tempfile
 
 import logic_plugins_mcp as plugins
 
@@ -57,6 +58,84 @@ class ProjectIdentityTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertFalse(result["verified"])
         self.assertIn("does not match", result["error"])
+
+
+class TransportPositionTests(unittest.TestCase):
+    def test_position_normalisation_reads_segmented_ax_value(self):
+        self.assertEqual(plugins.normalise_logic_position("\t101\t3\t1\t1"), "101.3.1.1")
+        self.assertIsNone(plugins.normalise_logic_position("101.3.1"))
+
+    def test_goto_is_dry_run_by_default(self):
+        with mock.patch.object(plugins, "require_logic") as require_logic:
+            result = plugins.transport_goto_position("101.3.1.1")
+        require_logic.assert_not_called()
+        self.assertTrue(result["dry_run"])
+        self.assertFalse(result["verified"])
+
+    def test_goto_rejects_noncanonical_position_before_ui(self):
+        with mock.patch.object(plugins, "require_logic") as require_logic:
+            result = plugins.transport_goto_position("101,3,1,1", dry_run=False)
+        require_logic.assert_not_called()
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["write_attempted"])
+
+
+class BounceSafetyTests(unittest.TestCase):
+    def test_bounce_is_dry_run_until_confirmed(self):
+        project = Path("/tmp/Test.logicx")
+        target = Path("/tmp/logic-audit-test/master.wav")
+        with (
+            mock.patch.object(plugins, "find_open_logic_project", return_value=project),
+            mock.patch.object(plugins, "run_accessible_bounce") as bounce,
+        ):
+            result = plugins.mix_bounce_target(str(target), str(project))
+        bounce.assert_not_called()
+        self.assertTrue(result["dry_run"])
+        self.assertTrue(result["confirmation_required"])
+
+    def test_confirmed_bounce_verifies_helper_artifact(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "Test.logicx"
+            target = root / "audit" / "master.wav"
+
+            def render(planned, _timeout):
+                planned.parent.mkdir()
+                planned.write_bytes(b"RIFF" + b"0" * 128)
+                return {
+                    "success": True,
+                    "bounce_fired": True,
+                    "artifact": str(planned),
+                    "size_bytes": planned.stat().st_size,
+                }
+
+            with (
+                mock.patch.object(plugins, "find_open_logic_project", return_value=project),
+                mock.patch.object(plugins, "run_accessible_bounce", side_effect=render),
+            ):
+                result = plugins.mix_bounce_target(
+                    str(target), str(project), confirmed=True
+                )
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["verified"])
+            self.assertEqual(result["artifact"], str(target))
+
+    def test_existing_stem_collision_is_refused_before_ui(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "Test.logicx"
+            target = root / "master.wav"
+            target.with_suffix(".aif").write_bytes(b"existing")
+            with (
+                mock.patch.object(plugins, "find_open_logic_project", return_value=project),
+                mock.patch.object(plugins, "run_accessible_bounce") as bounce,
+            ):
+                result = plugins.mix_bounce_target(
+                    str(target), str(project), confirmed=True
+                )
+            bounce.assert_not_called()
+            self.assertFalse(result["ok"])
+            self.assertIn("refusing to overwrite", result["error"])
 
 
 class WindowSelectionTests(unittest.TestCase):

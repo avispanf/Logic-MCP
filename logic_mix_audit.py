@@ -735,11 +735,12 @@ def build_audit_plan(
             _step(
                 f"{prefix}-locate",
                 "measure",
-                "logic-pro",
-                "logic_transport",
-                {"command": "goto_position", "params": {"position": start_position}},
+                "logic-plugins",
+                "transport_goto_position",
+                {"position": start_position, "dry_run": False},
                 target_id=target["audit_id"],
                 mutates_logic=True,
+                requires_verified_result=True,
                 compensation={"restore_from": "initial_state"},
             )
         )
@@ -1345,11 +1346,11 @@ def build_restore_dispatch(initial_state: dict, ax_state: list[dict] | None = No
     if position:
         dispatches.append(
             {
-                "server": "logic-pro",
-                "operation": "logic_transport",
+                "server": "logic-plugins",
+                "operation": "transport_goto_position",
                 "arguments": {
-                    "command": "goto_position",
-                    "params": {"position": str(position)},
+                    "position": str(position),
+                    "dry_run": False,
                 },
             }
         )

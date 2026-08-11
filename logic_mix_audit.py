@@ -13,6 +13,64 @@ MASTER_NAMES = {"master", "stereo out", "output 1-2", "main out", "main output"}
 GENERIC_NAMES = {"", "audio plug-in", "midi plug-in", "channel strip", "track"}
 
 
+def validate_mature_dispatch(operation: str, arguments: dict) -> str | None:
+    """Validate the subset of logic-pro-mcp v3.13.0's command/params contract emitted
+    by this coordinator. Invalid internal dispatches must fail while a plan is still dry."""
+    if operation not in {"logic_project", "logic_plugins", "logic_transport", "logic_tracks"}:
+        return f"unknown mature-server tool {operation!r}"
+    if not isinstance(arguments, dict) or set(arguments) != {"command", "params"}:
+        return f"{operation} arguments must contain exactly command and params"
+    command = arguments.get("command")
+    params = arguments.get("params")
+    if not isinstance(command, str) or not isinstance(params, dict):
+        return f"{operation} requires a string command and object params"
+    if operation == "logic_project":
+        return None if command == "audit" and not params else "logic_project audit takes no params"
+    if operation == "logic_plugins":
+        track = params.get("track")
+        if command != "get_inventory":
+            return f"unsupported logic_plugins command {command!r}"
+        if set(params) != {"track"} or not isinstance(track, int) or isinstance(track, bool) or track < 0:
+            return "logic_plugins get_inventory requires one non-negative integer track"
+        return None
+    if operation == "logic_transport":
+        if command in {"play", "stop", "toggle_cycle"}:
+            return None if not params else f"logic_transport {command} takes no params"
+        if command == "goto_position" and set(params) == {"position"} and str(params["position"]).strip():
+            return None
+        return f"unsupported or invalid logic_transport dispatch {command!r}"
+    if command not in {"select", "solo", "mute"}:
+        return f"unsupported logic_tracks command {command!r}"
+    selectors = [key for key in ("target_ref", "index", "name") if key in params]
+    if len(selectors) != 1:
+        return f"logic_tracks {command} requires exactly one target selector"
+    selector = selectors[0]
+    selector_value = params[selector]
+    if selector == "index" and (
+        not isinstance(selector_value, int) or isinstance(selector_value, bool) or selector_value < 0
+    ):
+        return f"logic_tracks {command} index must be a non-negative integer"
+    if selector != "index" and not str(selector_value).strip():
+        return f"logic_tracks {command} {selector} cannot be empty"
+    expected_keys = {selector} if command == "select" else {selector, "enabled"}
+    if set(params) != expected_keys:
+        return f"logic_tracks {command} params do not match the v3.13.0 contract"
+    if command != "select" and not isinstance(params.get("enabled"), bool):
+        return f"logic_tracks {command} enabled must be boolean"
+    return None
+
+
+def validate_mature_steps(steps: list[dict]) -> list[dict]:
+    errors = []
+    for step in steps:
+        if step.get("server") != "logic-pro":
+            continue
+        detail = validate_mature_dispatch(step.get("operation", ""), step.get("arguments"))
+        if detail:
+            errors.append({"step_id": step.get("step_id"), "error": detail})
+    return errors
+
+
 def _items(value, *keys: str) -> list[dict]:
     if value is None:
         return []
@@ -67,8 +125,10 @@ def classify_channel(record: dict) -> str:
         "audio": "track",
         "instrument": "track",
         "software instrument": "track",
+        "software_instrument": "track",
         "drummer": "track",
         "external midi": "track",
+        "external_midi": "track",
         "track": "track",
         "track stack": "group",
         "stack": "group",
@@ -98,11 +158,20 @@ def classify_channel(record: dict) -> str:
 
 
 def _record_identity(record: dict) -> tuple:
-    index = _integer(_first(record, "index", "trackIndex", "track_index", "strip"))
+    index = _integer(_first(record, "index", "id", "trackIndex", "track_index", "strip"))
     name = str(_first(record, "name", "title", "label", default="")).strip().casefold()
     if index is not None and name:
         return ("index_name", index, name)
-    ref = str(_first(record, "target_ref", "track_ref", "mixer_ref", "id", default=""))
+    ref = str(
+        _first(
+            record,
+            "target_ref",
+            "track_ref",
+            "mixer_strip_ref",
+            "mixer_ref",
+            default="",
+        )
+    )
     if ref:
         return ("ref", ref)
     return ("name", name)
@@ -110,8 +179,14 @@ def _record_identity(record: dict) -> tuple:
 
 def _normalise_record(record: dict, source: str) -> dict:
     name = str(_first(record, "name", "title", "label", default="")).strip()
-    index = _integer(_first(record, "index", "trackIndex", "track_index", "strip"))
-    ref = str(_first(record, "target_ref", "id", default=""))
+    index = _integer(_first(record, "index", "id", "trackIndex", "track_index", "strip"))
+    track_ref = str(_first(record, "track_ref", default=""))
+    mixer_ref = str(_first(record, "mixer_strip_ref", "mixer_ref", default=""))
+    generic_ref = str(_first(record, "target_ref", default=""))
+    if generic_ref.startswith("trk_") and not track_ref:
+        track_ref = generic_ref
+    elif generic_ref and not mixer_ref:
+        mixer_ref = generic_ref
     output = _first(record, "output", "output_bus", "destination")
     group = _first(record, "group", "parent", "parent_name", "stack")
     parent_ref = _first(record, "parent_ref", "group_ref", "stack_ref")
@@ -125,9 +200,9 @@ def _normalise_record(record: dict, source: str) -> dict:
         "name": name,
         "index": index,
         "kind": classify_channel(record),
-        "track_ref": ref if ref.startswith("trk_") else str(record.get("track_ref") or ""),
-        "mixer_ref": ref if ref.startswith("mix_") else str(record.get("mixer_ref") or ""),
-        "target_ref": ref,
+        "track_ref": track_ref,
+        "mixer_ref": mixer_ref,
+        "target_ref": track_ref or mixer_ref or generic_ref,
         "output": output,
         "group": group,
         "parent_ref": parent_ref,
@@ -137,8 +212,9 @@ def _normalise_record(record: dict, source: str) -> dict:
         if isinstance(record.get("control_paths"), dict)
         else {},
         "strip_path": str(record.get("path") or record.get("strip_path") or ""),
-        "mute": record.get("mute"),
-        "solo": record.get("solo"),
+        "mute": _first(record, "mute", "muted", "isMuted"),
+        "solo": _first(record, "solo", "soloed", "isSoloed"),
+        "selected": _first(record, "selected", "is_selected", "isSelected"),
         "detail": record.get("detail", "unknown"),
         "sources": [source],
         "raw": {source: record},
@@ -235,6 +311,7 @@ def resolve_targets(channels: list[dict], scope: str, selector: str = "") -> dic
     if scope not in VALID_SCOPES:
         return {"error": f"scope must be one of {sorted(VALID_SCOPES)}"}
     candidates = [channel for channel in channels if scope == "all" or channel["kind"] == scope]
+    group_selector_fallback = False
     if selector:
         exact = [channel for channel in candidates if _selector_matches(channel, selector)]
         if not exact:
@@ -245,6 +322,18 @@ def resolve_targets(channels: list[dict], scope: str, selector: str = "") -> dic
                 if needle in str(channel.get("name") or "").casefold()
             ]
         candidates = exact
+    if not candidates and scope == "group" and selector:
+        exact_tracks = [
+            channel for channel in channels if _selector_matches(channel, selector)
+        ]
+        if len(exact_tracks) == 1:
+            candidates = exact_tracks
+            group_selector_fallback = True
+        elif len(exact_tracks) > 1:
+            return {
+                "error": "group selector is ambiguous across track records",
+                "matches": [channel.get("name") for channel in exact_tracks],
+            }
     if selector and len(candidates) > 1:
         return {
             "error": "selector is ambiguous",
@@ -263,6 +352,10 @@ def resolve_targets(channels: list[dict], scope: str, selector: str = "") -> dic
     resolved = []
     for channel in candidates:
         target = dict(channel)
+        if group_selector_fallback:
+            target["kind"] = "group"
+            target["group_resolution"] = "exact_named_track_fallback"
+            target["membership_complete"] = False
         refs = []
         primary = channel.get("track_ref") or (
             channel.get("target_ref")
@@ -271,7 +364,7 @@ def resolve_targets(channels: list[dict], scope: str, selector: str = "") -> dic
         )
         if primary:
             refs.append(primary)
-        if channel["kind"] == "group":
+        if target["kind"] == "group":
             group_tokens = {
                 str(channel.get("name") or "").casefold(),
                 str(channel.get("audit_id") or "").casefold(),
@@ -292,7 +385,11 @@ def resolve_targets(channels: list[dict], scope: str, selector: str = "") -> dic
                         refs.append(ref)
         target["isolation_refs"] = refs
         resolved.append(target)
-    return {"targets": resolved, "count": len(resolved)}
+    return {
+        "targets": resolved,
+        "count": len(resolved),
+        "group_selector_fallback": group_selector_fallback,
+    }
 
 
 def _step(step_id: str, phase: str, server: str, operation: str, arguments=None, **extra):
@@ -326,6 +423,7 @@ def build_plugin_inspection_steps(prefix: str, target: dict, inserts: list[str])
                         "dry_run": False,
                     },
                     target_id=target["audit_id"],
+                    requires_verified_result=True,
                 ),
                 _step(
                     f"{plugin_prefix}-snapshot",
@@ -349,6 +447,7 @@ def build_plugin_inspection_steps(prefix: str, target: dict, inserts: list[str])
                     },
                     target_id=target["audit_id"],
                     mutates_ui=True,
+                    requires_verified_result=True,
                 ),
                 _step(
                     f"{plugin_prefix}-parameters",
@@ -377,6 +476,7 @@ def build_plugin_inspection_steps(prefix: str, target: dict, inserts: list[str])
                     target_id=target["audit_id"],
                     mutates_ui=True,
                     always_run=True,
+                    requires_verified_result=True,
                 ),
                 _step(
                     f"{plugin_prefix}-close",
@@ -392,6 +492,84 @@ def build_plugin_inspection_steps(prefix: str, target: dict, inserts: list[str])
                     target_id=target["audit_id"],
                     mutates_ui=True,
                     always_run=True,
+                    requires_verified_result=True,
+                ),
+            ]
+        )
+    return steps
+
+
+def build_meter_measurement_steps(
+    prefix: str, target: dict, inserts: list[str]
+) -> list[dict]:
+    candidates = [
+        (index, plugin)
+        for index, plugin in enumerate(inserts)
+        if any(
+            term in str(plugin).casefold()
+            for term in ("meter", "loudness", "analyzer", "insight", "ozone")
+        )
+    ] if target.get("strip_path") else []
+    if not candidates:
+        return [
+            _step(
+                f"{prefix}-meter-unavailable",
+                "measure",
+                "client",
+                "record_limitation",
+                {
+                    "reason": "no existing analyzer insert was identified in the freshly read chain",
+                    "fallback": "bounce_bs1770",
+                },
+                target_id=target["audit_id"],
+            )
+        ]
+    steps = []
+    for meter_index, (insert_index, plugin) in enumerate(candidates):
+        meter_prefix = f"{prefix}-meter-{meter_index:02d}"
+        steps.extend(
+            [
+                _step(
+                    f"{meter_prefix}-open",
+                    "measure",
+                    "logic-plugins",
+                    "plugin_open_insert",
+                    {
+                        "strip_path": target["strip_path"],
+                        "insert_index": insert_index,
+                        "expected_strip": target["name"],
+                        "expected_plugin": plugin,
+                        "dry_run": False,
+                    },
+                    target_id=target["audit_id"],
+                    requires_verified_result=True,
+                ),
+                _step(
+                    f"{meter_prefix}-read",
+                    "measure",
+                    "logic-plugins",
+                    "plugin_meter_read",
+                    {
+                        "window_index": 1,
+                        "expected_plugin": plugin,
+                        "expected_channel": target["name"],
+                    },
+                    target_id=target["audit_id"],
+                ),
+                _step(
+                    f"{meter_prefix}-close",
+                    "measure",
+                    "logic-plugins",
+                    "plugin_close_verified",
+                    {
+                        "window_index": 1,
+                        "expected_plugin": plugin,
+                        "expected_channel": target["name"],
+                        "dry_run": False,
+                    },
+                    target_id=target["audit_id"],
+                    always_run=True,
+                    requires_verified_result=True,
                 ),
             ]
         )
@@ -428,7 +606,21 @@ def build_audit_plan(
     )
     plan_id = "audit-" + hashlib.sha256(seed.encode()).hexdigest()[:12]
     steps = [
-        _step("preflight-project", "preflight", "logic-pro", "logic_project.audit"),
+        _step(
+            "preflight-project",
+            "preflight",
+            "logic-plugins",
+            "mix_project_identity",
+            {"expected_project_path": project_path},
+            requires_verified_result=True,
+        ),
+        _step(
+            "preflight-project-audit",
+            "preflight",
+            "logic-pro",
+            "logic_project",
+            {"command": "audit", "params": {}},
+        ),
         _step(
             "capture-state",
             "capture",
@@ -453,24 +645,20 @@ def build_audit_plan(
     for position, target in enumerate(selected["targets"], start=1):
         prefix = f"target-{position:03d}-{target['audit_id']}"
         refs = target.get("isolation_refs", [])
-        if refs or (
-            "tracks" in target.get("sources", []) and target.get("index") is not None
-        ):
+        if "tracks" in target.get("sources", []) and target.get("index") is not None:
             steps.append(
                 _step(
                     f"{prefix}-inventory",
                     "inspect",
                     "logic-pro",
-                    "logic_plugins.get_inventory",
+                    "logic_plugins",
                     {
-                        **({"target_ref": refs[0]} if refs else {}),
-                        **(
-                            {"track": target["index"]}
-                            if not refs and target.get("index") is not None
-                            else {}
-                        ),
+                        "command": "get_inventory",
+                        "params": {"track": target["index"]},
                     },
                     target_id=target["audit_id"],
+                    continue_on_failure=True,
+                    fallback="fresh AX strip read",
                 )
             )
         else:
@@ -502,6 +690,7 @@ def build_audit_plan(
                         },
                         target_id=target["audit_id"],
                         mutates_ui=True,
+                        requires_verified_result=True,
                     ),
                     _step(
                         f"{prefix}-read-strip",
@@ -537,8 +726,8 @@ def build_audit_plan(
                 f"{prefix}-locate",
                 "measure",
                 "logic-pro",
-                "logic_transport.goto_position",
-                {"position": start_position},
+                "logic_transport",
+                {"command": "goto_position", "params": {"position": start_position}},
                 target_id=target["audit_id"],
                 mutates_logic=True,
                 compensation={"restore_from": "initial_state"},
@@ -564,6 +753,7 @@ def build_audit_plan(
                     target_id=target["audit_id"],
                     mutates_ui=True,
                     produces="artifact",
+                    requires_verified_result=True,
                 )
             )
             steps.append(
@@ -578,73 +768,23 @@ def build_audit_plan(
                 )
             )
         if measurement in {"existing_meter", "both"}:
-            meter_candidates = [
-                (index, plugin)
-                for index, plugin in enumerate(target.get("inserts", []))
-                if any(
-                    term in str(plugin).casefold()
-                    for term in ("meter", "loudness", "analyzer", "insight", "ozone")
-                )
-            ] if target.get("strip_path") else []
-            if not meter_candidates:
+            if target.get("strip_path"):
                 steps.append(
                     _step(
-                        f"{prefix}-meter-unavailable",
+                        f"{prefix}-meter-expand",
                         "measure",
-                        "client",
-                        "record_limitation",
-                        {
-                            "reason": "no existing analyzer insert was identified",
-                            "fallback": "bounce_bs1770",
-                        },
+                        "logic-plugins",
+                        "mix_expand_meter_steps",
                         target_id=target["audit_id"],
+                        meter_prefix=prefix,
+                        expand_meter_steps=True,
                     )
                 )
-            for meter_index, (insert_index, plugin) in enumerate(meter_candidates):
-                meter_prefix = f"{prefix}-meter-{meter_index:02d}"
+            else:
                 steps.extend(
-                    [
-                        _step(
-                            f"{meter_prefix}-open",
-                            "measure",
-                            "logic-plugins",
-                            "plugin_open_insert",
-                            {
-                                "strip_path": target["strip_path"],
-                                "insert_index": insert_index,
-                                "expected_strip": target["name"],
-                                "expected_plugin": plugin,
-                                "dry_run": False,
-                            },
-                            target_id=target["audit_id"],
-                        ),
-                        _step(
-                            f"{meter_prefix}-read",
-                            "measure",
-                            "logic-plugins",
-                            "plugin_meter_read",
-                            {
-                                "window_index": 1,
-                                "expected_plugin": plugin,
-                                "expected_channel": target["name"],
-                            },
-                            target_id=target["audit_id"],
-                        ),
-                        _step(
-                            f"{meter_prefix}-close",
-                            "measure",
-                            "logic-plugins",
-                            "plugin_close_verified",
-                            {
-                                "window_index": 1,
-                                "expected_plugin": plugin,
-                                "expected_channel": target["name"],
-                                "dry_run": False,
-                            },
-                            target_id=target["audit_id"],
-                            always_run=True,
-                        ),
-                    ]
+                    build_meter_measurement_steps(
+                        prefix, target, target.get("inserts", [])
+                    )
                 )
         steps.append(
             _step(
@@ -671,6 +811,12 @@ def build_audit_plan(
             requires_dispatch_execution=True,
         )
     )
+    contract_errors = validate_mature_steps(steps)
+    if contract_errors:
+        return {
+            "error": "internal mature-server dispatch contract is invalid",
+            "contract_errors": contract_errors,
+        }
     return {
         "schema": SCHEMA,
         "plan_id": plan_id,
@@ -762,7 +908,21 @@ def build_fix_plan(inventory: dict, fixes: list[dict], project_path: str) -> dic
     )
     plan_id = "fix-" + hashlib.sha256((project_path + seed).encode()).hexdigest()[:12]
     steps = [
-        _step("preflight-project", "preflight", "logic-pro", "logic_project.audit"),
+        _step(
+            "preflight-project",
+            "preflight",
+            "logic-plugins",
+            "mix_project_identity",
+            {"expected_project_path": project_path},
+            requires_verified_result=True,
+        ),
+        _step(
+            "preflight-project-audit",
+            "preflight",
+            "logic-pro",
+            "logic_project",
+            {"command": "audit", "params": {}},
+        ),
         _step(
             "capture-state",
             "capture",
@@ -814,6 +974,7 @@ def build_fix_plan(inventory: dict, fixes: list[dict], project_path: str) -> dic
                         "dry_run": False,
                     },
                     target_id=target["audit_id"],
+                    requires_verified_result=True,
                 ),
                 _step(
                     f"{prefix}-snapshot",
@@ -836,6 +997,7 @@ def build_fix_plan(inventory: dict, fixes: list[dict], project_path: str) -> dic
                     },
                     target_id=target["audit_id"],
                     mutates_ui=True,
+                    requires_verified_result=True,
                 ),
                 _step(
                     f"{prefix}-write",
@@ -853,6 +1015,7 @@ def build_fix_plan(inventory: dict, fixes: list[dict], project_path: str) -> dic
                     },
                     target_id=target["audit_id"],
                     writes_parameter=True,
+                    requires_verified_result=True,
                 ),
                 _step(
                     f"{prefix}-restore-view",
@@ -867,6 +1030,7 @@ def build_fix_plan(inventory: dict, fixes: list[dict], project_path: str) -> dic
                     arguments_from={"view": f"{prefix}-snapshot.view_selector"},
                     target_id=target["audit_id"],
                     always_run=True,
+                    requires_verified_result=True,
                 ),
                 _step(
                     f"{prefix}-close",
@@ -881,6 +1045,7 @@ def build_fix_plan(inventory: dict, fixes: list[dict], project_path: str) -> dic
                     },
                     target_id=target["audit_id"],
                     always_run=True,
+                    requires_verified_result=True,
                 ),
             ]
         )
@@ -896,6 +1061,12 @@ def build_fix_plan(inventory: dict, fixes: list[dict], project_path: str) -> dic
             requires_dispatch_execution=True,
         )
     )
+    contract_errors = validate_mature_steps(steps)
+    if contract_errors:
+        return {
+            "error": "internal mature-server dispatch contract is invalid",
+            "contract_errors": contract_errors,
+        }
     return {
         "schema": "logic_mix_fix_plan.v1",
         "plan_id": plan_id,
@@ -1024,8 +1195,8 @@ def build_isolation_dispatch(
     dispatches = []
     target_addressed = target_is_master
     for row in track_rows:
-        ref = str(_first(row, "target_ref", "track_ref", "id", default=""))
-        index = _integer(_first(row, "index", "trackIndex", "track_index"))
+        ref = str(_first(row, "target_ref", "track_ref", default=""))
+        index = _integer(_first(row, "index", "id", "trackIndex", "track_index"))
         selector = {"target_ref": ref} if ref.startswith("trk_") else ({"index": index} if index is not None else {})
         if not selector:
             continue
@@ -1036,14 +1207,17 @@ def build_isolation_dispatch(
             )
         if enabled:
             target_addressed = True
-        current = _boolean(_first(row, "solo", "soloed"))
+        current = _boolean(_first(row, "solo", "soloed", "isSoloed"))
         if current is None or current != enabled:
             dispatches.append(
                 {
                     "server": "logic-pro",
-                    "operation": "logic_tracks.solo",
-                    "arguments": {**selector, "enabled": enabled},
-                    "verify": {"resource": "logic://tracks", "field": "solo", "equals": enabled},
+                    "operation": "logic_tracks",
+                    "arguments": {
+                        "command": "solo",
+                        "params": {**selector, "enabled": enabled},
+                    },
+                    "verify": {"resource": "logic://tracks", "field": "isSoloed", "equals": enabled},
                 }
             )
     for row in ax_state or []:
@@ -1073,10 +1247,16 @@ def build_isolation_dispatch(
                     },
                 }
             )
+    contract_errors = [
+        {"dispatch": index, "error": detail}
+        for index, dispatch in enumerate(dispatches)
+        if dispatch.get("server") == "logic-pro"
+        if (detail := validate_mature_dispatch(dispatch["operation"], dispatch["arguments"]))
+    ]
     return {
         "schema": "logic_mix_isolation_dispatch.v1",
-        "ok": target_addressed,
-        "complete": target_addressed and bool(track_rows or ax_state),
+        "ok": target_addressed and not contract_errors,
+        "complete": target_addressed and bool(track_rows or ax_state) and not contract_errors,
         "target": {
             "name": target.get("name"),
             "kind": target.get("kind"),
@@ -1085,7 +1265,12 @@ def build_isolation_dispatch(
         "dispatch_count": len(dispatches),
         "dispatches": dispatches,
         "requires_execution_and_readback": True,
-        "error": None if target_addressed else "target could not be addressed for exclusive solo",
+        "contract_errors": contract_errors,
+        "error": (
+            "internal mature-server dispatch contract is invalid"
+            if contract_errors
+            else None if target_addressed else "target could not be addressed for exclusive solo"
+        ),
     }
 
 
@@ -1101,12 +1286,15 @@ def build_restore_dispatch(initial_state: dict, ax_state: list[dict] | None = No
     dispatches = []
     selected = None
     for row in track_rows:
-        ref = str(_first(row, "target_ref", "track_ref", "id", default=""))
-        index = _integer(_first(row, "index", "trackIndex", "track_index"))
+        ref = str(_first(row, "target_ref", "track_ref", default=""))
+        index = _integer(_first(row, "index", "id", "trackIndex", "track_index"))
         selector = {"target_ref": ref} if ref.startswith("trk_") else ({"index": index} if index is not None else {})
         if not selector:
             continue
-        for command, keys in (("solo", ("solo", "soloed")), ("mute", ("mute", "muted"))):
+        for command, keys in (
+            ("solo", ("solo", "soloed", "isSoloed")),
+            ("mute", ("mute", "muted", "isMuted")),
+        ):
             raw = _first(row, *keys)
             enabled = _boolean(raw)
             if enabled is None:
@@ -1114,19 +1302,26 @@ def build_restore_dispatch(initial_state: dict, ax_state: list[dict] | None = No
             dispatches.append(
                 {
                     "server": "logic-pro",
-                    "operation": f"logic_tracks.{command}",
-                    "arguments": {**selector, "enabled": enabled},
-                    "verify": {"resource": "logic://tracks", "field": command, "equals": enabled},
+                    "operation": "logic_tracks",
+                    "arguments": {
+                        "command": command,
+                        "params": {**selector, "enabled": enabled},
+                    },
+                    "verify": {
+                        "resource": "logic://tracks",
+                        "field": "isSoloed" if command == "solo" else "isMuted",
+                        "equals": enabled,
+                    },
                 }
             )
-        if _boolean(_first(row, "selected", "is_selected")):
+        if _boolean(_first(row, "selected", "is_selected", "isSelected")):
             selected = selector
     if selected:
         dispatches.append(
             {
                 "server": "logic-pro",
-                "operation": "logic_tracks.select",
-                "arguments": selected,
+                "operation": "logic_tracks",
+                "arguments": {"command": "select", "params": selected},
             }
         )
     position = _first(transport, "position", "playhead_position", "playhead")
@@ -1134,30 +1329,41 @@ def build_restore_dispatch(initial_state: dict, ax_state: list[dict] | None = No
         dispatches.append(
             {
                 "server": "logic-pro",
-                "operation": "logic_transport.goto_position",
-                "arguments": {"position": str(position)},
+                "operation": "logic_transport",
+                "arguments": {
+                    "command": "goto_position",
+                    "params": {"position": str(position)},
+                },
             }
         )
-    cycle = _boolean(_first(transport, "cycle", "cycle_enabled"))
+    cycle = _boolean(_first(transport, "cycle", "cycle_enabled", "isCycleEnabled"))
     if cycle is not None:
         dispatches.append(
             {
-                "server": "logic-pro",
-                "operation": "client.ensure_transport_state",
-                "arguments": {"field": "cycle", "equals": cycle, "toggle_command": "toggle_cycle"},
+                "server": "client",
+                "operation": "ensure_resource_state",
+                "arguments": {
+                    "resource": "logic://transport/state",
+                    "field": "isCycleEnabled",
+                    "equals": cycle,
+                    "tool": "logic_transport",
+                    "command_if_mismatch": "toggle_cycle",
+                },
             }
         )
-    playing = _boolean(_first(transport, "playing", "is_playing"))
+    playing = _boolean(_first(transport, "playing", "is_playing", "isPlaying"))
     if playing is not None:
         dispatches.append(
             {
-                "server": "logic-pro",
-                "operation": "client.ensure_transport_state",
+                "server": "client",
+                "operation": "ensure_resource_state",
                 "arguments": {
-                    "field": "playing",
+                    "resource": "logic://transport/state",
+                    "field": "isPlaying",
                     "equals": playing,
-                    "true_command": "play",
-                    "false_command": "stop",
+                    "tool": "logic_transport",
+                    "command_if_true": "play",
+                    "command_if_false": "stop",
                 },
             }
         )
@@ -1181,11 +1387,18 @@ def build_restore_dispatch(initial_state: dict, ax_state: list[dict] | None = No
                     },
                 }
             )
+    contract_errors = [
+        {"dispatch": index, "error": detail}
+        for index, dispatch in enumerate(dispatches)
+        if dispatch.get("server") == "logic-pro"
+        if (detail := validate_mature_dispatch(dispatch["operation"], dispatch["arguments"]))
+    ]
     return {
         "schema": "logic_mix_restore_dispatch.v1",
         "dispatch_count": len(dispatches),
         "dispatches": dispatches,
-        "complete": bool(track_rows) and bool(transport),
+        "complete": bool(track_rows) and bool(transport) and not contract_errors,
+        "contract_errors": contract_errors,
         "note": "each intent must be read back; missing fields are never guessed",
     }
 

@@ -1,5 +1,6 @@
 import unittest
 from unittest import mock
+from pathlib import Path
 
 import logic_plugins_mcp as plugins
 
@@ -19,6 +20,43 @@ class NumberHandlingTests(unittest.TestCase):
         self.assertEqual(plugins.fader_db_from_raw("113,0"), -6.0)
         self.assertIsNone(plugins.fader_db_from_raw("112.9"))
         self.assertIsNone(plugins.fader_db_from_raw("not a number"))
+
+
+class ProjectIdentityTests(unittest.TestCase):
+    def test_tracks_window_title_selects_active_bundle_not_shorter_template(self):
+        selected = plugins.select_open_logic_project(
+            "Project - Tracks",
+            [
+                Path("/Users/test/Music/Templates/01 Hip Hop.logicx"),
+                Path("/Volumes/Work/Video/Project.logicx"),
+            ],
+        )
+        self.assertEqual(selected, Path("/Volumes/Work/Video/Project.logicx"))
+
+    def test_duplicate_project_names_fail_closed(self):
+        selected = plugins.select_open_logic_project(
+            "Song.logicx - Tracks",
+            [Path("/Volumes/A/Song.logicx"), Path("/Volumes/B/Song.logicx")],
+        )
+        self.assertIsNone(selected)
+
+    def test_exact_open_project_is_verified_without_writing(self):
+        with mock.patch.object(
+            plugins, "find_open_logic_project", return_value=Path("/tmp/Test.logicx")
+        ):
+            result = plugins.mix_project_identity("/tmp/Test.logicx")
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["verified"])
+        self.assertFalse(result["write_attempted"])
+
+    def test_wrong_open_project_fails_closed(self):
+        with mock.patch.object(
+            plugins, "find_open_logic_project", return_value=Path("/tmp/Other.logicx")
+        ):
+            result = plugins.mix_project_identity("/tmp/Test.logicx")
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["verified"])
+        self.assertIn("does not match", result["error"])
 
 
 class WindowSelectionTests(unittest.TestCase):
@@ -190,7 +228,56 @@ class MeterReadTests(unittest.TestCase):
 
 
 class AuditStateMachineTests(unittest.TestCase):
-    def test_preflight_failure_jumps_to_final_restore(self):
+    def test_cancel_before_any_mutation_requires_no_restore(self):
+        plan = plugins.mix_audit_plan(
+            tracks={"data": [{"id": 0, "name": "Kick", "type": "audio"}]},
+            mixer={},
+            ax_channels={},
+            scope="track",
+            selector="Kick",
+            project_path="/tmp/Test.logicx",
+            output_root="/tmp/logic-audits",
+        )
+        cancelled = plugins.mix_audit_cancel(plan["plan_id"])
+        self.assertTrue(cancelled["complete"])
+        self.assertFalse(cancelled["state_restore_required"])
+        self.assertIsNone(cancelled["next_step"])
+
+    def test_cancel_with_open_editor_keeps_verified_close_cleanup(self):
+        plan = plugins.mix_audit_plan(
+            tracks={"data": [{"id": 0, "name": "Kick", "type": "audio"}]},
+            mixer={},
+            ax_channels={"strips": [{"index": 0, "name": "Kick", "path": "8.1"}]},
+            scope="track",
+            selector="Kick",
+            project_path="/tmp/Test.logicx",
+            output_root="/tmp/logic-audits",
+        )
+        run = plugins.AUDIT_PLANS[plan["plan_id"]]
+        read_index = next(
+            index for index, step in enumerate(run["plan"]["steps"])
+            if step["operation"] == "mixer_read_strip"
+        )
+        for step in run["plan"]["steps"][:read_index]:
+            step["status"] = "completed"
+        run["confirmed"] = True
+        run["current"] = read_index
+        read_step = run["plan"]["steps"][read_index]
+        plugins.mix_audit_advance(
+            plan["plan_id"],
+            read_step["step_id"],
+            {"ok": True, "path": "8.1", "inserts": ["Channel EQ"]},
+        )
+        open_step = plugins.audit_next_step(run)
+        open_step["status"] = "completed"
+        run["results"][open_step["step_id"]] = {"ok": True, "verified": True}
+        run["current"] += 1
+        cancelled = plugins.mix_audit_cancel(plan["plan_id"])
+        self.assertFalse(cancelled["complete"])
+        self.assertTrue(cancelled["next_step"]["step_id"].endswith("-restore-view"))
+        self.assertTrue(any(item.endswith("-close") for item in cancelled["cleanup_steps"]))
+
+    def test_preflight_failure_completes_without_stale_restore(self):
         plan = plugins.mix_audit_plan(
             tracks={
                 "data": [
@@ -216,8 +303,72 @@ class AuditStateMachineTests(unittest.TestCase):
             "preflight-project",
             {"ok": False, "error": "project audit failed"},
         )
-        self.assertEqual(advanced["next_step"]["step_id"], "final-restore")
-        self.assertEqual(advanced["next_step"]["arguments"]["initial_state"], {})
+        self.assertTrue(advanced["complete"])
+        self.assertIsNone(advanced["next_step"])
+        run = plugins.AUDIT_PLANS[plan["plan_id"]]
+        self.assertTrue(
+            all(
+                step["status"] == "skipped"
+                for step in run["plan"]["steps"][1:]
+            )
+        )
+
+    def test_verified_step_cannot_pass_with_ok_true_only(self):
+        plan = plugins.mix_audit_plan(
+            tracks={
+                "data": [
+                    {
+                        "index": 0,
+                        "name": "Kick",
+                        "type": "Audio",
+                        "target_ref": "trk_kick",
+                    }
+                ]
+            },
+            mixer={},
+            ax_channels={},
+            scope="track",
+            selector="Kick",
+            project_path="/tmp/Test.logicx",
+            output_root="/tmp/logic-audits",
+        )
+        plugins.mix_audit_start(plan["plan_id"], confirm=True)
+        advanced = plugins.mix_audit_advance(
+            plan["plan_id"],
+            "preflight-project",
+            {"ok": True, "verified": False},
+        )
+        self.assertTrue(advanced["failed"])
+        self.assertTrue(advanced["complete"])
+        self.assertIsNone(advanced["next_step"])
+
+    def test_audit_results_exposes_paged_evidence(self):
+        plan = plugins.mix_audit_plan(
+            tracks={"data": [{"id": 0, "name": "Kick", "type": "audio"}]},
+            mixer={},
+            ax_channels={},
+            scope="track",
+            selector="Kick",
+            project_path="/tmp/Test.logicx",
+            output_root="/tmp/logic-audits",
+        )
+        plugins.mix_audit_start(plan["plan_id"], confirm=True)
+        plugins.mix_audit_advance(
+            plan["plan_id"],
+            "preflight-project",
+            {
+                "ok": True,
+                "verified": True,
+                "observed_project_path": "/tmp/Test.logicx",
+            },
+        )
+        result = plugins.mix_audit_results(
+            plan["plan_id"], phase="preflight", limit=1, include_payload=True
+        )
+        self.assertEqual(result["matched"], 1)
+        self.assertEqual(result["returned"], 1)
+        self.assertEqual(result["results"][0]["operation"], "mix_project_identity")
+        self.assertTrue(result["results"][0]["result"]["verified"])
 
     def test_fresh_strip_read_expands_each_insert_into_verified_steps(self):
         plan = plugins.mix_audit_plan(
@@ -251,6 +402,77 @@ class AuditStateMachineTests(unittest.TestCase):
             sum(1 for step in expanded if step["operation"] == "plugin_open_insert"),
             2,
         )
+
+    def test_mature_inventory_timeout_falls_back_to_ax_instead_of_aborting_target(self):
+        plan = plugins.mix_audit_plan(
+            tracks={"data": [{"id": 0, "name": "Kick", "type": "audio"}]},
+            mixer={},
+            ax_channels={"strips": [{"index": 0, "name": "Kick", "path": "8.1"}]},
+            scope="track",
+            selector="Kick",
+            project_path="/tmp/Test.logicx",
+            output_root="/tmp/logic-audits",
+        )
+        run = plugins.AUDIT_PLANS[plan["plan_id"]]
+        run["confirmed"] = True
+        inventory_index = next(
+            index
+            for index, step in enumerate(run["plan"]["steps"])
+            if step["operation"] == "logic_plugins"
+            and step["arguments"].get("command") == "get_inventory"
+        )
+        for step in run["plan"]["steps"][:inventory_index]:
+            step["status"] = "completed"
+        run["current"] = inventory_index
+        inventory_step = run["plan"]["steps"][inventory_index]
+        advanced = plugins.mix_audit_advance(
+            plan["plan_id"],
+            inventory_step["step_id"],
+            {"ok": False, "error": "operation_timeout"},
+        )
+        self.assertTrue(advanced["failed"])
+        self.assertEqual(advanced["next_step"]["operation"], "mixer_reveal_strip")
+
+    def test_fresh_strip_read_expands_meter_candidates_at_measurement_position(self):
+        plan = plugins.mix_audit_plan(
+            tracks={"data": [{"index": 0, "name": "Master", "type": "Output"}]},
+            mixer={},
+            ax_channels={"strips": [{"index": 0, "name": "Master", "path": "8.1"}]},
+            scope="master",
+            selector="Master",
+            project_path="/tmp/Test.logicx",
+            output_root="/tmp/logic-audits",
+            measurement="existing_meter",
+        )
+        run = plugins.AUDIT_PLANS[plan["plan_id"]]
+        run["confirmed"] = True
+        read_index = next(
+            index
+            for index, step in enumerate(run["plan"]["steps"])
+            if step["operation"] == "mixer_read_strip"
+        )
+        for step in run["plan"]["steps"][:read_index]:
+            step["status"] = "completed"
+        run["current"] = read_index
+        read_step = run["plan"]["steps"][read_index]
+        plugins.mix_audit_advance(
+            plan["plan_id"],
+            read_step["step_id"],
+            {
+                "ok": True,
+                "name": "Master",
+                "path": "8.1",
+                "inserts": ["Ozone 9 Elements", "Loudness Meter"],
+            },
+        )
+        steps = run["plan"]["steps"]
+        self.assertFalse(any(step["operation"] == "mix_expand_meter_steps" for step in steps))
+        meter_reads = [step for step in steps if step["operation"] == "plugin_meter_read"]
+        self.assertEqual(len(meter_reads), 2)
+        isolate_index = next(
+            index for index, step in enumerate(steps) if step["operation"] == "mix_isolation_dispatch"
+        )
+        self.assertTrue(all(steps.index(step) > isolate_index for step in meter_reads))
 
 
 if __name__ == "__main__":

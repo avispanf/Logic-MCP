@@ -44,7 +44,28 @@ BS.1770 → restore plan. `mix_audit_start`, `mix_audit_advance`, `mix_audit_sta
 cross-server dispatches to the MCP client instead of launching a second LogicProMCP
 process, so one request can use the three registered servers without duplicate MCU ports.
 
+Every mature-server dispatch uses the actual v3.13 wire shape: the MCP tool is
+`logic_tracks`, `logic_transport`, `logic_project` or `logic_plugins`, while the selected
+action and its arguments are nested under `command` and `params`. Audit and fix runs first
+verify the exact open `.logicx` bundle locally, then run the mature server's read-only
+project audit. This prevents a syntactically valid plan from being applied to another
+frontmost project.
+`health` and `--check` compare the installed `LogicProMCP --version` with the pinned
+dispatch contract version and warn instead of silently assuming a future release is wire
+compatible.
+
 `mix_audit_review` turns per-target LUFS/True Peak results into non-writing recommendations.
+Completed and failed step evidence is available through paged `mix_audit_results`, with
+optional target/phase filters and compact or full payloads; a large all-mixer parameter
+run therefore does not depend on the MCP client retaining every intermediate response.
+Analyzer candidates are expanded only after the target strip has been revealed and freshly
+read, so an off-screen Ozone or Loudness Meter is not missed because the initial inventory
+was partial. Cancellation before mutation is a no-op; cancellation after an editor opens
+keeps only that editor's verified cleanup, and state restore is retained only after
+isolation, transport or bounce has begun.
+The mature server's `logic_plugins get_inventory` is supplemental: its measured 25-second
+timeout falls back to the fresh AX strip read and is recorded as failed evidence instead of
+aborting that target.
 `mix_fix_plan` takes explicit target/plugin/parameter/value fixes. At apply time it reopens
 the exact signal-flow insert, re-resolves one exact Controls-table label, optionally checks
 the expected old value, writes with plugin/channel identity binding and read-back, restores
@@ -84,7 +105,10 @@ python3 -m venv ~/dev/venv
 ```
 
 Register in the MCP client of your choice, pointing `command` at the venv interpreter
-and `args` at the script. Both servers accept `--check` for a readiness report.
+and `args` at the scripts inside this checkout (for example,
+`/Users/you/dev/Logic-MCP/logic_plugins_mcp.py`), not at copied sibling files. Both
+servers accept `--check` for a readiness report. Restart/reload the MCP client after a
+code update so its long-running stdio process registers the current tool set.
 
 macOS permissions: Accessibility must be granted to the process that launches the
 server, not to the script. Automation for Logic Pro and System Events is also required.
@@ -170,10 +194,10 @@ compiled, imported and registered all tools, and only failed when a write was at
 ## Limitations
 
 Instrument editors cannot be read through accessibility: they expose thousands of elements
-and overrun any sensible budget. Plugin windows must be opened manually; `ax_press` can
-press an insert slot, but nothing here drives that automatically. Insert order cannot be
-changed and plugins cannot be removed. `ProjectData` is not parsed, so arrangement data
-comes from a MIDI export.
+and overrun any sensible budget. Audio-effect editors are opened automatically from their
+verified signal-flow insert; stale strip paths, changed plugin names and ambiguous duplicate
+inserts are refused. Insert order cannot be changed and plugins cannot be removed.
+`ProjectData` is not parsed, so arrangement data comes from a MIDI export.
 
 The audit coordinator is deliberately a cross-server state machine: the MCP client must
 execute each returned dispatch and feed its result to `mix_audit_advance`. It cannot call
@@ -185,11 +209,13 @@ Isolation and restoration tools return child dispatch lists. The coordinator ref
 advance these steps unless the MCP client reports both `executed: true` and
 `verified: true` after running and reading back every child operation.
 
-Group membership is exact when the mature track resource exposes stack parent/member data.
-Name-based classification is only a fallback. Mixer-only Aux/Bus operations require a
-current full-detail AX strip; off-screen generic strips are reported as incomplete and are
-not guessed. Existing analyzer plugins are read when they expose numeric AX values;
-otherwise bounce plus BS.1770 is the authoritative measurement path.
+Group membership is exact when an input inventory exposes stack parent/member data. The
+v3.13 `logic://tracks` base schema does not, so `scope=group` also supports one explicit
+exact-name fallback: it binds that named track as the stack root and reports
+`membership_complete=false`; it never guesses an unnamed set of groups. Mixer-only Aux/Bus
+operations require a current full-detail AX strip; off-screen generic strips are reported
+as incomplete and are not guessed. Existing analyzer plugins are read when they expose
+numeric AX values; otherwise bounce plus BS.1770 is the authoritative measurement path.
 
 Known rough edges, stated plainly because they were measured rather than assumed:
 `strip_settings_inspect` has never been given a real channel strip file; and `keys_fire` in

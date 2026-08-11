@@ -16,6 +16,36 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(audit.classify_channel({"name": "Bus 12"}), "bus")
 
 
+class MatureDispatchContractTests(unittest.TestCase):
+    def test_valid_v313_track_payload_is_accepted(self):
+        self.assertIsNone(
+            audit.validate_mature_dispatch(
+                "logic_tracks",
+                {
+                    "command": "solo",
+                    "params": {"target_ref": "trk_kick", "enabled": True},
+                },
+            )
+        )
+
+    def test_dotted_tool_name_and_flat_params_are_refused(self):
+        self.assertIn(
+            "unknown mature-server tool",
+            audit.validate_mature_dispatch(
+                "logic_tracks.solo", {"target_ref": "trk_kick", "enabled": True}
+            ),
+        )
+
+    def test_get_inventory_ref_is_refused_because_v313_requires_track_index(self):
+        self.assertIn(
+            "non-negative integer track",
+            audit.validate_mature_dispatch(
+                "logic_plugins",
+                {"command": "get_inventory", "params": {"target_ref": "trk_kick"}},
+            ),
+        )
+
+
 class InventoryTests(unittest.TestCase):
     def setUp(self):
         self.tracks = {
@@ -65,6 +95,64 @@ class InventoryTests(unittest.TestCase):
             result["targets"][0]["isolation_refs"],
             ["trk_drums", "trk_snare"],
         )
+
+    def test_named_group_fallback_binds_exact_track_when_v313_has_no_stack_metadata(self):
+        channels = audit.normalise_inventory(
+            {
+                "data": [
+                    {
+                        "id": 4,
+                        "name": "DRUMS",
+                        "type": "audio",
+                        "track_ref": "trk_drums",
+                    }
+                ]
+            },
+            None,
+            None,
+        )["channels"]
+        result = audit.resolve_targets(channels, "group", "DRUMS")
+        self.assertTrue(result["group_selector_fallback"])
+        target = result["targets"][0]
+        self.assertEqual(target["kind"], "group")
+        self.assertEqual(target["group_resolution"], "exact_named_track_fallback")
+        self.assertFalse(target["membership_complete"])
+        self.assertEqual(target["isolation_refs"], ["trk_drums"])
+
+    def test_real_v313_track_and_mixer_resource_keys_merge(self):
+        inventory = audit.normalise_inventory(
+            {
+                "data": [
+                    {
+                        "id": 0,
+                        "name": "Kick",
+                        "type": "audio",
+                        "isMuted": False,
+                        "isSoloed": True,
+                        "isSelected": True,
+                        "track_ref": "trk_kick",
+                    }
+                ]
+            },
+            {
+                "strips": [
+                    {
+                        "trackIndex": 0,
+                        "mixer_strip_ref": "mxr_kick",
+                        "volume": 0.5,
+                    }
+                ]
+            },
+            None,
+        )
+        self.assertEqual(inventory["count"], 1)
+        kick = inventory["channels"][0]
+        self.assertEqual(kick["index"], 0)
+        self.assertEqual(kick["track_ref"], "trk_kick")
+        self.assertEqual(kick["mixer_ref"], "mxr_kick")
+        self.assertTrue(kick["solo"])
+        self.assertFalse(kick["mute"])
+        self.assertTrue(kick["selected"])
 
 
 class PlanTests(unittest.TestCase):
@@ -127,8 +215,47 @@ class PlanTests(unittest.TestCase):
         )
         self.assertEqual(
             isolation["dispatches"][0]["arguments"],
-            {"index": 4, "enabled": True},
+            {
+                "command": "solo",
+                "params": {"index": 4, "enabled": True},
+            },
         )
+
+    def test_mature_server_steps_use_real_command_params_wire_shape(self):
+        inventory = audit.normalise_inventory(
+            {"data": [{"index": 0, "name": "Kick", "type": "Audio", "target_ref": "trk_kick"}]},
+            None,
+            {"channels": [{"index": 0, "name": "Kick", "path": "8.1"}]},
+        )
+        plan = audit.build_audit_plan(
+            inventory,
+            "track",
+            "Kick",
+            "/tmp/Test.logicx",
+            "/tmp/logic-audits",
+        )
+        project_audit = next(
+            step for step in plan["steps"] if step["step_id"] == "preflight-project-audit"
+        )
+        self.assertEqual(project_audit["operation"], "logic_project")
+        self.assertEqual(project_audit["arguments"], {"command": "audit", "params": {}})
+        inventory_step = next(
+            step
+            for step in plan["steps"]
+            if step["operation"] == "logic_plugins"
+            and step["arguments"].get("command") == "get_inventory"
+        )
+        self.assertEqual(
+            inventory_step["arguments"],
+            {"command": "get_inventory", "params": {"track": 0}},
+        )
+        locate = next(
+            step
+            for step in plan["steps"]
+            if step["operation"] == "logic_transport"
+            and step["arguments"].get("command") == "goto_position"
+        )
+        self.assertEqual(locate["arguments"]["params"], {"position": "1.1.1.1"})
 
     def test_mixer_only_aux_uses_verified_ax_solo_not_track_index(self):
         inventory = audit.normalise_inventory(
@@ -167,7 +294,8 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(solo["arguments"]["strip_path"], "8.7")
         self.assertFalse(
             any(
-                step["operation"] == "logic_plugins.get_inventory"
+                step["operation"] == "logic_plugins"
+                and step["arguments"].get("command") == "get_inventory"
                 for step in plan["steps"]
             )
         )
@@ -239,6 +367,51 @@ class ReviewTests(unittest.TestCase):
 
 
 class RestoreTests(unittest.TestCase):
+    def test_real_v313_state_keys_drive_isolation_and_restore(self):
+        initial = {
+            "logic://tracks": {
+                "data": [
+                    {
+                        "id": 0,
+                        "name": "Kick",
+                        "track_ref": "trk_kick",
+                        "isSoloed": False,
+                        "isMuted": True,
+                        "isSelected": True,
+                    }
+                ]
+            },
+            "logic://transport/state": {
+                "isPlaying": False,
+                "isCycleEnabled": True,
+                "position": "3.1.1.1",
+            },
+        }
+        isolation = audit.build_isolation_dispatch(
+            initial,
+            {
+                "name": "Kick",
+                "kind": "track",
+                "audit_id": "kick",
+                "sources": ["tracks"],
+                "index": 0,
+                "isolation_refs": ["trk_kick"],
+            },
+        )
+        self.assertTrue(isolation["complete"])
+        self.assertEqual(isolation["dispatches"][0]["arguments"]["command"], "solo")
+        restore = audit.build_restore_dispatch(initial)
+        commands = [
+            item["arguments"].get("command")
+            for item in restore["dispatches"]
+            if item["operation"] == "logic_tracks"
+        ]
+        self.assertEqual(commands, ["solo", "mute", "select"])
+        self.assertEqual(
+            sum(item["operation"] == "ensure_resource_state" for item in restore["dispatches"]),
+            2,
+        )
+
     def test_master_isolation_clears_all_preexisting_solos(self):
         result = audit.build_isolation_dispatch(
             {
@@ -253,7 +426,13 @@ class RestoreTests(unittest.TestCase):
         )
         self.assertTrue(result["complete"])
         self.assertEqual(result["dispatch_count"], 1)
-        self.assertEqual(result["dispatches"][0]["arguments"]["enabled"], False)
+        self.assertEqual(
+            result["dispatches"][0]["arguments"],
+            {
+                "command": "solo",
+                "params": {"target_ref": "trk_a", "enabled": False},
+            },
+        )
 
     def test_restore_dispatch_preserves_solo_mute_selection_transport_and_cycle(self):
         result = audit.build_restore_dispatch(
@@ -276,12 +455,24 @@ class RestoreTests(unittest.TestCase):
                 },
             }
         )
-        operations = [item["operation"] for item in result["dispatches"]]
-        self.assertIn("logic_tracks.solo", operations)
-        self.assertIn("logic_tracks.mute", operations)
-        self.assertIn("logic_tracks.select", operations)
-        self.assertIn("logic_transport.goto_position", operations)
-        self.assertEqual(operations.count("client.ensure_transport_state"), 2)
+        mature_commands = [
+            item["arguments"].get("command")
+            for item in result["dispatches"]
+            if item["operation"] in {"logic_tracks", "logic_transport"}
+        ]
+        self.assertIn("solo", mature_commands)
+        self.assertIn("mute", mature_commands)
+        self.assertIn("select", mature_commands)
+        self.assertIn("goto_position", mature_commands)
+        self.assertEqual(
+            sum(
+                1
+                for item in result["dispatches"]
+                if item["server"] == "client"
+                and item["operation"] == "ensure_resource_state"
+            ),
+            2,
+        )
         self.assertTrue(result["complete"])
 
     def test_mixer_only_aux_state_is_restored_through_verified_ax_toggle(self):

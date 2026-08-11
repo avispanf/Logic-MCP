@@ -43,6 +43,7 @@ AUDIO_UNIT_TYPES = {
     "aumi",  # MIDI processor
     "ausp",  # speech synthesizer
 }
+MATURE_DISPATCH_CONTRACT_VERSION = "3.13.0"
 
 
 class AudioComponentDescription(ctypes.Structure):
@@ -131,6 +132,20 @@ def logic_process() -> str | None:
         if proc.returncode == 0:
             return name
     return None
+
+
+def logic_pro_mcp_version() -> str | None:
+    binary = shutil.which("LogicProMCP")
+    if not binary:
+        return None
+    try:
+        result = subprocess.run(
+            [binary, "--version"], capture_output=True, text=True, timeout=10
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    version = (result.stdout or result.stderr).strip().splitlines()
+    return version[-1].strip() if result.returncode == 0 and version else None
 
 
 def require_logic() -> str:
@@ -1174,7 +1189,13 @@ def plugin_set_view(
         return {"ok": False, "error": "this window has no view menu; it may not be a plugin editor"}
     current = menu["name"] or menu["value"]
     if current == view:
-        return {"ok": True, "view": current, "changed": False, "note": "already in that view"}
+        return {
+            "ok": True,
+            "verified": True,
+            "view": current,
+            "changed": False,
+            "note": "already in that view",
+        }
     reference = element_reference(menu["path"], int(window_index))
     try:
         osa(
@@ -3077,9 +3098,33 @@ def plugin_meter_read(
     }
 
 
+def select_open_logic_project(project_title: str, candidates: list[Path]) -> Path | None:
+    """Select one project bundle by the exact Tracks-window title. Logic keeps many
+    template and Live Loops bundles open, so shortest-path or first-path selection is
+    unsafe. Ambiguous and missing matches intentionally resolve to None."""
+    title = str(project_title or "").strip()
+    if title.endswith(" - Tracks"):
+        title = title[: -len(" - Tracks")].strip()
+    folded = title.casefold()
+    matches = {
+        candidate
+        for candidate in candidates
+        if candidate.name.casefold() == folded or candidate.stem.casefold() == folded
+    }
+    return next(iter(matches)) if len(matches) == 1 else None
+
+
 def find_open_logic_project() -> Path | None:
     process = logic_process()
     if process is None:
+        return None
+    tracks_titles = [
+        window.get("title", "")
+        for window in ax_windows().get("windows", [])
+        if window.get("subrole") == "AXStandardWindow"
+        and str(window.get("title", "")).endswith(" - Tracks")
+    ]
+    if len(tracks_titles) != 1:
         return None
     pid_result = subprocess.run(["pgrep", "-x", process], capture_output=True, text=True)
     if pid_result.returncode != 0 or not pid_result.stdout.split():
@@ -3096,7 +3141,42 @@ def find_open_logic_project() -> Path | None:
         match = re.search(r"^(.*?\.logicx)(/|$)", line[1:])
         if match:
             candidates.append(Path(match.group(1)))
-    return sorted(set(candidates), key=lambda item: len(str(item)))[0] if candidates else None
+    return select_open_logic_project(tracks_titles[0], candidates)
+
+
+@tool
+def mix_project_identity(expected_project_path: str = "") -> dict:
+    """Read the open project bundle from Logic's file descriptors and optionally verify
+    it against an exact absolute path. Audit and fix plans use this local preflight before
+    any UI, solo, transport, bounce or parameter mutation."""
+    expected = Path(expected_project_path).expanduser() if expected_project_path else None
+    if expected is not None and not expected.is_absolute():
+        return {
+            "ok": False,
+            "verified": False,
+            "write_attempted": False,
+            "error": "expected_project_path must be absolute",
+        }
+    observed = find_open_logic_project()
+    matches = bool(
+        observed
+        and (
+            expected is None
+            or observed.resolve(strict=False) == expected.resolve(strict=False)
+        )
+    )
+    result = {
+        "ok": matches,
+        "verified": matches,
+        "write_attempted": False,
+        "observed_project_path": str(observed) if observed else None,
+        "expected_project_path": str(expected) if expected else None,
+    }
+    if observed is None:
+        result["error"] = "no open Logic project bundle could be resolved"
+    elif expected is not None and not matches:
+        result["error"] = "open project identity does not match the plan"
+    return result
 
 
 def logic_bounce_script() -> Path | None:
@@ -3179,7 +3259,20 @@ def mix_bounce_target(
             **preview,
             "error": (err or line or "bounce driver returned no result").strip(),
         }
-    return {"ok": bool(result.get("success")), **result}
+    artifact = Path(str(result.get("artifact") or ""))
+    verified = bool(
+        result.get("success")
+        and artifact.is_file()
+        and artifact.stat().st_size > 0
+        and artifact.parent.resolve(strict=False) == target.parent.resolve(strict=False)
+        and artifact.stem == target.stem
+    )
+    return {
+        "ok": verified,
+        "verified": verified,
+        **result,
+        **({"error": "bounce result did not verify the planned artifact"} if not verified and not result.get("error") else {}),
+    }
 
 
 @tool
@@ -3337,11 +3430,24 @@ def mix_audit_advance(plan_id: str, step_id: str, result: dict) -> dict:
     dispatch_incomplete = step.get("requires_dispatch_execution") and not (
         result.get("executed") is True and result.get("verified") is True
     )
-    failed = bool(result.get("error")) or result.get("ok") is False or dispatch_incomplete
+    verification_incomplete = (
+        step.get("requires_verified_result") and result.get("verified") is not True
+    )
+    failed = (
+        bool(result.get("error"))
+        or result.get("ok") is False
+        or dispatch_incomplete
+        or verification_incomplete
+    )
     if dispatch_incomplete:
         result = {
             **result,
             "error": "child dispatches were not reported as executed and verified",
+        }
+    elif verification_incomplete:
+        result = {
+            **result,
+            "error": "step did not return verified true",
         }
     step["status"] = "failed" if failed else "completed"
     run["results"][step_id] = result
@@ -3363,13 +3469,30 @@ def mix_audit_advance(plan_id: str, step_id: str, result: dict) -> dict:
                 step.get("plugin_prefix") or step["step_id"], target, inserts
             )
             run["plan"]["steps"][run["current"] : run["current"]] = expanded
-    if failed and step["phase"] != "restore":
-        remaining = run["plan"]["steps"][run["current"] :]
-        if step["phase"] in ("preflight", "capture"):
-            destination = next(
-                (pending for pending in reversed(remaining) if pending.get("always_run")),
+            meter_placeholder = next(
+                (
+                    pending
+                    for pending in run["plan"]["steps"]
+                    if pending.get("expand_meter_steps")
+                    and pending.get("target_id") == step.get("target_id")
+                ),
                 None,
             )
+            if meter_placeholder is not None:
+                meter_index = run["plan"]["steps"].index(meter_placeholder)
+                meter_steps = mix_audit.build_meter_measurement_steps(
+                    meter_placeholder.get("meter_prefix") or step["step_id"],
+                    target,
+                    inserts,
+                )
+                run["plan"]["steps"][meter_index : meter_index + 1] = meter_steps
+    if failed and step["phase"] != "restore" and not step.get("continue_on_failure"):
+        remaining = run["plan"]["steps"][run["current"] :]
+        if step["phase"] in ("preflight", "capture"):
+            for pending in remaining:
+                pending["status"] = "skipped"
+            run["current"] = len(run["plan"]["steps"])
+            destination = None
         else:
             destination = next(
                 (
@@ -3385,11 +3508,12 @@ def mix_audit_advance(plan_id: str, step_id: str, result: dict) -> dict:
                     (pending for pending in reversed(remaining) if pending.get("always_run")),
                     None,
                 )
-        for pending in remaining:
-            if pending is destination:
-                run["current"] = run["plan"]["steps"].index(pending)
-                break
-            pending["status"] = "skipped"
+        if destination is not None:
+            for pending in remaining:
+                if pending is destination:
+                    run["current"] = run["plan"]["steps"].index(pending)
+                    break
+                pending["status"] = "skipped"
     next_step = audit_next_step(run)
     return {
         "plan_id": plan_id,
@@ -3402,24 +3526,63 @@ def mix_audit_advance(plan_id: str, step_id: str, result: dict) -> dict:
 
 @tool
 def mix_audit_cancel(plan_id: str) -> dict:
-    """Cancel remaining work and return the mandatory final restore dispatch."""
+    """Cancel remaining work. Preserve cleanup only for an editor that was actually
+    opened, and preserve final state restoration only after isolation/transport/bounce
+    began. Cancelling a dry preflight returns no mutating restore work."""
     run = AUDIT_PLANS.get(plan_id)
     if run is None:
         return {"error": f"unknown plan_id {plan_id!r}"}
     run["cancelled"] = True
     steps = run["plan"]["steps"]
+    keep_ids = set()
+    for opened in steps[: run["current"]]:
+        if opened.get("operation") != "plugin_open_insert":
+            continue
+        opened_result = run["results"].get(opened["step_id"], {})
+        may_be_open = opened["status"] == "completed" or (
+            opened["status"] == "failed" and opened_result.get("opened") is True
+        )
+        if not may_be_open or not opened["step_id"].endswith("-open"):
+            continue
+        prefix = opened["step_id"][: -len("-open")]
+        close_id = f"{prefix}-close"
+        close_step = next((item for item in steps if item["step_id"] == close_id), None)
+        if close_step is None or close_step["status"] == "completed":
+            continue
+        restore_view_id = f"{prefix}-restore-view"
+        if any(item["step_id"] == restore_view_id for item in steps):
+            keep_ids.add(restore_view_id)
+        keep_ids.add(close_id)
+    state_was_mutated = any(
+        step["status"] in ("completed", "failed")
+        and (step.get("mutates_logic") or step.get("operation") == "mix_bounce_target")
+        for step in steps[: run["current"]]
+    )
+    if state_was_mutated:
+        final_restore = next(
+            (step for step in reversed(steps) if step["step_id"] == "final-restore"),
+            None,
+        )
+        if final_restore is not None:
+            keep_ids.add(final_restore["step_id"])
     for step in steps[run["current"] :]:
-        if not step.get("always_run"):
+        if step["status"] == "pending" and step["step_id"] not in keep_ids:
             step["status"] = "skipped"
     restore = next(
-        (step for step in reversed(steps) if step.get("always_run") and step["status"] == "pending"),
+        (
+            step
+            for step in steps[run["current"] :]
+            if step["status"] == "pending" and step["step_id"] in keep_ids
+        ),
         None,
     )
-    if restore:
-        run["current"] = steps.index(restore)
+    run["current"] = steps.index(restore) if restore is not None else len(steps)
     return {
         "plan_id": plan_id,
         "cancelled": True,
+        "state_restore_required": state_was_mutated,
+        "cleanup_steps": sorted(keep_ids),
+        "complete": restore is None,
         "next_step": materialise_audit_step(run, restore) if restore else None,
     }
 
@@ -3440,6 +3603,77 @@ def mix_audit_status(plan_id: str) -> dict:
         "step_status": counts,
         "next_step": materialise_audit_step(run, step) if step else None,
         "complete": step is None,
+    }
+
+
+@tool
+def mix_audit_results(
+    plan_id: str,
+    target_id: str = "",
+    phase: str = "",
+    offset: int = 0,
+    limit: int = 50,
+    include_payload: bool = True,
+) -> dict:
+    """Read completed/failed audit results in plan order. Filter by target_id or phase
+    and page by step so large all-mixer runs stay bounded. include_payload=false returns
+    compact evidence summaries; true returns the exact tool result, including plugin
+    parameter pages, meter readouts, loudness analysis and verified fix write-back."""
+    run = AUDIT_PLANS.get(plan_id)
+    if run is None:
+        return {"error": f"unknown plan_id {plan_id!r}"}
+    wanted_target = str(target_id or "").casefold()
+    wanted_phase = str(phase or "").casefold()
+    records = []
+    for step in run["plan"]["steps"]:
+        if step["status"] not in ("completed", "failed"):
+            continue
+        if wanted_target and str(step.get("target_id") or "").casefold() != wanted_target:
+            continue
+        if wanted_phase and str(step.get("phase") or "").casefold() != wanted_phase:
+            continue
+        payload = run["results"].get(step["step_id"], {})
+        summary = {
+            key: payload.get(key)
+            for key in (
+                "ok",
+                "verified",
+                "error",
+                "artifact",
+                "parameter_count",
+                "readout_count",
+                "measurement_available",
+                "integrated_lufs",
+                "true_peak_dbtp",
+                "write_attempted",
+                "before",
+                "after",
+            )
+            if key in payload
+        }
+        record = {
+            "step_id": step["step_id"],
+            "target_id": step.get("target_id"),
+            "phase": step.get("phase"),
+            "server": step.get("server"),
+            "operation": step.get("operation"),
+            "status": step["status"],
+            "summary": summary,
+        }
+        if include_payload:
+            record["result"] = payload
+        records.append(record)
+    start = max(0, int(offset))
+    page_limit = max(1, min(int(limit), 200))
+    page = records[start : start + page_limit]
+    return {
+        "plan_id": plan_id,
+        "complete": audit_next_step(run) is None,
+        "matched": len(records),
+        "offset": start,
+        "returned": len(page),
+        "next_offset": start + len(page) if start + len(page) < len(records) else None,
+        "results": page,
     }
 
 
@@ -3480,6 +3714,7 @@ def health() -> dict:
     rest."""
     name = logic_process()
     ax = accessibility_status(name)
+    mature_version = logic_pro_mcp_version()
     blocking = None
     if name is None:
         blocking = "Logic is not running"
@@ -3491,6 +3726,9 @@ def health() -> dict:
         "accessibility": ax["granted"],
         "accessibility_detail": ax,
         "auval": shutil.which("auval") or "not found",
+        "logic_pro_mcp_version": mature_version,
+        "dispatch_contract_version": MATURE_DISPATCH_CONTRACT_VERSION,
+        "dispatch_contract_matches": mature_version == MATURE_DISPATCH_CONTRACT_VERSION,
         "settings_roots_present": [str(r) for r in SETTINGS_ROOTS if r.is_dir()],
         "tools_defined": len(TOOLS),
         "plans_held": sorted(PLANS),
@@ -3589,6 +3827,14 @@ def selfcheck() -> int:
         ("ok" if shutil.which("osascript") else "FAIL", "osascript", shutil.which("osascript") or "missing")
     )
     rows.append(("ok" if shutil.which("auval") else "warn", "auval", shutil.which("auval") or "missing"))
+    mature_version = logic_pro_mcp_version()
+    rows.append(
+        (
+            "ok" if mature_version == MATURE_DISPATCH_CONTRACT_VERSION else "warn",
+            "LogicProMCP contract",
+            f"installed={mature_version or 'missing'} expected={MATURE_DISPATCH_CONTRACT_VERSION}",
+        )
+    )
     name = logic_process()
     rows.append(("ok" if name else "warn", "logic", name or "not running"))
     if name:

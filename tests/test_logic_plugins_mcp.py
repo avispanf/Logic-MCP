@@ -188,6 +188,24 @@ class ParameterTableTests(unittest.TestCase):
 
 
 class MixerParsingTests(unittest.TestCase):
+    def test_reveal_skips_unsupported_scroll_when_strip_is_already_visible(self):
+        visible = {
+            "name": "Kick",
+            "detail": "full",
+            "inserts": ["Channel EQ"],
+        }
+        with (
+            mock.patch.object(plugins, "require_logic", return_value="Logic Pro"),
+            mock.patch.object(plugins, "main_window_index", return_value=2),
+            mock.patch.object(plugins, "osa", return_value="AXLayoutItem") as osa,
+            mock.patch.object(plugins, "walk_window", return_value=[]),
+            mock.patch.object(plugins, "parse_strip", return_value=visible),
+        ):
+            result = plugins.mixer_reveal_strip("8.1", "Kick", dry_run=False)
+        self.assertTrue(result["verified"])
+        self.assertTrue(result["already_visible"])
+        self.assertEqual(osa.call_count, 1)
+
     def test_ax_order_is_reversed_into_signal_flow(self):
         kids = [
             {"role": "AXSlider", "description": "send knob", "value": "-20"},
@@ -531,6 +549,33 @@ class MeterReadTests(unittest.TestCase):
 
 
 class AuditStateMachineTests(unittest.TestCase):
+    def test_materialise_resolves_nested_verified_plugin_identity(self):
+        run = {
+            "results": {
+                "plugin-open": {
+                    "window_index": 3,
+                    "identity": {"plugin": "Pro-Q 4", "channel": "Stereo Out"},
+                }
+            }
+        }
+        step = {
+            "arguments": {"window_index": 1},
+            "arguments_from": {
+                "window_index": "plugin-open.window_index",
+                "expected_plugin": "plugin-open.identity.plugin",
+                "expected_channel": "plugin-open.identity.channel",
+            },
+        }
+        materialised = plugins.materialise_audit_step(run, step)
+        self.assertEqual(
+            materialised["arguments"],
+            {
+                "window_index": 3,
+                "expected_plugin": "Pro-Q 4",
+                "expected_channel": "Stereo Out",
+            },
+        )
+
     def test_cancel_before_any_mutation_requires_no_restore(self):
         plan = plugins.mix_audit_plan(
             tracks={"data": [{"id": 0, "name": "Kick", "type": "audio"}]},

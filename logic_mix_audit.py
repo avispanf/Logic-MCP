@@ -535,10 +535,25 @@ def _step(step_id: str, phase: str, server: str, operation: str, arguments=None,
     }
 
 
+def _surface_name(target: dict) -> str:
+    """Return the corroborated AX strip name when it differs from the project label."""
+    raw_ax = target.get("raw", {}).get("ax", {})
+    name = str(_first(raw_ax, "name", "title", "label", default="")).strip()
+    if name and name.casefold() not in GENERIC_NAMES:
+        return name
+    return str(target.get("name") or "")
+
+
 def build_plugin_inspection_steps(prefix: str, target: dict, inserts: list[str]) -> list[dict]:
     steps = []
+    surface_name = _surface_name(target)
     for insert_index, plugin in enumerate(inserts):
         plugin_prefix = f"{prefix}-plugin-{insert_index:02d}"
+        identity_sources = {
+            "window_index": f"{plugin_prefix}-open.window_index",
+            "expected_plugin": f"{plugin_prefix}-open.identity.plugin",
+            "expected_channel": f"{plugin_prefix}-open.identity.channel",
+        }
         steps.extend(
             [
                 _step(
@@ -549,7 +564,7 @@ def build_plugin_inspection_steps(prefix: str, target: dict, inserts: list[str])
                     {
                         "strip_path": target["strip_path"],
                         "insert_index": insert_index,
-                        "expected_strip": target["name"],
+                        "expected_strip": surface_name,
                         "expected_plugin": plugin,
                         "dry_run": False,
                     },
@@ -562,6 +577,9 @@ def build_plugin_inspection_steps(prefix: str, target: dict, inserts: list[str])
                     "logic-plugins",
                     "plugin_snapshot",
                     {"window_index": 1},
+                    arguments_from={
+                        "window_index": f"{plugin_prefix}-open.window_index"
+                    },
                     target_id=target["audit_id"],
                     plugin=plugin,
                 ),
@@ -574,8 +592,9 @@ def build_plugin_inspection_steps(prefix: str, target: dict, inserts: list[str])
                         "window_index": 1,
                         "view": "Controls",
                         "expected_plugin": plugin,
-                        "expected_channel": target["name"],
+                        "expected_channel": surface_name,
                     },
+                    arguments_from=identity_sources,
                     target_id=target["audit_id"],
                     mutates_ui=True,
                     requires_verified_result=True,
@@ -589,8 +608,9 @@ def build_plugin_inspection_steps(prefix: str, target: dict, inserts: list[str])
                         "window_index": 1,
                         "limit": 500,
                         "expected_plugin": plugin,
-                        "expected_channel": target["name"],
+                        "expected_channel": surface_name,
                     },
+                    arguments_from=identity_sources,
                     target_id=target["audit_id"],
                 ),
                 _step(
@@ -601,9 +621,12 @@ def build_plugin_inspection_steps(prefix: str, target: dict, inserts: list[str])
                     {
                         "window_index": 1,
                         "expected_plugin": plugin,
-                        "expected_channel": target["name"],
+                        "expected_channel": surface_name,
                     },
-                    arguments_from={"view": f"{plugin_prefix}-snapshot.view_selector"},
+                    arguments_from={
+                        **identity_sources,
+                        "view": f"{plugin_prefix}-snapshot.view_selector",
+                    },
                     target_id=target["audit_id"],
                     mutates_ui=True,
                     always_run=True,
@@ -617,9 +640,10 @@ def build_plugin_inspection_steps(prefix: str, target: dict, inserts: list[str])
                     {
                         "window_index": 1,
                         "expected_plugin": plugin,
-                        "expected_channel": target["name"],
+                        "expected_channel": surface_name,
                         "dry_run": False,
                     },
+                    arguments_from=identity_sources,
                     target_id=target["audit_id"],
                     mutates_ui=True,
                     always_run=True,
@@ -656,6 +680,7 @@ def build_meter_measurement_steps(
             )
         ]
     steps = []
+    surface_name = _surface_name(target)
     for meter_index, (insert_index, plugin) in enumerate(candidates):
         meter_prefix = f"{prefix}-meter-{meter_index:02d}"
         steps.extend(
@@ -668,7 +693,7 @@ def build_meter_measurement_steps(
                     {
                         "strip_path": target["strip_path"],
                         "insert_index": insert_index,
-                        "expected_strip": target["name"],
+                        "expected_strip": surface_name,
                         "expected_plugin": plugin,
                         "dry_run": False,
                     },
@@ -683,7 +708,12 @@ def build_meter_measurement_steps(
                     {
                         "window_index": 1,
                         "expected_plugin": plugin,
-                        "expected_channel": target["name"],
+                        "expected_channel": surface_name,
+                    },
+                    arguments_from={
+                        "window_index": f"{meter_prefix}-open.window_index",
+                        "expected_plugin": f"{meter_prefix}-open.identity.plugin",
+                        "expected_channel": f"{meter_prefix}-open.identity.channel",
                     },
                     target_id=target["audit_id"],
                 ),
@@ -695,8 +725,13 @@ def build_meter_measurement_steps(
                     {
                         "window_index": 1,
                         "expected_plugin": plugin,
-                        "expected_channel": target["name"],
+                        "expected_channel": surface_name,
                         "dry_run": False,
+                    },
+                    arguments_from={
+                        "window_index": f"{meter_prefix}-open.window_index",
+                        "expected_plugin": f"{meter_prefix}-open.identity.plugin",
+                        "expected_channel": f"{meter_prefix}-open.identity.channel",
                     },
                     target_id=target["audit_id"],
                     always_run=True,
@@ -823,6 +858,7 @@ def build_audit_plan(
                 )
             )
         if target.get("strip_path"):
+            surface_name = _surface_name(target)
             steps.extend(
                 [
                     _step(
@@ -832,7 +868,7 @@ def build_audit_plan(
                         "mixer_reveal_strip",
                         {
                             "strip_path": target["strip_path"],
-                            "expected_strip": target["name"],
+                            "expected_strip": surface_name,
                             "dry_run": False,
                         },
                         target_id=target["audit_id"],
@@ -846,7 +882,7 @@ def build_audit_plan(
                         "mixer_read_strip",
                         {
                             "strip_path": target["strip_path"],
-                            "expected_strip": target["name"],
+                            "expected_strip": surface_name,
                         },
                         target_id=target["audit_id"],
                         expand_plugin_steps=True,
@@ -1096,6 +1132,12 @@ def build_fix_plan(inventory: dict, fixes: list[dict], project_path: str) -> dic
     for position, fix in enumerate(resolved_fixes, start=1):
         target = fix["target_record"]
         prefix = f"fix-{position:03d}-{target['audit_id']}"
+        surface_name = _surface_name(target)
+        identity_sources = {
+            "window_index": f"{prefix}-open.window_index",
+            "expected_plugin": f"{prefix}-open.identity.plugin",
+            "expected_channel": f"{prefix}-open.identity.channel",
+        }
         public_fixes.append(
             {
                 "target": target["name"],
@@ -1117,7 +1159,7 @@ def build_fix_plan(inventory: dict, fixes: list[dict], project_path: str) -> dic
                     {
                         "strip_path": target["strip_path"],
                         "insert_index": fix["insert_index"],
-                        "expected_strip": target["name"],
+                        "expected_strip": surface_name,
                         "expected_plugin": fix["plugin"],
                         "dry_run": False,
                     },
@@ -1130,6 +1172,7 @@ def build_fix_plan(inventory: dict, fixes: list[dict], project_path: str) -> dic
                     "logic-plugins",
                     "plugin_snapshot",
                     {"window_index": 1},
+                    arguments_from={"window_index": f"{prefix}-open.window_index"},
                     target_id=target["audit_id"],
                 ),
                 _step(
@@ -1141,8 +1184,9 @@ def build_fix_plan(inventory: dict, fixes: list[dict], project_path: str) -> dic
                         "window_index": 1,
                         "view": "Controls",
                         "expected_plugin": fix["plugin"],
-                        "expected_channel": target["name"],
+                        "expected_channel": surface_name,
                     },
+                    arguments_from=identity_sources,
                     target_id=target["audit_id"],
                     mutates_ui=True,
                     requires_verified_result=True,
@@ -1158,9 +1202,10 @@ def build_fix_plan(inventory: dict, fixes: list[dict], project_path: str) -> dic
                         "value": fix["value"],
                         "expected_before": fix["expected_before"],
                         "expected_plugin": fix["plugin"],
-                        "expected_channel": target["name"],
+                        "expected_channel": surface_name,
                         "dry_run": False,
                     },
+                    arguments_from=identity_sources,
                     target_id=target["audit_id"],
                     writes_parameter=True,
                     requires_verified_result=True,
@@ -1173,9 +1218,12 @@ def build_fix_plan(inventory: dict, fixes: list[dict], project_path: str) -> dic
                     {
                         "window_index": 1,
                         "expected_plugin": fix["plugin"],
-                        "expected_channel": target["name"],
+                        "expected_channel": surface_name,
                     },
-                    arguments_from={"view": f"{prefix}-snapshot.view_selector"},
+                    arguments_from={
+                        **identity_sources,
+                        "view": f"{prefix}-snapshot.view_selector",
+                    },
                     target_id=target["audit_id"],
                     always_run=True,
                     requires_verified_result=True,
@@ -1188,9 +1236,10 @@ def build_fix_plan(inventory: dict, fixes: list[dict], project_path: str) -> dic
                     {
                         "window_index": 1,
                         "expected_plugin": fix["plugin"],
-                        "expected_channel": target["name"],
+                        "expected_channel": surface_name,
                         "dry_run": False,
                     },
+                    arguments_from=identity_sources,
                     target_id=target["audit_id"],
                     always_run=True,
                     requires_verified_result=True,
@@ -1345,7 +1394,11 @@ def build_isolation_dispatch(
     for row in track_rows:
         ref = str(_first(row, "target_ref", "track_ref", default=""))
         index = _integer(_first(row, "index", "id", "trackIndex", "track_index"))
-        selector = {"target_ref": ref} if ref.startswith("trk_") else ({"index": index} if index is not None else {})
+        # Audit plans may be assembled from a resource snapshot obtained through a
+        # different MCP client connection.  target_ref is deliberately session-scoped,
+        # while the explicit project index is accepted and independently read back by
+        # logic_tracks.  Never leak a captured ref into an executable audit dispatch.
+        selector = {"index": index} if index is not None else {}
         if not selector:
             continue
         enabled = False
@@ -1441,9 +1494,10 @@ def build_restore_dispatch(initial_state: dict, ax_state: list[dict] | None = No
     dispatches = []
     selected = None
     for row in track_rows:
-        ref = str(_first(row, "target_ref", "track_ref", default=""))
         index = _integer(_first(row, "index", "id", "trackIndex", "track_index"))
-        selector = {"target_ref": ref} if ref.startswith("trk_") else ({"index": index} if index is not None else {})
+        # See build_isolation_dispatch: restore steps must remain executable even when
+        # capture and dispatch are performed by different MCP client sessions.
+        selector = {"index": index} if index is not None else {}
         if not selector:
             continue
         for command, keys in (

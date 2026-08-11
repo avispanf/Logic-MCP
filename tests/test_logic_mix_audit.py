@@ -680,8 +680,47 @@ class RestoreTests(unittest.TestCase):
             result["dispatches"][0]["arguments"],
             {
                 "command": "solo",
-                "params": {"target_ref": "trk_a", "enabled": False},
+                "params": {"index": 0, "enabled": False},
             },
+        )
+
+    def test_session_scoped_track_refs_never_enter_audit_dispatches(self):
+        captured = {
+            "logic://tracks": {
+                "data": [
+                    {
+                        "index": 2,
+                        "target_ref": "trk_from_another_session",
+                        "solo": False,
+                        "mute": False,
+                        "selected": True,
+                    }
+                ]
+            }
+        }
+        target = {
+            "name": "Vox",
+            "kind": "track",
+            "audit_id": "track-vox",
+            "index": 2,
+            "track_ref": "trk_from_another_session",
+            "isolation_refs": ["trk_from_another_session"],
+            "sources": ["tracks"],
+        }
+        dispatches = (
+            audit.build_isolation_dispatch(captured, target)["dispatches"]
+            + audit.build_restore_dispatch(captured)["dispatches"]
+        )
+        track_dispatches = [
+            item for item in dispatches if item["operation"] == "logic_tracks"
+        ]
+        self.assertTrue(track_dispatches)
+        self.assertTrue(
+            all(
+                item["arguments"]["params"].get("index") == 2
+                and "target_ref" not in item["arguments"]["params"]
+                for item in track_dispatches
+            )
         )
 
     def test_restore_dispatch_preserves_solo_mute_selection_transport_and_cycle(self):

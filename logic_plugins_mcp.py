@@ -3052,6 +3052,29 @@ def mixer_reveal_strip(
     }
     if dry_run:
         return {"ok": True, "dry_run": True, **preview, "note": "viewport was not changed"}
+    # AXScrollToVisible is not exposed by every Logic 12.3 strip.  A visible strip does
+    # not need it at all, so verify the current identity before requesting the action.
+    try:
+        current_kids = walk_window(
+            process, main, 0, budget=350, seconds=20, root=strip_path
+        )
+        current_strip = parse_strip("", strip_path, current_kids)
+        current_name = current_strip.get("name") or ""
+        if current_name and current_name.casefold() == expected_strip.casefold():
+            return {
+                "ok": True,
+                "verified": True,
+                **preview,
+                "observed_strip": current_name,
+                "detail": current_strip.get("detail"),
+                "inserts": current_strip.get("inserts", []),
+                "already_visible": True,
+                "note": "",
+            }
+    except ProbeError:
+        # A failed pre-read is not conclusive: an off-screen strip can become readable
+        # after Logic handles AXScrollToVisible, so continue to the existing path.
+        pass
     try:
         osa(
             f'tell application "System Events" to tell process "{process}" to '
@@ -4005,20 +4028,27 @@ def audit_next_step(run: dict) -> dict | None:
 
 
 def materialise_audit_step(run: dict, step: dict) -> dict:
+    def resolve(source: str):
+        step_id, _, path = source.partition(".")
+        value = run["results"].get(step_id, {})
+        if path == "$":
+            return value
+        for part in path.split(".") if path else []:
+            if not isinstance(value, dict) or part not in value:
+                return None
+            value = value[part]
+        return value
+
     result = json.loads(json.dumps(step))
     source = result.get("arguments", {}).pop("path_from", None)
     if source:
-        step_id, _, field = source.partition(".")
-        observed = run["results"].get(step_id, {})
-        path = observed.get(field)
+        path = resolve(source)
         if path:
             result["arguments"]["path"] = path
         else:
             result["blocked"] = f"{source} is not available"
     for argument, source in result.pop("arguments_from", {}).items():
-        step_id, _, field = source.partition(".")
-        observed = run["results"].get(step_id, {})
-        value = observed if field == "$" else observed.get(field)
+        value = resolve(source)
         if value is not None and value != "":
             result["arguments"][argument] = value
         else:

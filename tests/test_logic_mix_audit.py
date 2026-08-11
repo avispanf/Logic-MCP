@@ -723,6 +723,59 @@ class RestoreTests(unittest.TestCase):
             )
         )
 
+    def test_visible_target_isolated_only_through_verified_mixer_toggle(self):
+        captured = {
+            "logic://tracks": {
+                "data": [{"index": 1, "name": "Lead", "solo": False}]
+            }
+        }
+        target = {
+            "name": "Lead",
+            "kind": "track",
+            "audit_id": "lead",
+            "index": 1,
+            "strip_path": "9.2.1",
+            "sources": ["tracks", "ax"],
+        }
+        result = audit.build_isolation_dispatch(
+            captured,
+            target,
+            [{"name": "Lead", "strip_path": "9.2.1", "solo": "off"}],
+        )
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["dispatch_count"], 1)
+        self.assertEqual(result["dispatches"][0]["operation"], "mixer_set_toggle")
+
+    def test_unique_visible_track_restores_toggle_only_through_mixer(self):
+        result = audit.build_restore_dispatch(
+            {
+                "logic://tracks": {
+                    "data": [
+                        {"index": 1, "name": "Lead", "solo": False, "mute": True}
+                    ]
+                }
+            },
+            [
+                {
+                    "name": "Lead",
+                    "strip_path": "9.2.1",
+                    "solo": "off",
+                    "mute": "on",
+                }
+            ],
+        )
+        track_toggles = [
+            item
+            for item in result["dispatches"]
+            if item["operation"] == "logic_tracks"
+            and item["arguments"].get("command") in {"solo", "mute"}
+        ]
+        mixer_toggles = [
+            item for item in result["dispatches"] if item["operation"] == "mixer_set_toggle"
+        ]
+        self.assertEqual(track_toggles, [])
+        self.assertEqual(len(mixer_toggles), 2)
+
     def test_restore_dispatch_preserves_solo_mute_selection_transport_and_cycle(self):
         result = audit.build_restore_dispatch(
             {

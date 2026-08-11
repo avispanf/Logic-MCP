@@ -1391,6 +1391,13 @@ def build_isolation_dispatch(
     target_is_master = target.get("kind") == "master"
     dispatches = []
     target_addressed = target_is_master
+    ax_target_available = any(
+        not row.get("track_ref")
+        and row.get("strip_path") == target.get("strip_path")
+        and str(row.get("name") or "").casefold()
+        == str(target.get("name") or "").casefold()
+        for row in ax_state or []
+    )
     for row in track_rows:
         ref = str(_first(row, "target_ref", "track_ref", default=""))
         index = _integer(_first(row, "index", "id", "trackIndex", "track_index"))
@@ -1409,7 +1416,11 @@ def build_isolation_dispatch(
         if enabled:
             target_addressed = True
         current = _boolean(_first(row, "solo", "soloed", "isSoloed"))
-        if current is None or current != enabled:
+        # A corroborated mixer strip is much cheaper and more reliable than scanning
+        # every Arrange track header in a large project.  The AX dispatch below owns
+        # the target toggle in that case; do not issue a duplicate mature-server write.
+        ax_owns_target = enabled and ax_target_available
+        if (current is None or current != enabled) and not ax_owns_target:
             dispatches.append(
                 {
                     "server": "logic-pro",
@@ -1493,6 +1504,18 @@ def build_restore_dispatch(initial_state: dict, ax_state: list[dict] | None = No
     track_rows = _items(tracks_payload, "data", "tracks")
     dispatches = []
     selected = None
+    track_name_counts = {}
+    ax_name_counts = {}
+    for row in track_rows:
+        name = str(_first(row, "name", "title", "label", default="")).strip().casefold()
+        if name:
+            track_name_counts[name] = track_name_counts.get(name, 0) + 1
+    for row in ax_state or []:
+        if row.get("track_ref") or not row.get("strip_path"):
+            continue
+        name = str(row.get("name") or "").strip().casefold()
+        if name:
+            ax_name_counts[name] = ax_name_counts.get(name, 0) + 1
     for row in track_rows:
         index = _integer(_first(row, "index", "id", "trackIndex", "track_index"))
         # See build_isolation_dispatch: restore steps must remain executable even when
@@ -1500,6 +1523,12 @@ def build_restore_dispatch(initial_state: dict, ax_state: list[dict] | None = No
         selector = {"index": index} if index is not None else {}
         if not selector:
             continue
+        row_name = str(_first(row, "name", "title", "label", default="")).strip().casefold()
+        ax_owns_toggles = (
+            bool(row_name)
+            and track_name_counts.get(row_name) == 1
+            and ax_name_counts.get(row_name) == 1
+        )
         for command, keys in (
             ("solo", ("solo", "soloed", "isSoloed")),
             ("mute", ("mute", "muted", "isMuted")),
@@ -1507,6 +1536,8 @@ def build_restore_dispatch(initial_state: dict, ax_state: list[dict] | None = No
             raw = _first(row, *keys)
             enabled = _boolean(raw)
             if enabled is None:
+                continue
+            if ax_owns_toggles:
                 continue
             dispatches.append(
                 {

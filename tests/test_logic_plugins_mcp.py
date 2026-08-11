@@ -365,6 +365,84 @@ class PluginWriteSafetyTests(unittest.TestCase):
 
 
 class PluginOpenTests(unittest.TestCase):
+    def test_percent_view_label_is_normalised_to_editor(self):
+        shallow = [
+            {
+                "path": "4",
+                "role": "AXMenuButton",
+                "name": "100%",
+                "value": "",
+                "description": "view",
+            },
+            {
+                "path": "9",
+                "role": "AXStaticText",
+                "name": "Enveloper",
+                "value": "Enveloper",
+                "description": "text",
+            },
+            {
+                "path": "11",
+                "role": "AXStaticText",
+                "name": "Lead",
+                "value": "Lead",
+                "description": "text",
+            },
+        ]
+        with mock.patch.object(plugins, "walk_window", return_value=shallow):
+            identity = plugins.read_plugin_identity("Logic Pro", 1)
+        self.assertEqual(identity["raw_view_selector"], "100%")
+        self.assertEqual(identity["view_selector"], "Editor")
+        self.assertFalse(identity["controls_view"])
+
+    def test_parameter_table_is_authoritative_controls_view(self):
+        shallow = [
+            {
+                "path": "4",
+                "role": "AXMenuButton",
+                "name": "100%",
+                "value": "",
+                "description": "view",
+            },
+            {
+                "path": "10.1",
+                "role": "AXTable",
+                "name": "",
+                "value": "",
+                "description": "table",
+            },
+        ]
+        with mock.patch.object(plugins, "walk_window", return_value=shallow):
+            identity = plugins.read_plugin_identity("Logic Pro", 1)
+        self.assertEqual(identity["view_selector"], "Controls")
+        self.assertTrue(identity["controls_view"])
+
+    def test_set_view_uses_show_menu_and_identity_readback(self):
+        identities = iter(
+            [
+                {"plugin": "Pro-DS", "channel": "Lead", "view_selector": "Editor"},
+                {"plugin": "Pro-DS", "channel": "Lead", "view_selector": "Controls"},
+            ]
+        )
+        shallow = [
+            {"path": "4", "role": "AXMenuButton", "name": "Editor", "value": "", "description": "view"}
+        ]
+        menu_items = [
+            {"path": "4.1.1", "role": "AXMenuItem", "name": "Controls", "value": "", "description": ""}
+        ]
+        with (
+            mock.patch.object(plugins, "require_logic", return_value="Logic Pro"),
+            mock.patch.object(plugins, "read_plugin_identity", side_effect=lambda *_: next(identities)),
+            mock.patch.object(plugins, "walk_window", side_effect=[shallow, menu_items]),
+            mock.patch.object(plugins, "osa") as osa,
+            mock.patch.object(plugins.time, "sleep"),
+        ):
+            result = plugins.plugin_set_view(
+                1, "Controls", expected_plugin="Pro-DS", expected_channel="Lead"
+            )
+        self.assertTrue(result["verified"])
+        self.assertIn("AXShowMenu", osa.call_args_list[0].args[0])
+
     def test_insert_open_reuses_unique_verified_editor_without_toggling_it_closed(self):
         strip = {
             "name": "Stereo Out",

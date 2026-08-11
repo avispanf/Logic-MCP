@@ -696,7 +696,7 @@ def read_plugin_identity(process: str, window_index: int) -> dict:
     shallow = walk_window(process, int(window_index), 2, budget=400, seconds=20)
     if not shallow:
         raise ProbeError("no elements returned from the plugin window")
-    view_selector = next(
+    raw_view_selector = next(
         (
             e["name"] or e["value"]
             for e in shallow
@@ -704,6 +704,16 @@ def read_plugin_identity(process: str, window_index: int) -> dict:
         ),
         "",
     )
+    has_parameter_table = any(e["role"] == "AXTable" for e in shallow)
+    # Some Apple plugins report their zoom percentage (for example "100%") as
+    # the View menu's AX name while the same menu actually offers Editor/Controls.
+    # The Controls table is authoritative; a percentage without a table means Editor.
+    if has_parameter_table or raw_view_selector == "Controls":
+        view_selector = "Controls"
+    elif re.fullmatch(r"\d+(?:[.,]\d+)?%", raw_view_selector or ""):
+        view_selector = "Editor"
+    else:
+        view_selector = raw_view_selector
     bypass = next(
         (
             e["value"]
@@ -725,6 +735,7 @@ def read_plugin_identity(process: str, window_index: int) -> dict:
         "plugin": titles[0] if titles else "",
         "channel": titles[-1] if len(titles) > 1 else "",
         "view_selector": view_selector,
+        "raw_view_selector": raw_view_selector,
         "controls_view": view_selector == "Controls",
         "bypass_control": bypass,
     }
@@ -1215,11 +1226,18 @@ def plugin_set_view(
         }
     reference = element_reference(menu["path"], int(window_index))
     try:
-        osa(
-            f'tell application "System Events" to tell process "{process}" to '
-            f'perform action "AXPress" of {reference}',
-            timeout=30,
-        )
+        try:
+            osa(
+                f'tell application "System Events" to tell process "{process}" to '
+                f'perform action "AXShowMenu" of {reference}',
+                timeout=30,
+            )
+        except ProbeError:
+            osa(
+                f'tell application "System Events" to tell process "{process}" to '
+                f'perform action "AXPress" of {reference}',
+                timeout=30,
+            )
         time.sleep(0.6)
         items = walk_window(process, int(window_index), 2, budget=200, seconds=20, root=menu["path"])
     except ProbeError as exc:
@@ -1241,17 +1259,10 @@ def plugin_set_view(
         return {"ok": False, "error": f"could not select {view!r}: {exc}"}
     time.sleep(1.0)
     try:
-        after = walk_window(process, int(window_index), 1, budget=200, seconds=20)
+        after_identity = read_plugin_identity(process, int(window_index))
     except ProbeError as exc:
         return {"ok": False, "error": f"selected but could not verify: {exc}"}
-    now = next(
-        (
-            e["name"] or e["value"]
-            for e in after
-            if e["role"] == "AXMenuButton" and e["description"] == "view"
-        ),
-        "",
-    )
+    now = after_identity["view_selector"]
     return {
         "ok": now == view,
         "verified": now == view,

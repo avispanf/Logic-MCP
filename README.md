@@ -10,16 +10,20 @@ Two MCP servers for Logic Pro on macOS, built to sit alongside
 
 `logic_plugins_mcp.py` groups its tools roughly as follows.
 
-**Plugins.** `plugin_snapshot` reads an open editor as a parameter table with an exact path
-for every control. `plugins_sweep` does the same across every open editor.
-`plugin_write_path` writes one control and verifies it. `plugin_plan` and `plugin_apply`
-batch edits behind an explicit confirmation. `au_list` and `au_parameters` read parameter
-dictionaries straight from the Audio Unit, so a parameter index is never guessed.
+**Plugins.** `plugin_snapshot` identifies an open editor without descending into a heavy
+custom interface. `plugin_set_view` switches it to Logic's generic Controls view, and
+`plugin_parameters` reads even large parameter tables row by row with filtering and
+pagination. `plugins_sweep` handles all open editors. `plugin_write_path` writes one
+control and verifies it; checkboxes are pressed rather than assigned. `plugin_plan` and
+`plugin_apply` batch edits behind an explicit confirmation. `au_list` and `au_parameters`
+read parameter dictionaries straight from the Audio Unit, so a parameter index is never
+guessed.
 
 **Mixer.** `mixer_strips` indexes the channel strips; `mixer_survey` reads name, fader level
 in decibels, pan, mute, solo, clipping state, output bus, sends and insert chain for each.
-`mixer_locate` finds the Mixer pane in the accessibility tree, because element indices move
-between sessions.
+Insert and send lists are reversed from AX order into actual signal-flow order.
+`main_window` and `mixer_locate` find the Tracks window and Mixer pane in the accessibility
+tree, because opening an editor changes every window index.
 
 **Transport and metering.** `control_bar` reports playback state, tempo, signature, key and
 playhead position. `transport_press` presses real Control Bar buttons and reports what
@@ -28,7 +32,31 @@ changed. `meter_watch` polls meter values during playback.
 **Application.** `menu_list` and `menu_click` navigate Logic's menus, with destructive items
 refused unless explicitly allowed. `surfaces_bypass` reads and sets Bypass All Control
 Surfaces, which silences an attached control surface without disturbing its port
-assignment.
+assignment. `ax_show_menu` exposes context-menu capabilities without clicking them, and
+`close_plugin_windows` clears editor dialogs without closing the project window.
+
+**Mix audit orchestration.** `mix_inventory` merges the mature server's `logic://tracks`
+and `logic://mixer` resources with `mixer_survey`, preserving stable track references and
+AX-only Aux/Bus paths. `mix_audit_plan` accepts `track`, `group`, `aux`, `bus`, `master` or
+`all`, then emits an ordered capture → inspect every insert → isolate → bounce/meter →
+BS.1770 → restore plan. `mix_audit_start`, `mix_audit_advance`, `mix_audit_status` and
+`mix_audit_cancel` enforce ordering and keep restoration steps mandatory. They return
+cross-server dispatches to the MCP client instead of launching a second LogicProMCP
+process, so one request can use the three registered servers without duplicate MCU ports.
+
+`mix_audit_review` turns per-target LUFS/True Peak results into non-writing recommendations.
+`mix_fix_plan` takes explicit target/plugin/parameter/value fixes. At apply time it reopens
+the exact signal-flow insert, re-resolves one exact Controls-table label, optionally checks
+the expected old value, writes with plugin/channel identity binding and read-back, restores
+the original editor view and closes only that verified window. A second audit can be
+compared with `mix_before_after`.
+
+For large mixers, the cheap initial inventory may contain generic off-screen strip labels.
+Each target is therefore sent through `mixer_reveal_strip` (`AXScrollToVisible`) and
+`mixer_read_strip` immediately before its insert chain is expanded into per-plugin steps.
+The revealed strip name must match the mature track inventory; otherwise that target stops.
+Isolation is exclusive: captured pre-existing solos are cleared, only the selected track or
+group members are enabled, and a master run clears every solo so it measures the full mix.
 
 Both are single files with one dependency: `mcp`. `python-rtmidi` is optional and
 affects one tool only.
@@ -52,6 +80,7 @@ parsing and naming validation have no equivalent there.
 python3 -m venv ~/dev/venv
 ~/dev/venv/bin/pip install mcp
 ~/dev/venv/bin/python logic_plugins_mcp.py --check
+~/dev/venv/bin/python -m unittest discover -s tests -v
 ```
 
 Register in the MCP client of your choice, pointing `command` at the venv interpreter
@@ -88,7 +117,27 @@ name-based lookup refuses ambiguous matches rather than guessing.
 **Paths are not stable across sessions.** Element indices shift when Logic's layout changes
 or the application restarts, and a stale path resolves to nothing or, worse, to the wrong
 element. The mixer tools locate the Mixer pane by searching for it rather than assuming a
-path. Plugin window indices carry the same hazard and are not yet handled the same way.
+path. Tools that target the main project window find the `AXStandardWindow` whose title
+ends in ` - Tracks`; plugin editor paths still carry the same hazard and should be obtained
+immediately before a write.
+
+**Insert order is backwards in Accessibility.** The visually lowest slot has the smallest
+AX index. Mixer reports reverse both insert and send lists so their first item is the first
+one reached by the signal.
+
+**The fader scale is only locally linear.** From raw position 113 through unity at 173 the
+measured relationship is ten raw units per decibel. Below that span the error grows quickly,
+so the server returns `null` with a reason instead of inventing a decibel value.
+
+**Listing does not require plugin validation.** `auval -a` did not finish on a collection
+of hundreds of components. `au_list` now reads the public macOS AudioComponent registry
+directly, which returns the same identifiers without launching or validating each plugin.
+
+**Live meter readout is capability-tested.** A meter window is counted as measurable only
+when AX exposes both a numeric value and a meter label/unit. Logic Loudness Meter's custom
+view exposed only its title in the measured session, so the audit correctly fell back to a
+target bounce and the independent BS.1770 analyzer instead of reporting a fabricated LUFS
+value.
 
 **Transport is two buttons, not one toggle.** Logic replaces the Go to Beginning button with
 a Stop button during playback, so pressing Play a second time does not stop transport.
@@ -105,6 +154,15 @@ come from an allowlist because keystrokes land wherever focus is. Every accessib
 call runs in its own process group and is killed with its group on timeout, so a hung
 AppleScript cannot wedge the server.
 
+Live plugin writes additionally require the expected plugin or channel identity. Audit
+fixes never reuse an earlier parameter path: the exact label and optional old value are
+resolved again immediately before the write. Track isolation uses session-stable `trk_…`
+references when available. A mixer-only Aux/Bus is never treated as a track index; its
+mute/solo control is addressed by verified strip path and read back. Initial track,
+selection, mute/solo, playhead, cycle and transport intents are converted into explicit
+restore dispatches, with missing fields left unknown rather than guessed. Bounce targets
+are project-bound, confirmation-gated and created without overwrite.
+
 `--check` includes a name-resolution pass over the server's own source. This exists
 because a refactor once silently deleted six module-level definitions: the file still
 compiled, imported and registered all tools, and only failed when a write was attempted.
@@ -117,11 +175,27 @@ press an insert slot, but nothing here drives that automatically. Insert order c
 changed and plugins cannot be removed. `ProjectData` is not parsed, so arrangement data
 comes from a MIDI export.
 
-Known rough edges, stated plainly because they were measured rather than assumed: the size
-probe in `plugins_sweep` counts only the top level, so heavy editors are still excluded by
-timeout rather than by size; `au_list` has not completed a run on a large plugin collection;
+The audit coordinator is deliberately a cross-server state machine: the MCP client must
+execute each returned dispatch and feed its result to `mix_audit_advance`. It cannot call
+another already-running stdio MCP server from inside this server. If the client disappears
+mid-run, use `mix_audit_status`/`mix_audit_cancel` in the same server session and execute the
+returned restore dispatch. In-memory plans do not survive a server restart.
+
+Isolation and restoration tools return child dispatch lists. The coordinator refuses to
+advance these steps unless the MCP client reports both `executed: true` and
+`verified: true` after running and reading back every child operation.
+
+Group membership is exact when the mature track resource exposes stack parent/member data.
+Name-based classification is only a fallback. Mixer-only Aux/Bus operations require a
+current full-detail AX strip; off-screen generic strips are reported as incomplete and are
+not guessed. Existing analyzer plugins are read when they expose numeric AX values;
+otherwise bounce plus BS.1770 is the authoritative measurement path.
+
+Known rough edges, stated plainly because they were measured rather than assumed:
 `strip_settings_inspect` has never been given a real channel strip file; and `keys_fire` in
-the audio server needs `python-rtmidi`, which is optional and usually absent.
+the audio server needs `python-rtmidi`, which is optional and usually absent. Channel strips
+outside the visible Mixer viewport expose generic insert labels instead of plugin names;
+`mixer_survey` marks those rows partial rather than presenting the placeholders as facts.
 
 ## Licence
 

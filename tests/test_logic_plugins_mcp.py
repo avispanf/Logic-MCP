@@ -1,0 +1,257 @@
+import unittest
+from unittest import mock
+
+import logic_plugins_mcp as plugins
+
+
+class NumberHandlingTests(unittest.TestCase):
+    def test_fourcc_preserves_spaces_and_symbols(self):
+        self.assertEqual(plugins.fourcc(int.from_bytes(b"aac ", "big")), "aac ")
+        self.assertEqual(plugins.fourcc(int.from_bytes(b"pc+3", "big")), "pc+3")
+
+    def test_values_match_accepts_system_decimal_separator(self):
+        self.assertTrue(plugins.values_match("21.0", "21,0"))
+        self.assertTrue(plugins.values_match("-12", "-12,0 dB"))
+        self.assertFalse(plugins.values_match("-12 dB", "-12 LUFS"))
+
+    def test_fader_conversion_stays_inside_measured_span(self):
+        self.assertEqual(plugins.fader_db_from_raw("173"), 0.0)
+        self.assertEqual(plugins.fader_db_from_raw("113,0"), -6.0)
+        self.assertIsNone(plugins.fader_db_from_raw("112.9"))
+        self.assertIsNone(plugins.fader_db_from_raw("not a number"))
+
+
+class WindowSelectionTests(unittest.TestCase):
+    def test_tracks_window_wins_over_front_plugin_dialog(self):
+        listing = (
+            "1~AXDialog~Ozone|:|"
+            "2~AXStandardWindow~Example Project - Tracks|:|"
+            "3~AXStandardWindow~Mixer|:|"
+        )
+        with mock.patch.object(plugins, "osa", return_value=listing):
+            self.assertEqual(plugins.main_window_index("Logic Pro"), 2)
+
+    def test_first_standard_window_is_safe_fallback(self):
+        listing = "1~AXDialog~Plugin|:|3~AXStandardWindow~Project|:|"
+        with mock.patch.object(plugins, "osa", return_value=listing):
+            self.assertEqual(plugins.main_window_index("Logic Pro"), 3)
+
+    def test_accessibility_probe_reports_real_ax_denial(self):
+        denial = plugins.ProbeError("assistive access denied (-25211)")
+        with mock.patch.object(plugins, "osa", side_effect=denial):
+            status = plugins.accessibility_status("Logic Pro")
+        self.assertFalse(status["granted"])
+        self.assertIn("-25211", status["reason"])
+
+
+class ParameterTableTests(unittest.TestCase):
+    def test_filter_is_applied_before_match_pagination(self):
+        rows = (
+            "4#"
+            "1~Threshold Low~-12,0~AXSlider|:|"
+            "2~Ratio~4,0~AXSlider|:|"
+            "3~Threshold High~-6,0~AXSlider|:|"
+            "4~Threshold Ceiling~-1,0~AXSlider|:|"
+        )
+        with (
+            mock.patch.object(plugins, "require_logic", return_value="Logic Pro"),
+            mock.patch.object(plugins, "find_parameter_table", return_value="2.4"),
+            mock.patch.object(plugins, "osa", return_value=rows),
+        ):
+            result = plugins.plugin_parameters(
+                window_index=1,
+                contains="threshold",
+                offset=1,
+                limit=1,
+            )
+        self.assertEqual(result["rows_total"], 4)
+        self.assertEqual(result["matched_total"], 3)
+        self.assertEqual(result["next_offset"], 2)
+        self.assertEqual(result["parameters"][0]["label"], "Threshold High")
+
+
+class MixerParsingTests(unittest.TestCase):
+    def test_ax_order_is_reversed_into_signal_flow(self):
+        kids = [
+            {"role": "AXSlider", "description": "send knob", "value": "-20"},
+            {"role": "AXGroup", "description": "Bus 2", "value": ""},
+            {"role": "AXSlider", "description": "send knob", "value": "-10"},
+            {"role": "AXGroup", "description": "Bus 1", "value": ""},
+            {"role": "AXGroup", "description": "insert bar", "value": ""},
+            {"role": "AXGroup", "description": "Loudness Meter", "value": ""},
+            {"role": "AXGroup", "description": "Ozone", "value": ""},
+        ]
+        row = plugins.parse_strip("Stereo Out", "1.2", kids)
+        self.assertEqual(row["inserts"], ["Ozone", "Loudness Meter"])
+        self.assertEqual(
+            [item["name"] for item in row["insert_controls"]],
+            ["Ozone", "Loudness Meter"],
+        )
+        self.assertEqual(
+            row["sends"],
+            [{"bus": "Bus 1", "level": "-10"}, {"bus": "Bus 2", "level": "-20"}],
+        )
+        self.assertEqual(row["order"], "signal flow, first processed first")
+
+
+class PluginWriteSafetyTests(unittest.TestCase):
+    def test_live_write_requires_window_identity(self):
+        with mock.patch.object(plugins, "require_logic", return_value="Logic Pro"):
+            result = plugins.plugin_write_path("1.2", "-6", dry_run=False)
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["write_attempted"])
+        self.assertIn("requires expected_plugin", result["error"])
+
+    def test_stale_window_is_refused_before_control_resolution(self):
+        identity = {"plugin": "Loudness Meter", "channel": "Stereo Out"}
+        with (
+            mock.patch.object(plugins, "require_logic", return_value="Logic Pro"),
+            mock.patch.object(plugins, "read_plugin_identity", return_value=identity),
+            mock.patch.object(plugins, "read_role_and_value") as read_control,
+        ):
+            result = plugins.plugin_write_path(
+                "1.2",
+                "-6",
+                dry_run=False,
+                expected_plugin="Ozone 9 Elements",
+                expected_channel="Stereo Out",
+            )
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["write_attempted"])
+        read_control.assert_not_called()
+
+    def test_label_write_resolves_fresh_path_and_preserves_identity(self):
+        table = {
+            "parameters": [
+                {
+                    "label": "Threshold",
+                    "display": "-12,0",
+                    "path": "2.4.1.7.1.2",
+                }
+            ]
+        }
+        outcome = {"ok": True, "dry_run": True, "path": "2.4.1.7.1.2"}
+        with (
+            mock.patch.object(plugins, "plugin_parameters", return_value=table),
+            mock.patch.object(plugins, "plugin_write_path", return_value=outcome) as write,
+        ):
+            result = plugins.plugin_write_label_verified(
+                "Threshold",
+                "-6",
+                expected_plugin="Ozone 9 Elements",
+                expected_channel="Stereo Out",
+                expected_before="-12.0",
+            )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["resolved_path"], "2.4.1.7.1.2")
+        self.assertEqual(write.call_args.kwargs["expected_plugin"], "Ozone 9 Elements")
+
+
+class MeterReadTests(unittest.TestCase):
+    def test_plugin_title_alone_is_not_a_measurement(self):
+        identity = {"plugin": "Loudness Meter", "channel": "Stereo Out"}
+        elements = [
+            {
+                "path": "7",
+                "role": "AXStaticText",
+                "name": "Loudness Meter",
+                "description": "text",
+                "value": "Loudness Meter",
+            }
+        ]
+        with (
+            mock.patch.object(plugins, "require_logic", return_value="Logic Pro"),
+            mock.patch.object(plugins, "read_plugin_identity", return_value=identity),
+            mock.patch.object(plugins, "walk_window", return_value=elements),
+        ):
+            result = plugins.plugin_meter_read(1, "Loudness Meter", "Stereo Out")
+        self.assertFalse(result["measurement_available"])
+        self.assertEqual(result["readout_count"], 0)
+
+    def test_numeric_lufs_readout_is_reported(self):
+        identity = {"plugin": "Meter", "channel": "Stereo Out"}
+        elements = [
+            {
+                "path": "9",
+                "role": "AXStaticText",
+                "name": "Integrated",
+                "description": "LUFS",
+                "value": "-9,2 LUFS",
+            }
+        ]
+        with (
+            mock.patch.object(plugins, "require_logic", return_value="Logic Pro"),
+            mock.patch.object(plugins, "read_plugin_identity", return_value=identity),
+            mock.patch.object(plugins, "walk_window", return_value=elements),
+        ):
+            result = plugins.plugin_meter_read(1, "Meter", "Stereo Out")
+        self.assertTrue(result["measurement_available"])
+        self.assertEqual(result["readout_count"], 1)
+
+
+class AuditStateMachineTests(unittest.TestCase):
+    def test_preflight_failure_jumps_to_final_restore(self):
+        plan = plugins.mix_audit_plan(
+            tracks={
+                "data": [
+                    {
+                        "index": 0,
+                        "name": "Kick",
+                        "type": "Audio",
+                        "target_ref": "trk_kick",
+                    }
+                ]
+            },
+            mixer={},
+            ax_channels={},
+            scope="track",
+            selector="Kick",
+            project_path="/tmp/Test.logicx",
+            output_root="/tmp/logic-audits",
+        )
+        started = plugins.mix_audit_start(plan["plan_id"], confirm=True)
+        self.assertEqual(started["next_step"]["step_id"], "preflight-project")
+        advanced = plugins.mix_audit_advance(
+            plan["plan_id"],
+            "preflight-project",
+            {"ok": False, "error": "project audit failed"},
+        )
+        self.assertEqual(advanced["next_step"]["step_id"], "final-restore")
+        self.assertEqual(advanced["next_step"]["arguments"]["initial_state"], {})
+
+    def test_fresh_strip_read_expands_each_insert_into_verified_steps(self):
+        plan = plugins.mix_audit_plan(
+            tracks={"data": [{"index": 0, "name": "Kick", "type": "Audio", "target_ref": "trk_kick"}]},
+            mixer={},
+            ax_channels={"strips": [{"index": 0, "name": "Kick", "path": "8.1"}]},
+            scope="track",
+            selector="Kick",
+            project_path="/tmp/Test.logicx",
+            output_root="/tmp/logic-audits",
+        )
+        run = plugins.AUDIT_PLANS[plan["plan_id"]]
+        run["confirmed"] = True
+        read_index = next(
+            index
+            for index, step in enumerate(run["plan"]["steps"])
+            if step["operation"] == "mixer_read_strip"
+        )
+        for step in run["plan"]["steps"][:read_index]:
+            step["status"] = "completed"
+        run["current"] = read_index
+        read_step = run["plan"]["steps"][read_index]
+        advanced = plugins.mix_audit_advance(
+            plan["plan_id"],
+            read_step["step_id"],
+            {"ok": True, "name": "Kick", "path": "8.1", "inserts": ["Channel EQ", "Compressor"]},
+        )
+        self.assertEqual(advanced["next_step"]["operation"], "plugin_open_insert")
+        expanded = run["plan"]["steps"][read_index + 1 : read_index + 13]
+        self.assertEqual(
+            sum(1 for step in expanded if step["operation"] == "plugin_open_insert"),
+            2,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()

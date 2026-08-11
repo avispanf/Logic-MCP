@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ctypes
 import json
 import os
 import pathlib
@@ -11,6 +12,8 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+
+import logic_mix_audit as mix_audit
 
 APP_PROCESSES = ("Logic Pro", "Logic Pro Creator Studio")
 PREFERENCE_DOMAINS = ("com.apple.logic10", "com.apple.mobilelogic")
@@ -27,6 +30,29 @@ PLIST_MAGIC = (b"bplist00", b"<?xml")
 WRITABLE_ROLES = ("AXSlider", "AXTextField", "AXIncrementor", "AXCheckBox", "AXPopUpButton")
 
 NUMERIC_ROLES = ("AXSlider", "AXIncrementor", "AXValueIndicator", "AXScrollBar")
+AUDIO_UNIT_TYPES = {
+    "auou",  # output
+    "aumu",  # instrument
+    "aumf",  # music effect
+    "aufc",  # format converter
+    "aufx",  # effect
+    "aumx",  # mixer
+    "aupn",  # panner
+    "auol",  # offline effect
+    "augn",  # generator
+    "aumi",  # MIDI processor
+    "ausp",  # speech synthesizer
+}
+
+
+class AudioComponentDescription(ctypes.Structure):
+    _fields_ = (
+        ("component_type", ctypes.c_uint32),
+        ("component_subtype", ctypes.c_uint32),
+        ("component_manufacturer", ctypes.c_uint32),
+        ("component_flags", ctypes.c_uint32),
+        ("component_flags_mask", ctypes.c_uint32),
+    )
 
 
 def as_number(text):
@@ -55,6 +81,7 @@ def find_control(name: str, window_index: int, process: str) -> dict:
 
 TOOLS: list = []
 PLANS: dict[str, dict] = {}
+AUDIT_PLANS: dict[str, dict] = {}
 
 
 def tool(fn):
@@ -113,6 +140,22 @@ def require_logic() -> str:
     return name
 
 
+def accessibility_status(process: str | None = None) -> dict:
+    """Test the first AX operation the tools actually need, rather than a process-name
+    lookup that System Events may allow even when assistive access is denied."""
+    name = process or logic_process()
+    if name is None:
+        return {"granted": False, "reason": "Logic is not running"}
+    try:
+        raw = osa(
+            f'tell application "System Events" to tell process "{name}" to '
+            "return count of windows"
+        )
+        return {"granted": True, "window_count": int(raw or 0)}
+    except (ProbeError, ValueError) as exc:
+        return {"granted": False, "reason": str(exc)}
+
+
 def split_records(raw: str) -> list[str]:
     return [part.strip() for part in raw.split("|:|") if part.strip()]
 
@@ -158,16 +201,7 @@ def plugins_probe() -> dict:
     report: dict = {"platform_ok": sys.platform == "darwin"}
     name = logic_process()
     report["logic_process"] = name
-    report["accessibility"] = {}
-    if name:
-        try:
-            windows = osa(
-                f'tell application "System Events" to tell process "{name}" to '
-                "return count of windows"
-            )
-            report["accessibility"] = {"granted": True, "window_count": int(windows or 0)}
-        except (ProbeError, ValueError) as exc:
-            report["accessibility"] = {"granted": False, "reason": str(exc)}
+    report["accessibility"] = accessibility_status(name)
     report["controls_view_preference"] = read_preference_flags() or {
         "found": False,
         "note": (
@@ -184,33 +218,113 @@ def plugins_probe() -> dict:
     return report
 
 
+def fourcc(value: int) -> str:
+    return int(value).to_bytes(4, "big").decode("mac_roman", errors="replace")
+
+
+def audio_component_units() -> list[dict]:
+    """Read the macOS AudioComponent registry without asking auval to scan plugins."""
+    if sys.platform != "darwin":
+        raise ProbeError("the AudioComponent registry is only available on macOS")
+
+    audio_toolbox = ctypes.CDLL(
+        "/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox"
+    )
+    core_foundation = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    )
+    audio_toolbox.AudioComponentFindNext.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(AudioComponentDescription),
+    )
+    audio_toolbox.AudioComponentFindNext.restype = ctypes.c_void_p
+    audio_toolbox.AudioComponentGetDescription.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(AudioComponentDescription),
+    )
+    audio_toolbox.AudioComponentGetDescription.restype = ctypes.c_int32
+    audio_toolbox.AudioComponentCopyName.argtypes = (
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    )
+    audio_toolbox.AudioComponentCopyName.restype = ctypes.c_int32
+    core_foundation.CFStringGetCString.argtypes = (
+        ctypes.c_void_p,
+        ctypes.c_char_p,
+        ctypes.c_long,
+        ctypes.c_uint32,
+    )
+    core_foundation.CFStringGetCString.restype = ctypes.c_bool
+    core_foundation.CFRelease.argtypes = (ctypes.c_void_p,)
+    core_foundation.CFRelease.restype = None
+
+    def component_name(component) -> str:
+        ref = ctypes.c_void_p()
+        status = audio_toolbox.AudioComponentCopyName(component, ctypes.byref(ref))
+        if status != 0 or not ref.value:
+            return ""
+        try:
+            buffer = ctypes.create_string_buffer(4096)
+            converted = core_foundation.CFStringGetCString(
+                ref, buffer, len(buffer), 0x08000100  # kCFStringEncodingUTF8
+            )
+            return buffer.value.decode("utf-8", errors="replace") if converted else ""
+        finally:
+            core_foundation.CFRelease(ref)
+
+    query = AudioComponentDescription(0, 0, 0, 0, 0)
+    component = ctypes.c_void_p()
+    units = []
+    while True:
+        component = ctypes.c_void_p(
+            audio_toolbox.AudioComponentFindNext(component, ctypes.byref(query))
+        )
+        if not component.value:
+            break
+        description = AudioComponentDescription()
+        if audio_toolbox.AudioComponentGetDescription(
+            component, ctypes.byref(description)
+        ) != 0:
+            continue
+        kind = fourcc(description.component_type)
+        if kind not in AUDIO_UNIT_TYPES:
+            continue
+        full_name = component_name(component).strip()
+        vendor, separator, title = full_name.partition(":")
+        units.append(
+            {
+                "type": kind,
+                "subtype": fourcc(description.component_subtype),
+                "manufacturer": fourcc(description.component_manufacturer),
+                "vendor": vendor.strip()
+                if separator
+                else fourcc(description.component_manufacturer),
+                "name": title.strip() if separator else full_name,
+            }
+        )
+    return units
+
+
 @tool
 def au_list(filter_text: str | None = None, limit: int = 200) -> dict:
-    """List installed Audio Unit plugins with their four-character type, subtype and
-    manufacturer codes. Those codes are what au_parameters needs."""
-    if shutil.which("auval") is None:
-        return {"error": "auval not found"}
-    proc = subprocess.run(["auval", "-a"], capture_output=True, text=True, timeout=180)
-    units = []
-    pattern = re.compile(
-        r"^\s*(\w{4})\s+(\w{4})\s+(\w{4})\s*-\s*(.+?):\s*(.+?)\s*$"
-    )
-    for line in proc.stdout.splitlines():
-        match = pattern.match(line)
-        if not match:
-            continue
-        kind, subtype, manufacturer, vendor, title = match.groups()
-        entry = {
-            "type": kind,
-            "subtype": subtype,
-            "manufacturer": manufacturer,
-            "vendor": vendor.strip(),
-            "name": title.strip(),
-        }
-        if filter_text and filter_text.lower() not in json.dumps(entry).lower():
-            continue
-        units.append(entry)
-    return {"count": len(units), "units": units[:limit]}
+    """List installed Audio Units with the four-character codes that au_parameters needs.
+    This reads the system AudioComponent registry directly; unlike `auval -a`, it does not
+    launch or validate hundreds of plugins and therefore does not hang on a large setup."""
+    try:
+        units = audio_component_units()
+    except (OSError, ProbeError) as exc:
+        return {"error": f"AudioComponent registry unavailable: {exc}"}
+    needle = (filter_text or "").lower()
+    if needle:
+        units = [unit for unit in units if needle in json.dumps(unit).lower()]
+    units.sort(key=lambda unit: (unit["vendor"].lower(), unit["name"].lower()))
+    capped = max(1, min(int(limit), 2000))
+    return {
+        "count": len(units),
+        "returned": min(len(units), capped),
+        "source": "macOS AudioComponent registry",
+        "units": units[:capped],
+    }
 
 
 @tool
@@ -377,7 +491,23 @@ def normalise_number(value: str) -> str:
 def values_match(requested: str, observed: str) -> bool:
     if requested == observed:
         return True
-    return normalise_number(requested) == normalise_number(observed)
+    if normalise_number(requested) == normalise_number(observed):
+        return True
+
+    def number_and_unit(value):
+        match = re.fullmatch(
+            r"\s*([-+]?\d+(?:[.,]\d+)?)\s*([^\d]*)\s*",
+            str(value),
+        )
+        if not match:
+            return None
+        return float(match.group(1).replace(",", ".")), match.group(2).strip().casefold()
+
+    left, right = number_and_unit(requested), number_and_unit(observed)
+    if left is None or right is None:
+        return False
+    units_compatible = not left[1] or not right[1] or left[1] == right[1]
+    return units_compatible and left[0] == right[0]
 
 
 def walk_script(process: str, window: int, max_depth: int, budget: int, seconds: int, root: str = "") -> str:
@@ -545,6 +675,53 @@ def pair_parameters(elements: list[dict]) -> list[dict]:
     return parameters
 
 
+def read_plugin_identity(process: str, window_index: int) -> dict:
+    shallow = walk_window(process, int(window_index), 2, budget=400, seconds=20)
+    if not shallow:
+        raise ProbeError("no elements returned from the plugin window")
+    view_selector = next(
+        (
+            e["name"] or e["value"]
+            for e in shallow
+            if e["role"] == "AXMenuButton" and e["description"] == "view"
+        ),
+        "",
+    )
+    bypass = next(
+        (
+            e["value"]
+            for e in shallow
+            if e["description"] == "bypass" and "." not in e["path"]
+        ),
+        None,
+    )
+    titles = [
+        e["value"].strip()
+        for e in shallow
+        if e["role"] == "AXStaticText"
+        and "." not in e["path"]
+        and e["value"]
+        and not e["value"].strip().endswith(":")
+    ]
+    return {
+        "window_index": int(window_index),
+        "plugin": titles[0] if titles else "",
+        "channel": titles[-1] if len(titles) > 1 else "",
+        "view_selector": view_selector,
+        "controls_view": view_selector == "Controls",
+        "bypass_control": bypass,
+    }
+
+
+def identity_matches(identity: dict, expected_plugin: str = "", expected_channel: str = "") -> bool:
+    def same(left, right):
+        return str(left or "").strip().casefold() == str(right or "").strip().casefold()
+
+    return (not expected_plugin or same(identity.get("plugin"), expected_plugin)) and (
+        not expected_channel or same(identity.get("channel"), expected_channel)
+    )
+
+
 @tool
 def ax_windows() -> dict:
     """List Logic's windows with their titles and subroles. Plugin editors appear as
@@ -700,44 +877,168 @@ def plugin_snapshot(
     budget: int = 1500,
     seconds: int = 60,
 ) -> dict:
-    """Read one open plugin window as a parameter table: plugin name, whether Controls
-    view is active, and every label paired with its control value and exact path. This is
-    the read that ax_dump feeds; use it rather than reading the raw tree."""
+    """Read one open plugin editor: which plugin it is, which channel it belongs to, which
+    view it is showing, whether it is bypassed, and, when the view is Controls, every
+    parameter paired with its value and an exact path. The window is first read two levels
+    deep, which is where the identity lives; the deep walk that collects parameters only
+    runs when Controls view is active, because a plugin drawing its own interface exposes
+    thousands of elements and would otherwise time out."""
     name = require_logic()
-    elements = walk_window(
-        name, int(window_index), int(max_depth), budget=int(budget), seconds=int(seconds)
-    )
-    if not elements:
-        return {"window_index": window_index, "error": "no elements returned"}
-    view_mode = next(
-        (e["name"] or e["value"] for e in elements if e["role"] == "AXMenuButton" and e["description"] == "view"),
-        "",
-    )
-    titles = [
-        e["value"]
-        for e in elements
-        if e["role"] == "AXStaticText" and "." not in e["path"] and e["value"]
-    ]
-    parameters = pair_parameters(elements)
-    return {
-        "window_index": window_index,
-        "plugin": titles[0] if titles else "",
-        "channel": titles[-1] if len(titles) > 1 else "",
-        "view_mode": view_mode,
-        "controls_view": view_mode == "Controls",
-        "element_count": len(elements),
-        "parameter_count": len(parameters),
-        "parameters": parameters,
-        "note": ""
-        if view_mode == "Controls"
-        else "view is not Controls, the plugin draws itself and few parameters will be readable",
+    try:
+        identity = read_plugin_identity(name, int(window_index))
+    except ProbeError as exc:
+        return {"window_index": window_index, "error": str(exc)}
+    result = {
+        **identity,
+        "view_mode": identity["view_selector"],
+        "parameter_count": 0,
+        "parameters": [],
     }
+    if not identity["controls_view"]:
+        result["note"] = (
+            "the plugin is drawing its own interface, so parameters are not exposed. "
+            "Switch the window's View menu to Controls to read them"
+        )
+        return result
+    try:
+        elements = walk_window(
+            name, int(window_index), int(max_depth), budget=int(budget), seconds=int(seconds)
+        )
+    except ProbeError as exc:
+        result["note"] = f"identity read, but the parameter walk failed: {exc}"
+        return result
+    parameters = pair_parameters(elements)
+    result["element_count"] = len(elements)
+    result["parameter_count"] = len(parameters)
+    result["parameters"] = parameters
+    return result
 
 
 @tool
 def plugin_read(window_index: int = 1) -> dict:
     """Compatibility wrapper around plugin_snapshot."""
     return plugin_snapshot(window_index)
+
+
+def find_parameter_table(process: str, window: int) -> str:
+    elements = walk_window(process, window, 2, budget=200, seconds=20)
+    for entry in elements:
+        if entry["role"] == "AXTable":
+            return entry["path"]
+    return ""
+
+
+@tool
+def plugin_parameters(
+    window_index: int = 1,
+    contains: str = "",
+    offset: int = 0,
+    limit: int = 60,
+    seconds: int = 120,
+    expected_plugin: str = "",
+    expected_channel: str = "",
+) -> dict:
+    """Read the parameter table of a plugin editor that is showing Controls view, walking
+    the table row by row instead of recursing through the whole window. A large plugin such
+    as a mastering suite exposes over a hundred parameters, and a recursive walk of that
+    tree does not finish; this reads each row directly. Use contains to filter by label,
+    and offset with limit to page through a long list."""
+    process = require_logic()
+    if expected_plugin or expected_channel:
+        try:
+            identity = read_plugin_identity(process, int(window_index))
+        except ProbeError as exc:
+            return {"window_index": window_index, "error": str(exc)}
+        if not identity_matches(identity, expected_plugin, expected_channel):
+            return {
+                "window_index": window_index,
+                "error": "plugin identity changed; refusing to read a stale window",
+                "expected": {"plugin": expected_plugin, "channel": expected_channel},
+                "observed": identity,
+            }
+    table = find_parameter_table(process, int(window_index))
+    if not table:
+        return {
+            "window_index": window_index,
+            "error": "no parameter table in this window",
+            "advice": "switch the window's View menu to Controls first",
+        }
+    page_offset = max(0, int(offset))
+    page_limit = max(1, min(int(limit), 500))
+    needle = contains.lower()
+    reference = element_reference(table, int(window_index))
+    start_row = 1 if needle else page_offset + 1
+    end_row = "n" if needle else str(page_offset + page_limit)
+    raw = osa(
+        f'tell application "System Events" to tell process "{process}"\n'
+        f"set t to {reference}\n"
+        "set n to 0\n"
+        "try\n"
+        "set n to count of rows of t\n"
+        "end try\n"
+        'set out to ""\n'
+        f"set startRow to {start_row}\n"
+        f"set endRow to {end_row}\n"
+        "if endRow > n then set endRow to n\n"
+        "repeat with i from startRow to endRow\n"
+        'set lbl to ""\n'
+        'set disp to ""\n'
+        'set rol to ""\n'
+        "try\n"
+        "set c to UI element 1 of row i of t\n"
+        "try\n"
+        "set lbl to (value of static text 1 of c) as string\n"
+        "end try\n"
+        "try\n"
+        "set disp to (value of UI element 2 of c) as string\n"
+        "end try\n"
+        "try\n"
+        "set rol to (role of UI element 2 of c) as string\n"
+        "end try\n"
+        "end try\n"
+        'set out to out & (i as string) & "~" & lbl & "~" & disp & "~" & rol & "|:|"\n'
+        "end repeat\n"
+        'return (n as string) & "#" & out\n'
+        "end tell",
+        timeout=int(seconds),
+    )
+    total, _, body = raw.partition("#")
+    try:
+        row_count = int(float(total.replace(",", ".")))
+    except ValueError:
+        row_count = 0
+    parameters = []
+    for record in split_records(body):
+        parts = (record.split("~") + ["", "", "", ""])[:4]
+        label = clean(parts[1]).rstrip(":").strip()
+        display = clean(parts[2])
+        if needle and needle not in label.lower():
+            continue
+        parameters.append(
+            {
+                "row": int(parts[0]) if parts[0].isdigit() else None,
+                "label": label,
+                "display": display,
+                "role": parts[3],
+                "path": f"{table}.{parts[0]}.1.2" if parts[0].isdigit() else "",
+            }
+        )
+    matched_total = len(parameters) if needle else row_count
+    if needle:
+        parameters = parameters[page_offset : page_offset + page_limit]
+    return {
+        "window_index": window_index,
+        "table_path": table,
+        "rows_total": row_count,
+        "offset": page_offset,
+        "returned": len(parameters),
+        "matched_total": matched_total,
+        "next_offset": page_offset + page_limit
+        if page_offset + page_limit < matched_total
+        else None,
+        "filter": contains or None,
+        "parameters": parameters,
+    }
 
 
 @tool
@@ -800,6 +1101,234 @@ def plugins_sweep(
 
 
 @tool
+def ax_show_menu(path: str, window_index: int = 1, settle: float = 0.8) -> dict:
+    """Open an element's context menu and list what it offers. Insert slots, faders and
+    sends all carry context menus that expose operations no other channel reaches, so this
+    is how a capability is discovered rather than assumed. Nothing is clicked; use ax_press
+    on the returned menu item path to act."""
+    process = require_logic()
+    if not all(part.strip().isdigit() for part in path.split(".") if part.strip()):
+        return {"ok": False, "error": f"path must be dotted integers, got {path!r}"}
+    reference = element_reference(path, int(window_index))
+    try:
+        osa(
+            f'tell application "System Events" to tell process "{process}" to '
+            f'perform action "AXShowMenu" of {reference}',
+            timeout=30,
+        )
+    except ProbeError as exc:
+        return {"ok": False, "error": f"could not open a menu here: {exc}", "path": path}
+    time.sleep(max(0.2, min(float(settle), 5.0)))
+    try:
+        elements = walk_window(process, int(window_index), 2, budget=400, seconds=25, root=path)
+    except ProbeError as exc:
+        return {"ok": False, "error": f"menu opened but could not be read: {exc}"}
+    items = [
+        {"path": e["path"], "title": e["name"] or e["value"], "enabled": e["value"] != "0"}
+        for e in elements
+        if e["role"] == "AXMenuItem"
+    ]
+    return {
+        "ok": True,
+        "path": path,
+        "menu_items": items,
+        "count": len(items),
+        "note": "press Escape or click elsewhere to dismiss; ax_press on an item path acts on it",
+    }
+
+
+@tool
+def plugin_set_view(
+    window_index: int = 1,
+    view: str = "Controls",
+    expected_plugin: str = "",
+    expected_channel: str = "",
+) -> dict:
+    """Switch a plugin editor between its own interface and Logic's generic Controls list.
+    Controls view is what makes any Audio Unit readable and writable, including third-party
+    plugins that draw themselves, so this is the gate to every parameter operation. The
+    change is verified by reading the view menu back."""
+    process = require_logic()
+    if expected_plugin or expected_channel:
+        try:
+            identity = read_plugin_identity(process, int(window_index))
+        except ProbeError as exc:
+            return {"ok": False, "error": str(exc)}
+        if not identity_matches(identity, expected_plugin, expected_channel):
+            return {
+                "ok": False,
+                "write_attempted": False,
+                "error": "plugin identity changed; refusing to operate on a stale window",
+                "expected": {"plugin": expected_plugin, "channel": expected_channel},
+                "observed": identity,
+            }
+    try:
+        shallow = walk_window(process, int(window_index), 1, budget=200, seconds=20)
+    except ProbeError as exc:
+        return {"ok": False, "error": str(exc)}
+    menu = next(
+        (e for e in shallow if e["role"] == "AXMenuButton" and e["description"] == "view"),
+        None,
+    )
+    if menu is None:
+        return {"ok": False, "error": "this window has no view menu; it may not be a plugin editor"}
+    current = menu["name"] or menu["value"]
+    if current == view:
+        return {"ok": True, "view": current, "changed": False, "note": "already in that view"}
+    reference = element_reference(menu["path"], int(window_index))
+    try:
+        osa(
+            f'tell application "System Events" to tell process "{process}" to '
+            f'perform action "AXPress" of {reference}',
+            timeout=30,
+        )
+        time.sleep(0.6)
+        items = walk_window(process, int(window_index), 2, budget=200, seconds=20, root=menu["path"])
+    except ProbeError as exc:
+        return {"ok": False, "error": f"could not open the view menu: {exc}"}
+    target = next(
+        (e for e in items if e["role"] == "AXMenuItem" and (e["name"] or "").strip() == view),
+        None,
+    )
+    if target is None:
+        offered = [e["name"] for e in items if e["role"] == "AXMenuItem" and e["name"]]
+        return {"ok": False, "error": f"{view!r} not offered", "available": offered}
+    try:
+        osa(
+            f'tell application "System Events" to tell process "{process}" to '
+            f'perform action "AXPress" of {element_reference(target["path"], int(window_index))}',
+            timeout=30,
+        )
+    except ProbeError as exc:
+        return {"ok": False, "error": f"could not select {view!r}: {exc}"}
+    time.sleep(1.0)
+    try:
+        after = walk_window(process, int(window_index), 1, budget=200, seconds=20)
+    except ProbeError as exc:
+        return {"ok": False, "error": f"selected but could not verify: {exc}"}
+    now = next(
+        (
+            e["name"] or e["value"]
+            for e in after
+            if e["role"] == "AXMenuButton" and e["description"] == "view"
+        ),
+        "",
+    )
+    return {
+        "ok": now == view,
+        "verified": now == view,
+        "view": now,
+        "was": current,
+        "changed": now != current,
+    }
+
+
+@tool
+def close_plugin_windows(keep: int = 0) -> dict:
+    """Close plugin editor windows, leaving the project windows alone. Opening editors one
+    at a time to identify them leaves a pile of dialogs behind, and every open editor shifts
+    the window indices that other tools depend on."""
+    process = require_logic()
+    closed = 0
+    for _ in range(40):
+        listing = ax_windows()
+        dialogs = [w for w in listing["windows"] if w["subrole"] == "AXDialog"]
+        if len(dialogs) <= int(keep):
+            break
+        target = dialogs[0]
+        try:
+            osa(
+                f'tell application "System Events" to tell process "{process}" to '
+                f'perform action "AXPress" of UI element 1 of window {target["index"]}',
+                timeout=20,
+            )
+        except ProbeError:
+            break
+        closed += 1
+        time.sleep(0.3)
+    listing = ax_windows()
+    return {
+        "closed": closed,
+        "remaining_dialogs": sum(1 for w in listing["windows"] if w["subrole"] == "AXDialog"),
+        "windows": listing["windows"],
+    }
+
+
+@tool
+def plugin_close_verified(
+    window_index: int = 1,
+    expected_plugin: str = "",
+    expected_channel: str = "",
+    dry_run: bool = True,
+) -> dict:
+    """Close exactly one editor after verifying its plugin/channel identity. This avoids
+    the broad close_plugin_windows cleanup path during an audit and preserves unrelated
+    windows that the user had open before the run."""
+    process = require_logic()
+    if not (expected_plugin or expected_channel):
+        return {"ok": False, "error": "expected_plugin or expected_channel is required"}
+    try:
+        identity = read_plugin_identity(process, int(window_index))
+    except ProbeError as exc:
+        return {"ok": False, "error": str(exc)}
+    if not identity_matches(identity, expected_plugin, expected_channel):
+        return {
+            "ok": False,
+            "write_attempted": False,
+            "error": "plugin identity changed; refusing to close a different window",
+            "expected": {"plugin": expected_plugin, "channel": expected_channel},
+            "observed": identity,
+        }
+    try:
+        top = walk_window(process, int(window_index), 0, budget=80, seconds=10)
+    except ProbeError as exc:
+        return {"ok": False, "error": f"could not inspect window controls: {exc}"}
+    close_button = next(
+        (
+            entry
+            for entry in top
+            if entry["role"] == "AXButton"
+            and "close" in f'{entry["name"]} {entry["description"]}'.casefold()
+        ),
+        None,
+    )
+    if close_button is None:
+        return {
+            "ok": False,
+            "error": "verified plugin window has no readable close button",
+            "identity": identity,
+        }
+    if dry_run:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "identity": identity,
+            "close_path": close_button["path"],
+            "note": "nothing was closed",
+        }
+    before = ax_windows()
+    try:
+        osa(
+            f'tell application "System Events" to tell process "{process}" to '
+            f'perform action "AXPress" of {element_reference(close_button["path"], int(window_index))}',
+            timeout=20,
+        )
+    except ProbeError as exc:
+        return {"ok": False, "identity": identity, "error": str(exc)}
+    time.sleep(0.4)
+    after = ax_windows()
+    closed = after["count"] < before["count"]
+    return {
+        "ok": closed,
+        "verified": closed,
+        "identity": identity,
+        "windows_before": before["count"],
+        "windows_after": after["count"],
+        "note": "window count did not decrease" if not closed else "",
+    }
+
+
+@tool
 def plugin_write_path(
     path: str,
     value: str,
@@ -807,6 +1336,8 @@ def plugin_write_path(
     dry_run: bool = True,
     allow_stepping: bool = True,
     max_steps: int = 64,
+    expected_plugin: str = "",
+    expected_channel: str = "",
 ) -> dict:
     """Write one control addressed by the dotted path from plugin_snapshot, and verify by
     reading it back. An absolute set is attempted first; measured behaviour on Logic sliders
@@ -819,6 +1350,37 @@ def plugin_write_path(
         return {"ok": False, "error": f"path must be dotted integers, got {path!r}"}
     if '"' in value:
         return {"ok": False, "error": "double quotes are not accepted in value"}
+    if not dry_run and not (expected_plugin or expected_channel):
+        return {
+            "ok": False,
+            "verified": False,
+            "write_attempted": False,
+            "error": "a live write requires expected_plugin or expected_channel",
+            "reason": "window indices change when editors open or close; bind the write "
+            "to identity returned by plugin_snapshot",
+        }
+    if expected_plugin or expected_channel:
+        try:
+            identity = read_plugin_identity(process, int(window_index))
+        except ProbeError as exc:
+            return {
+                "ok": False,
+                "verified": False,
+                "write_attempted": False,
+                "error": f"could not verify plugin identity: {exc}",
+            }
+        if not identity_matches(identity, expected_plugin, expected_channel):
+            return {
+                "ok": False,
+                "verified": False,
+                "write_attempted": False,
+                "error": "plugin identity changed; refusing the stale path",
+                "expected": {
+                    "plugin": expected_plugin or None,
+                    "channel": expected_channel or None,
+                },
+                "observed": identity,
+            }
     reference = element_reference(path, int(window_index))
     try:
         role, current = read_role_and_value(process, reference)
@@ -833,6 +1395,7 @@ def plugin_write_path(
         }
     target_number = as_number(value)
     numeric = target_number is not None and role in NUMERIC_ROLES
+    toggle = role in ("AXCheckBox", "AXRadioButton")
     if dry_run:
         return {
             "ok": True,
@@ -841,10 +1404,36 @@ def plugin_write_path(
             "role": role,
             "current_value": current,
             "requested_value": value,
-            "write_mode": "absolute number" if numeric else "string",
+            "write_mode": "press to toggle"
+            if toggle
+            else ("absolute number" if numeric else "string"),
             "note": "nothing was changed. Re-run with dry_run false to apply",
         }
     try:
+        if toggle:
+            for _ in range(3):
+                if values_match(value, read_value(process, reference)):
+                    break
+                osa(
+                    f'tell application "System Events" to tell process "{process}" to '
+                    f'perform action "AXPress" of {reference}',
+                    timeout=30,
+                )
+                time.sleep(0.35)
+            observed = read_value(process, reference)
+            return {
+                "ok": values_match(value, observed),
+                "verified": values_match(value, observed),
+                "method": "pressed",
+                "path": path,
+                "before": current,
+                "requested": value,
+                "after": observed,
+                "note": ""
+                if values_match(value, observed)
+                else "a checkbox is toggled by pressing it, and it did not reach the "
+                "requested state within three presses",
+            }
         send_value(process, reference, value, numeric)
         observed = read_value(process, reference)
     except ProbeError as exc:
@@ -926,6 +1515,8 @@ def plugin_write(
     value: str,
     window_index: int = 1,
     dry_run: bool = True,
+    expected_plugin: str = "",
+    expected_channel: str = "",
 ) -> dict:
     """Write one plugin parameter located by its accessibility name. Refuses when the name
     is ambiguous and reports the competing paths so plugin_write_path can be used instead.
@@ -935,15 +1526,92 @@ def plugin_write(
         target = find_control(parameter, int(window_index), process)
     except ProbeError as exc:
         return {"ok": False, "error": str(exc)}
-    return plugin_write_path(target["path"], value, window_index, dry_run)
+    return plugin_write_path(
+        target["path"],
+        value,
+        window_index,
+        dry_run,
+        expected_plugin=expected_plugin,
+        expected_channel=expected_channel,
+    )
+
+
+@tool
+def plugin_write_label_verified(
+    parameter: str,
+    value: str,
+    window_index: int = 1,
+    expected_plugin: str = "",
+    expected_channel: str = "",
+    expected_before: str = "",
+    dry_run: bool = True,
+) -> dict:
+    """Resolve an exact Controls-table label immediately before a verified write. This is
+    the audit fix path: it does not reuse an earlier AX path, refuses ambiguous labels,
+    checks optional expected_before, binds window identity, and delegates to read-back
+    verified plugin_write_path."""
+    if not (expected_plugin or expected_channel):
+        return {"ok": False, "error": "expected_plugin or expected_channel is required"}
+    table = plugin_parameters(
+        window_index=window_index,
+        contains=parameter,
+        offset=0,
+        limit=500,
+        expected_plugin=expected_plugin,
+        expected_channel=expected_channel,
+    )
+    if "error" in table:
+        return {"ok": False, "error": table["error"], "write_attempted": False}
+    matches = [
+        entry
+        for entry in table.get("parameters", [])
+        if entry.get("label", "").strip().casefold() == parameter.strip().casefold()
+    ]
+    if not matches:
+        return {
+            "ok": False,
+            "write_attempted": False,
+            "error": f"no exact parameter label {parameter!r}",
+            "near_matches": [entry.get("label") for entry in table.get("parameters", [])[:20]],
+        }
+    if len(matches) != 1:
+        return {
+            "ok": False,
+            "write_attempted": False,
+            "error": f"{len(matches)} exact parameters named {parameter!r}; refusing to guess",
+            "paths": [entry.get("path") for entry in matches],
+        }
+    resolved = matches[0]
+    before = resolved.get("display", "")
+    if expected_before and not values_match(expected_before, before):
+        return {
+            "ok": False,
+            "write_attempted": False,
+            "error": "parameter value changed since the fix was planned",
+            "expected_before": expected_before,
+            "observed_before": before,
+            "path": resolved.get("path"),
+        }
+    outcome = plugin_write_path(
+        resolved["path"],
+        value,
+        window_index=window_index,
+        dry_run=dry_run,
+        expected_plugin=expected_plugin,
+        expected_channel=expected_channel,
+    )
+    return {
+        **outcome,
+        "parameter": parameter,
+        "resolved_path": resolved.get("path"),
+        "resolved_before": before,
+    }
 
 
 @tool
 def plugin_plan(edits: list, note: str = "") -> dict:
-    """Register a batch of parameter edits as a named plan without touching Logic.
-    Each edit is an object with parameter, value and optional window_index. Returns a
-    plan id and the full list for review. Nothing is applied until plugin_apply is
-    called with that id and confirm set to true."""
+    """Register a batch without writing. The current plugin and channel identity is bound
+    into every edit, so plugin_apply refuses if z-order changes before confirmation."""
     if not isinstance(edits, list) or not edits:
         return {"error": "edits must be a non-empty list"}
     normalised = []
@@ -952,12 +1620,27 @@ def plugin_plan(edits: list, note: str = "") -> dict:
             return {"error": f"edit {index} is not an object"}
         if "value" not in edit or ("parameter" not in edit and "path" not in edit):
             return {"error": f"edit {index} needs value plus either parameter or path"}
+        window_index = int(edit.get("window_index", 1))
+        expected_plugin = str(edit.get("expected_plugin", ""))
+        expected_channel = str(edit.get("expected_channel", ""))
+        if not (expected_plugin or expected_channel):
+            try:
+                identity = read_plugin_identity(require_logic(), window_index)
+            except ProbeError as exc:
+                return {
+                    "error": f"edit {index} could not bind plugin identity: {exc}",
+                    "write_attempted": False,
+                }
+            expected_plugin = identity["plugin"]
+            expected_channel = identity["channel"]
         normalised.append(
             {
                 "parameter": str(edit.get("parameter", "")),
                 "path": str(edit["path"]) if edit.get("path") else "",
                 "value": str(edit["value"]),
-                "window_index": int(edit.get("window_index", 1)),
+                "window_index": window_index,
+                "expected_plugin": expected_plugin,
+                "expected_channel": expected_channel,
             }
         )
     plan_id = f"plan-{len(PLANS) + 1}"
@@ -996,11 +1679,21 @@ def plugin_apply(plan_id: str, confirm: bool = False, stop_on_failure: bool = Tr
     for edit in plan["edits"]:
         if edit.get("path"):
             outcome = plugin_write_path(
-                edit["path"], edit["value"], edit["window_index"], dry_run=False
+                edit["path"],
+                edit["value"],
+                edit["window_index"],
+                dry_run=False,
+                expected_plugin=edit["expected_plugin"],
+                expected_channel=edit["expected_channel"],
             )
         else:
             outcome = plugin_write(
-                edit["parameter"], edit["value"], edit["window_index"], dry_run=False
+                edit["parameter"],
+                edit["value"],
+                edit["window_index"],
+                dry_run=False,
+                expected_plugin=edit["expected_plugin"],
+                expected_channel=edit["expected_channel"],
             )
         results.append({**edit, "result": outcome})
         if stop_on_failure and not outcome.get("ok"):
@@ -1155,7 +1848,8 @@ def ax_subtree(
     }
 
 
-def find_control_bar(process: str, window: int) -> dict:
+def find_control_bar(process: str, window: int = 0) -> dict:
+    window = window or main_window_index(process)
     elements = walk_window(process, window, 2, root="6")
     index: dict[str, dict] = {}
     for entry in elements:
@@ -1166,12 +1860,13 @@ def find_control_bar(process: str, window: int) -> dict:
 
 
 @tool
-def control_bar(window_index: int = 1) -> dict:
+def control_bar(window_index: int = 0) -> dict:
     """Read Logic's Control Bar: whether transport is playing or recording, cycle, solo and
     metronome state, live tempo, time and key signature, playhead position and master
     volume. Unlike a key command this reports actual state rather than assuming a toggle."""
     process = require_logic()
-    index = find_control_bar(process, int(window_index))
+    window_index = int(window_index) or main_window_index(process)
+    index = find_control_bar(process, window_index)
     def value_of(label):
         entry = index.get(label)
         return entry["value"] if entry else None
@@ -1195,17 +1890,18 @@ def control_bar(window_index: int = 1) -> dict:
 
 
 @tool
-def transport_press(button: str, window_index: int = 1, verify: bool = True) -> dict:
+def transport_press(button: str, window_index: int = 0, verify: bool = True) -> dict:
     """Press a Control Bar button by name and report the state before and after. This is
     the reliable transport path: it targets the actual button rather than sending a
     keystroke that could land in the wrong place, and it can confirm what happened.
     Names come from control_bar, for example Play, Record, Cycle, Solo, Go to Beginning."""
     process = require_logic()
-    index = find_control_bar(process, int(window_index))
+    window_index = int(window_index) or main_window_index(process)
+    index = find_control_bar(process, window_index)
     entry = index.get(button)
     if entry is None:
         return {"ok": False, "error": f"no Control Bar element named {button!r}", "available": sorted(index)}
-    reference = element_reference(entry["path"], int(window_index))
+    reference = element_reference(entry["path"], window_index)
     before = entry["value"]
     try:
         osa(
@@ -1428,17 +2124,58 @@ def ax_press(path: str, window_index: int = 1, settle: float = 0.6) -> dict:
         return {"ok": False, "error": f"press failed: {exc}", "role": role}
     time.sleep(max(0.1, min(float(settle), 5.0)))
     after = ax_windows()
-    opened = [w for w in after["windows"] if w["title"] not in {b["title"] for b in before["windows"]}]
-    closed = [w for w in before["windows"] if w["title"] not in {a["title"] for a in after["windows"]}]
+    delta = after["count"] - before["count"]
+    def tally(windows):
+        counts: dict[str, int] = {}
+        for w in windows:
+            counts[w["title"]] = counts.get(w["title"], 0) + 1
+        return counts
+    before_tally, after_tally = tally(before["windows"]), tally(after["windows"])
+    gained = {
+        title: after_tally[title] - before_tally.get(title, 0)
+        for title in after_tally
+        if after_tally[title] > before_tally.get(title, 0)
+    }
+    lost = {
+        title: before_tally[title] - after_tally.get(title, 0)
+        for title in before_tally
+        if before_tally[title] > after_tally.get(title, 0)
+    }
     return {
         "ok": True,
         "path": path,
         "role": role,
         "windows_before": before["count"],
         "windows_after": after["count"],
-        "opened": opened,
-        "closed": closed,
+        "window_delta": delta,
+        "opened": gained,
+        "closed": lost,
+        "windows": after["windows"],
+        "note": "windows are counted by title because several editors on one channel share "
+        "the channel name; a delta with no title change means another editor of the same "
+        "channel opened or closed",
     }
+
+
+FADER_UNITY_RAW = 173.0
+FADER_RAW_PER_DB = 10.0
+FADER_LINEAR_FLOOR = 113.0
+
+
+def fader_db_from_raw(raw: str):
+    """Convert a raw fader position to decibels, but only across the span where the
+    relationship was actually measured. Logic's fader is linear at ten raw units per
+    decibel from unity down to about minus six, then steepens sharply: a strip reading
+    forty-seven showed minus twenty-one where the linear rule predicts minus twelve point
+    six, and zero is silence rather than the minus seventeen the rule would give. Outside
+    the measured span this returns nothing, because a plausible wrong number is worse than
+    an admitted gap."""
+    value = as_number(raw)
+    if value is None:
+        return None
+    if value < FADER_LINEAR_FLOOR:
+        return None
+    return round((value - FADER_UNITY_RAW) / FADER_RAW_PER_DB, 1)
 
 
 def parse_db(text: str):
@@ -1449,6 +2186,9 @@ def parse_db(text: str):
 
 
 NON_SEND_DESCRIPTIONS = (
+    "automation",
+    "volume",
+    "input",
     "insert bar",
     "audio plug-in",
     "midi plug-in",
@@ -1673,19 +2413,66 @@ def surfaces_bypass(state: str = "read") -> dict:
     }
 
 
+def main_window_index(process: str) -> int:
+    raw = osa(
+        f'tell application "System Events" to tell process "{process}"\n'
+        'set out to ""\n'
+        "repeat with i from 1 to (count of windows)\n"
+        "try\n"
+        'set out to out & (i as string) & "~" & (subrole of window i as string) & "~" & (name of window i as string) & "|:|"\n'
+        "end try\n"
+        "end repeat\n"
+        "return out\n"
+        "end tell"
+    )
+    standard = []
+    for record in split_records(raw):
+        parts = (record.split("~") + ["", "", ""])[:3]
+        if parts[1] == "AXStandardWindow":
+            standard.append((int(parts[0]), parts[2]))
+    if not standard:
+        raise ProbeError("no standard window found; Logic may have only dialogs open")
+    for index, title in standard:
+        if title.endswith(" - Tracks"):
+            return index
+    return standard[0][0]
+
+
+@tool
+def main_window() -> dict:
+    """Report which window index currently holds Logic's main Tracks window. Window indices
+    are ordered by which window is in front, so opening any plugin editor pushes the main
+    window off index 1. Every tool that means the main window resolves it this way instead
+    of assuming, because assuming produced invalid-index errors that looked like the mixer
+    had disappeared."""
+    process = require_logic()
+    index = main_window_index(process)
+    listing = ax_windows()
+    return {
+        "main_window_index": index,
+        "windows": listing["windows"],
+        "note": "a plugin editor in front takes index 1, which is why a path that worked a "
+        "moment ago can stop resolving",
+    }
+
+
 def locate_mixer(process: str, hint: str = "") -> dict:
+    try:
+        main = main_window_index(process)
+    except ProbeError as exc:
+        return {"found": False, "reason": str(exc)}
     if hint:
         try:
             role = osa(
                 f'tell application "System Events" to tell process "{process}" to '
-                f"return role of {element_reference(hint, 1)} as string"
+                f"return role of {element_reference(hint, main)} as string"
             )
             if role == "AXLayoutArea":
-                return {"found": True, "path": hint, "source": "hint"}
+                return {"found": True, "path": hint, "window_index": main, "source": "hint"}
         except ProbeError:
             pass
     try:
-        elements = walk_window(process, 1, 2, budget=600, seconds=30)
+        elements = walk_window(process, main, 2, budget=600, seconds=30)
     except ProbeError as exc:
         return {"found": False, "reason": f"could not read the main window: {exc}"}
     areas = [
@@ -1707,7 +2494,7 @@ def locate_mixer(process: str, hint: str = "") -> dict:
         try:
             count = osa(
                 f'tell application "System Events" to tell process "{process}" to '
-                f"return count of UI elements of {element_reference(area['path'], 1)} as string",
+                f"return count of UI elements of {element_reference(area['path'], main)} as string",
                 timeout=15,
             )
             strips = int(float(count.replace(",", ".")))
@@ -1717,7 +2504,13 @@ def locate_mixer(process: str, hint: str = "") -> dict:
             best = (area["path"], strips)
     if best is None or best[1] == 0:
         return {"found": False, "reason": "mixer area found but it holds no channel strips"}
-    return {"found": True, "path": best[0], "strip_count": best[1], "source": "discovered"}
+    return {
+        "found": True,
+        "path": best[0],
+        "window_index": main,
+        "strip_count": best[1],
+        "source": "discovered",
+    }
 
 
 @tool
@@ -1730,7 +2523,21 @@ def mixer_locate(hint: str = "") -> dict:
 
 
 def parse_strip(label: str, path: str, kids: list) -> dict:
-    row: dict = {"path": path, "name": label}
+    row: dict = {
+        "path": path,
+        "name": label,
+        "fader_db": None,
+        "fader_raw": None,
+        "pan": None,
+        "clipping": None,
+        "mute": None,
+        "solo": None,
+        "automation": None,
+        "output": None,
+        "fader_db_source": None,
+        "order": None,
+        "control_paths": {},
+    }
     send_levels, output = [], None
     bars = [i for i, k in enumerate(kids) if k["description"] == "insert bar"]
     first_bar = min(bars) if bars else len(kids)
@@ -1750,20 +2557,62 @@ def parse_strip(label: str, path: str, kids: list) -> dict:
             row["clipping"] = "clipping off" not in (kid["value"] or "")
         elif what in ("mute", "solo", "record", "monitoring"):
             row[what] = kid["value"]
+            row["control_paths"][what] = kid.get("path", "")
         elif is_automation(what):
             row["automation"] = what.split(",")[0].strip()
         elif role == "AXSlider" and what == "send knob":
             send_levels.append(kid["value"])
+        elif what == "insert bar":
+            continue
         elif role == "AXGroup" and what and not is_automation(what):
-            (sends if position < first_bar else inserts).append(what)
+            (sends if position < first_bar else inserts).append(
+                {"name": what, "path": kid.get("path", ""), "role": role}
+            )
         elif role == "AXButton" and what and what not in NON_SEND_DESCRIPTIONS:
             output = output or what
-    row["sends"] = [
-        {"bus": bus, "level": send_levels[i] if i < len(send_levels) else None}
-        for i, bus in enumerate(sends)
-    ]
-    row["inserts"] = inserts
+    row["sends"] = list(
+        reversed(
+            [
+                {"bus": bus, "level": send_levels[i] if i < len(send_levels) else None}
+                for i, bus in enumerate(item["name"] for item in sends)
+            ]
+        )
+    )
+    row["send_controls"] = list(reversed(sends))
+    row["insert_controls"] = list(reversed(inserts))
+    row["inserts"] = [item["name"] for item in row["insert_controls"]]
+    row["order"] = "signal flow, first processed first"
     row["output"] = output
+    if row.get("fader_db") is None and row.get("fader_raw"):
+        derived = fader_db_from_raw(row["fader_raw"])
+        if derived is not None:
+            row["fader_db"] = derived
+            row["fader_db_source"] = "derived from fader position"
+        else:
+            row["fader_db_source"] = (
+                "not derivable: the fader sits below the span where the raw-to-decibel "
+                "relationship was measured, and guessing there produced errors of eight "
+                "decibels or more"
+            )
+    elif row.get("fader_db") is not None:
+        row["fader_db_source"] = "read from the strip label"
+    generic = {"audio plug-in", "midi plug-in", "send button", ""}
+    detail_missing = []
+    if row.get("fader_db") is None:
+        detail_missing.append("fader level in dB")
+    if row["inserts"] and all(i in generic for i in row["inserts"]):
+        detail_missing.append("plugin names")
+    if row["sends"] and all(s["bus"] in generic for s in row["sends"]):
+        detail_missing.append("send destinations")
+    if detail_missing:
+        row["detail"] = "partial"
+        row["missing"] = detail_missing
+        row["reason"] = (
+            "Logic only labels channel strips that are scrolled into view; this one was "
+            "off screen, so names and levels came back as generic placeholders"
+        )
+    else:
+        row["detail"] = "full"
     return row
 
 
@@ -1778,7 +2627,8 @@ def mixer_strips(mixer_path: str = "") -> dict:
     if not located.get("found"):
         return located
     mixer_path = located["path"]
-    elements = walk_window(process, 1, 1, budget=400, seconds=25, root=mixer_path)
+    main = located["window_index"]
+    elements = walk_window(process, main, 1, budget=400, seconds=25, root=mixer_path)
     strips = [
         {"index": i, "path": e["path"], "name": e["description"] or e["name"]}
         for i, e in enumerate(elements)
@@ -1786,9 +2636,280 @@ def mixer_strips(mixer_path: str = "") -> dict:
     ]
     return {
         "mixer_path": mixer_path,
+        "window_index": main,
         "located_by": located.get("source"),
         "count": len(strips),
         "strips": strips,
+    }
+
+
+@tool
+def mixer_reveal_strip(
+    strip_path: str,
+    expected_strip: str,
+    dry_run: bool = True,
+) -> dict:
+    """Scroll one mixer strip into the visible viewport using AXScrollToVisible, then
+    verify the real name. This turns off-screen generic labels into readable plugin names
+    without assuming that a mixer index is a track index."""
+    if not strip_path or not all(
+        part.strip().isdigit() for part in strip_path.split(".") if part.strip()
+    ):
+        return {"ok": False, "error": f"strip_path must be dotted integers, got {strip_path!r}"}
+    process = require_logic()
+    try:
+        main = main_window_index(process)
+        role = osa(
+            f'tell application "System Events" to tell process "{process}" to '
+            f'return role of {element_reference(strip_path, main)} as string',
+            timeout=15,
+        )
+    except ProbeError as exc:
+        return {"ok": False, "error": f"strip path does not resolve: {exc}"}
+    if role != "AXLayoutItem":
+        return {"ok": False, "error": f"strip path resolved to {role}, expected AXLayoutItem"}
+    preview = {
+        "strip_path": strip_path,
+        "expected_strip": expected_strip,
+        "window_index": main,
+    }
+    if dry_run:
+        return {"ok": True, "dry_run": True, **preview, "note": "viewport was not changed"}
+    try:
+        osa(
+            f'tell application "System Events" to tell process "{process}" to '
+            f'perform action "AXScrollToVisible" of {element_reference(strip_path, main)}',
+            timeout=20,
+        )
+        time.sleep(0.45)
+        kids = walk_window(process, main, 1, budget=350, seconds=20, root=strip_path)
+    except ProbeError as exc:
+        return {"ok": False, **preview, "error": f"scroll/read failed: {exc}"}
+    strip = parse_strip("", strip_path, kids)
+    observed = strip.get("name") or ""
+    verified = bool(observed) and observed.casefold() == expected_strip.casefold()
+    return {
+        "ok": verified,
+        "verified": verified,
+        **preview,
+        "observed_strip": observed,
+        "detail": strip.get("detail"),
+        "inserts": strip.get("inserts", []),
+        "note": "revealed strip identity did not match" if not verified else "",
+    }
+
+
+@tool
+def mixer_read_strip(strip_path: str, expected_strip: str) -> dict:
+    """Read one already revealed strip with verified name, insert paths and solo/mute
+    controls. Call mixer_reveal_strip first for an off-screen channel."""
+    process = require_logic()
+    try:
+        main = main_window_index(process)
+        kids = walk_window(process, main, 1, budget=350, seconds=20, root=strip_path)
+    except ProbeError as exc:
+        return {"ok": False, "error": str(exc)}
+    strip = parse_strip("", strip_path, kids)
+    observed = strip.get("name") or ""
+    if not observed or observed.casefold() != expected_strip.casefold():
+        return {
+            "ok": False,
+            "error": "strip is not visible with the expected identity",
+            "expected_strip": expected_strip,
+            "observed_strip": observed,
+            "advice": "call mixer_reveal_strip immediately before this read",
+        }
+    return {"ok": True, **strip}
+
+
+@tool
+def plugin_open_insert(
+    strip_path: str,
+    insert_index: int,
+    expected_strip: str,
+    expected_plugin: str = "",
+    dry_run: bool = True,
+) -> dict:
+    """Open one insert by its signal-flow index after re-reading the strip identity.
+    The operation refuses stale paths or unexpected plugin names. Opening an editor does
+    not alter audio, but defaults to a dry run because it changes window z-order."""
+    if not strip_path or not all(
+        part.strip().isdigit() for part in strip_path.split(".") if part.strip()
+    ):
+        return {"ok": False, "error": f"strip_path must be dotted integers, got {strip_path!r}"}
+    slot = int(insert_index)
+    if slot < 0:
+        return {"ok": False, "error": "insert_index must be zero or greater"}
+    process = require_logic()
+    try:
+        main = main_window_index(process)
+        kids = walk_window(
+            process, main, 1, budget=350, seconds=20, root=strip_path
+        )
+    except ProbeError as exc:
+        return {"ok": False, "error": f"could not re-read the strip: {exc}"}
+    strip = parse_strip("", strip_path, kids)
+    observed_strip = strip.get("name") or ""
+    if expected_strip and observed_strip.casefold() != expected_strip.casefold():
+        return {
+            "ok": False,
+            "write_attempted": False,
+            "error": "strip identity changed; refusing the stale path",
+            "expected_strip": expected_strip,
+            "observed_strip": observed_strip,
+        }
+    controls = strip.get("insert_controls", [])
+    if slot >= len(controls):
+        return {
+            "ok": False,
+            "error": f"insert_index {slot} is outside the {len(controls)} readable inserts",
+            "inserts": strip.get("inserts", []),
+        }
+    target = controls[slot]
+    observed_plugin = target.get("name", "")
+    if expected_plugin and observed_plugin.casefold() != expected_plugin.casefold():
+        return {
+            "ok": False,
+            "write_attempted": False,
+            "error": "insert identity changed; refusing the stale path",
+            "expected_plugin": expected_plugin,
+            "observed_plugin": observed_plugin,
+            "inserts": strip.get("inserts", []),
+        }
+    preview = {
+        "strip": observed_strip,
+        "strip_path": strip_path,
+        "insert_index": slot,
+        "plugin": observed_plugin,
+        "insert_path": target.get("path"),
+    }
+    if dry_run:
+        return {
+            "ok": True,
+            "dry_run": True,
+            **preview,
+            "note": "nothing was opened; re-call with dry_run false",
+        }
+    before = ax_windows()
+    try:
+        osa(
+            f'tell application "System Events" to tell process "{process}" to '
+            f'perform action "AXPress" of {element_reference(target["path"], main)}',
+            timeout=30,
+        )
+    except ProbeError as exc:
+        return {"ok": False, **preview, "error": f"insert press failed: {exc}"}
+    time.sleep(0.8)
+    after = ax_windows()
+    try:
+        identity = read_plugin_identity(process, 1)
+    except ProbeError as exc:
+        return {
+            "ok": False,
+            **preview,
+            "opened": after["count"] >= before["count"],
+            "error": f"editor opened but identity could not be read: {exc}",
+        }
+    verified = identity_matches(
+        identity,
+        expected_plugin or observed_plugin,
+        expected_strip,
+    )
+    return {
+        "ok": verified,
+        "verified": verified,
+        **preview,
+        "window_index": 1,
+        "identity": identity,
+        "windows_before": before["count"],
+        "windows_after": after["count"],
+        "note": "editor identity did not match the requested insert"
+        if not verified
+        else "",
+    }
+
+
+@tool
+def mixer_set_toggle(
+    strip_path: str,
+    control: str,
+    enabled: bool,
+    expected_strip: str,
+    dry_run: bool = True,
+) -> dict:
+    """Set mute or solo on a mixer-only Aux/Bus strip after re-reading its identity.
+    This is used when a mixer index is not a valid track index. AXPress is independently
+    read back and stale strip paths are refused."""
+    if control not in ("mute", "solo"):
+        return {"ok": False, "error": "control must be mute or solo"}
+    if not strip_path or not all(
+        part.strip().isdigit() for part in strip_path.split(".") if part.strip()
+    ):
+        return {"ok": False, "error": f"strip_path must be dotted integers, got {strip_path!r}"}
+    process = require_logic()
+    try:
+        main = main_window_index(process)
+        kids = walk_window(process, main, 1, budget=350, seconds=20, root=strip_path)
+    except ProbeError as exc:
+        return {"ok": False, "error": f"could not re-read strip: {exc}"}
+    strip = parse_strip("", strip_path, kids)
+    observed_strip = strip.get("name") or ""
+    if expected_strip and observed_strip.casefold() != expected_strip.casefold():
+        return {
+            "ok": False,
+            "write_attempted": False,
+            "error": "strip identity changed; refusing the stale path",
+            "expected_strip": expected_strip,
+            "observed_strip": observed_strip,
+        }
+    path = strip.get("control_paths", {}).get(control)
+    if not path:
+        return {"ok": False, "error": f"{control} control is not readable on this strip"}
+
+    def toggle_value(value):
+        folded = str(value or "").strip().casefold()
+        if folded in ("1", "true", "on", "yes", "enabled"):
+            return True
+        if folded in ("0", "false", "off", "no", "disabled"):
+            return False
+        return None
+
+    before_raw = strip.get(control)
+    before = toggle_value(before_raw)
+    if before is None:
+        return {"ok": False, "error": f"unrecognised {control} state {before_raw!r}"}
+    preview = {
+        "strip": observed_strip,
+        "strip_path": strip_path,
+        "control": control,
+        "control_path": path,
+        "before": before,
+        "requested": bool(enabled),
+    }
+    if before == bool(enabled):
+        return {"ok": True, "verified": True, "changed": False, **preview}
+    if dry_run:
+        return {"ok": True, "dry_run": True, **preview, "note": "nothing was changed"}
+    reference = element_reference(path, main)
+    try:
+        osa(
+            f'tell application "System Events" to tell process "{process}" to '
+            f'perform action "AXPress" of {reference}',
+            timeout=20,
+        )
+        time.sleep(0.35)
+        after_raw = read_value(process, reference)
+    except ProbeError as exc:
+        return {"ok": False, "verified": False, **preview, "error": str(exc)}
+    after = toggle_value(after_raw)
+    verified = after == bool(enabled)
+    return {
+        "ok": verified,
+        "verified": verified,
+        "changed": after != before,
+        "after": after,
+        **preview,
+        "note": "state read-back did not match" if not verified else "",
     }
 
 
@@ -1822,7 +2943,12 @@ def mixer_survey(
         allowance = int(min(max(4, remaining - 2), int(per_strip_seconds)))
         try:
             kids = walk_window(
-                process, 1, 1, budget=300, seconds=allowance, root=strip["path"]
+                process,
+                index["window_index"],
+                1,
+                budget=300,
+                seconds=allowance,
+                root=strip["path"],
             )
         except ProbeError as exc:
             incomplete.append({**strip, "reason": str(exc)})
@@ -1834,6 +2960,7 @@ def mixer_survey(
 
     clipping = [r["name"] for r in report if r.get("clipping")]
     muted = [r["name"] for r in report if r.get("mute") == "on"]
+    partial = [r["name"] for r in report if r.get("detail") == "partial"]
     faders = [r["fader_db"] for r in report if isinstance(r.get("fader_db"), float)]
     outputs: dict[str, int] = {}
     for r in report:
@@ -1841,17 +2968,510 @@ def mixer_survey(
             outputs[r["output"]] = outputs.get(r["output"], 0) + 1
     return {
         "mixer_path": index["mixer_path"],
+        "window_index": index["window_index"],
         "strips_total": index["count"],
         "offset": offset,
         "strips_parsed": len(report),
         "strips_incomplete": incomplete,
         "next_offset": int(offset) + len(window),
+        "strips_full_detail": len(report) - len(partial),
+        "strips_partial_detail": partial,
         "clipping_strips": clipping,
         "muted_strips": muted,
         "fader_range_db": [min(faders), max(faders)] if faders else None,
         "outputs": dict(sorted(outputs.items(), key=lambda kv: -kv[1])),
         "channels": report,
+        "note": "strips marked partial were off screen. Scroll the Mixer so they are "
+        "visible, or survey in smaller slices while scrolling, to get plugin names and "
+        "fader levels for them"
+        if partial
+        else "",
     }
+
+
+@tool
+def plugin_meter_read(
+    window_index: int = 1,
+    expected_plugin: str = "",
+    expected_channel: str = "",
+    contains: str = "",
+    max_depth: int = 3,
+    budget: int = 700,
+    seconds: int = 20,
+) -> dict:
+    """Read AX-exposed live meter labels and values from an already open analyzer.
+    Generic Controls parameters are settings, not measurements, so this intentionally
+    reads the editor view and reports only observable values. It refuses a shifted window
+    identity and does not invent LUFS/peak values when a plugin does not expose them."""
+    process = require_logic()
+    try:
+        identity = read_plugin_identity(process, int(window_index))
+    except ProbeError as exc:
+        return {"ok": False, "error": f"could not identify meter window: {exc}"}
+    if not identity_matches(identity, expected_plugin, expected_channel):
+        return {
+            "ok": False,
+            "error": "meter window identity changed",
+            "expected": {"plugin": expected_plugin, "channel": expected_channel},
+            "observed": identity,
+        }
+    try:
+        elements = walk_window(
+            process,
+            int(window_index),
+            max(1, min(int(max_depth), 4)),
+            budget=max(50, min(int(budget), 1200)),
+            seconds=max(5, min(int(seconds), 45)),
+        )
+    except ProbeError as exc:
+        return {"ok": False, "identity": identity, "error": str(exc)}
+    terms = (
+        "lufs",
+        "loudness",
+        "integrated",
+        "momentary",
+        "short-term",
+        "short term",
+        "true peak",
+        "peak",
+        "range",
+        "rms",
+        "dbtp",
+        "dbfs",
+        " lu",
+        " db",
+    )
+    needle = contains.casefold().strip()
+    readouts = []
+    seen = set()
+    for entry in elements:
+        if entry["role"] not in (
+            "AXStaticText",
+            "AXValueIndicator",
+            "AXTextField",
+            "AXSlider",
+        ):
+            continue
+        text_value = " | ".join(
+            value for value in (entry["name"], entry["description"], entry["value"]) if value
+        )
+        folded = text_value.casefold()
+        has_number = bool(re.search(r"[-+]?\d+(?:[.,]\d+)?", text_value))
+        if needle:
+            relevant = needle in folded and has_number
+        else:
+            relevant = has_number and any(term in folded for term in terms)
+        if not relevant or (entry["path"], text_value) in seen:
+            continue
+        seen.add((entry["path"], text_value))
+        readouts.append({**entry, "text": text_value})
+    return {
+        "ok": True,
+        "identity": identity,
+        "readout_count": len(readouts),
+        "readouts": readouts,
+        "measurement_available": bool(readouts),
+        "note": "no live measurement was exposed through AX; use a bounce plus BS.1770"
+        if not readouts
+        else "values are raw plugin readouts and should be interpreted by label and unit",
+    }
+
+
+def find_open_logic_project() -> Path | None:
+    process = logic_process()
+    if process is None:
+        return None
+    pid_result = subprocess.run(["pgrep", "-x", process], capture_output=True, text=True)
+    if pid_result.returncode != 0 or not pid_result.stdout.split():
+        return None
+    listing = subprocess.run(
+        ["lsof", "-p", pid_result.stdout.split()[0], "-Fn"],
+        capture_output=True,
+        text=True,
+    )
+    candidates = []
+    for line in listing.stdout.splitlines():
+        if not line.startswith("n"):
+            continue
+        match = re.search(r"^(.*?\.logicx)(/|$)", line[1:])
+        if match:
+            candidates.append(Path(match.group(1)))
+    return sorted(set(candidates), key=lambda item: len(str(item)))[0] if candidates else None
+
+
+def logic_bounce_script() -> Path | None:
+    binary = shutil.which("LogicProMCP")
+    if not binary:
+        return None
+    candidate = Path(binary).resolve().parents[1] / "share" / "logic-pro-mcp" / "logic_bounce.py"
+    return candidate if candidate.is_file() else None
+
+
+@tool
+def mix_bounce_target(
+    target_path: str,
+    expected_project_path: str,
+    confirmed: bool = False,
+    timeout_seconds: int = 1800,
+) -> dict:
+    """Bounce the currently isolated target to a planned non-existing path. This is the
+    measurement bridge used after a mature-server solo/isolation step. It refuses unless
+    the exact open project matches and confirmed is true; the packaged bounce driver uses
+    exclusive file creation and never overwrites an artifact."""
+    target = Path(target_path).expanduser()
+    expected = Path(expected_project_path).expanduser()
+    if not target.is_absolute() or not expected.is_absolute():
+        return {"ok": False, "error": "target_path and expected_project_path must be absolute"}
+    current = find_open_logic_project()
+    preview = {
+        "target_path": str(target),
+        "expected_project_path": str(expected),
+        "observed_project_path": str(current) if current else None,
+    }
+    if current is None or current.resolve() != expected.resolve():
+        return {
+            "ok": False,
+            "write_attempted": False,
+            **preview,
+            "error": "open project identity does not match the bounce plan",
+        }
+    if target.exists() or any(target.parent.glob(f"{target.stem}.*")):
+        return {
+            "ok": False,
+            "write_attempted": False,
+            **preview,
+            "error": "planned artifact already exists; refusing to overwrite",
+        }
+    script = logic_bounce_script()
+    if script is None:
+        return {"ok": False, **preview, "error": "packaged logic_bounce.py was not found"}
+    if not confirmed:
+        return {
+            "ok": True,
+            "dry_run": True,
+            "confirmation_required": True,
+            **preview,
+            "driver": str(script),
+            "note": "no UI action or file write occurred",
+        }
+    process = subprocess.Popen(
+        [sys.executable, str(script), "--target-path", str(target)],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        start_new_session=True,
+    )
+    try:
+        out, err = process.communicate(timeout=max(60, min(int(timeout_seconds), 3600)))
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            process.kill()
+        process.communicate()
+        return {"ok": False, **preview, "error": "bounce timed out and its process group was killed"}
+    line = next((line for line in reversed(out.splitlines()) if line.strip()), "")
+    try:
+        result = json.loads(line)
+    except json.JSONDecodeError:
+        return {
+            "ok": False,
+            **preview,
+            "error": (err or line or "bounce driver returned no result").strip(),
+        }
+    return {"ok": bool(result.get("success")), **result}
+
+
+@tool
+def mix_inventory(tracks=None, mixer=None, ax_channels=None) -> dict:
+    """Merge mature-server track/mixer resources and mixer_survey output into one typed
+    inventory. Explicit server type metadata wins; name heuristics are only a fallback."""
+    return mix_audit.normalise_inventory(tracks, mixer, ax_channels)
+
+
+@tool
+def mix_audit_plan(
+    tracks,
+    mixer,
+    ax_channels,
+    scope: str,
+    project_path: str,
+    output_root: str,
+    selector: str = "",
+    measurement: str = "bounce_bs1770",
+    start_position: str = "1.1.1.1",
+    target_name: str = "streaming",
+) -> dict:
+    """Create a serializable dry-run plan for track, group, aux, bus, master or all.
+    Pass the live logic://tracks and logic://mixer payloads plus mixer_survey output. The
+    plan contains exact cross-server dispatches and mandatory restore steps, but performs
+    no solo, transport, bounce or plugin write."""
+    inventory = mix_audit.normalise_inventory(tracks, mixer, ax_channels)
+    plan = mix_audit.build_audit_plan(
+        inventory,
+        scope,
+        selector,
+        project_path,
+        output_root,
+        measurement,
+        start_position,
+        target_name,
+    )
+    if "error" not in plan:
+        AUDIT_PLANS[plan["plan_id"]] = {
+            "plan": plan,
+            "confirmed": False,
+            "cancelled": False,
+            "current": 0,
+            "results": {},
+        }
+    return plan
+
+
+@tool
+def mix_fix_plan(
+    tracks,
+    mixer,
+    ax_channels,
+    fixes: list,
+    project_path: str,
+) -> dict:
+    """Create a confirmation-gated fix plan from explicit target/plugin/parameter/value
+    requests. Paths are resolved again at apply time and every write is identity-bound and
+    read back. Run a new mix audit afterwards and compare with mix_before_after."""
+    inventory = mix_audit.normalise_inventory(tracks, mixer, ax_channels)
+    plan = mix_audit.build_fix_plan(inventory, fixes, project_path)
+    if "error" not in plan:
+        AUDIT_PLANS[plan["plan_id"]] = {
+            "plan": plan,
+            "confirmed": False,
+            "cancelled": False,
+            "current": 0,
+            "results": {},
+        }
+    return plan
+
+
+def audit_next_step(run: dict) -> dict | None:
+    steps = run["plan"]["steps"]
+    while run["current"] < len(steps) and steps[run["current"]]["status"] in (
+        "completed",
+        "skipped",
+    ):
+        run["current"] += 1
+    return steps[run["current"]] if run["current"] < len(steps) else None
+
+
+def materialise_audit_step(run: dict, step: dict) -> dict:
+    result = json.loads(json.dumps(step))
+    source = result.get("arguments", {}).pop("path_from", None)
+    if source:
+        step_id, _, field = source.partition(".")
+        observed = run["results"].get(step_id, {})
+        path = observed.get(field)
+        if path:
+            result["arguments"]["path"] = path
+        else:
+            result["blocked"] = f"{source} is not available"
+    for argument, source in result.pop("arguments_from", {}).items():
+        step_id, _, field = source.partition(".")
+        observed = run["results"].get(step_id, {})
+        value = observed if field == "$" else observed.get(field)
+        if value is not None and value != "":
+            result["arguments"][argument] = value
+        else:
+            result["blocked"] = f"{source} is not available"
+    return result
+
+
+@tool
+def mix_audit_start(plan_id: str, confirm: bool = False) -> dict:
+    """Start a stored audit plan. Confirmation unlocks solo/transport/bounce dispatches,
+    not parameter writes. The client executes the returned next_step and reports it with
+    mix_audit_advance; this server preserves ordering and restoration obligations."""
+    run = AUDIT_PLANS.get(plan_id)
+    if run is None:
+        return {"error": f"unknown plan_id {plan_id!r}", "known": sorted(AUDIT_PLANS)}
+    if not confirm:
+        return {
+            "plan_id": plan_id,
+            "confirmation_required": True,
+            "targets": run["plan"].get("target_count"),
+            "fixes": run["plan"].get("fix_count"),
+            "mutating_steps": sum(
+                1
+                for step in run["plan"]["steps"]
+                if step.get("mutates_logic")
+                or step.get("mutates_ui")
+                or step.get("writes_parameter")
+            ),
+            "reason": "review the dry-run plan, save the project, then re-call with confirm true",
+        }
+    run["confirmed"] = True
+    step = audit_next_step(run)
+    return {
+        "plan_id": plan_id,
+        "started": True,
+        "next_step": materialise_audit_step(run, step) if step else None,
+    }
+
+
+@tool
+def mix_audit_advance(plan_id: str, step_id: str, result: dict) -> dict:
+    """Record one externally dispatched step and return the next ordered step. A failed
+    step skips forward to the next always-run restoration step instead of cascading."""
+    run = AUDIT_PLANS.get(plan_id)
+    if run is None:
+        return {"error": f"unknown plan_id {plan_id!r}"}
+    if not run["confirmed"]:
+        return {"error": "plan has not been confirmed"}
+    step = audit_next_step(run)
+    if step is None:
+        return {"plan_id": plan_id, "complete": True}
+    if step["step_id"] != step_id:
+        return {
+            "error": "out-of-order audit result",
+            "expected_step_id": step["step_id"],
+            "received_step_id": step_id,
+        }
+    dispatch_incomplete = step.get("requires_dispatch_execution") and not (
+        result.get("executed") is True and result.get("verified") is True
+    )
+    failed = bool(result.get("error")) or result.get("ok") is False or dispatch_incomplete
+    if dispatch_incomplete:
+        result = {
+            **result,
+            "error": "child dispatches were not reported as executed and verified",
+        }
+    step["status"] = "failed" if failed else "completed"
+    run["results"][step_id] = result
+    run["current"] += 1
+    if not failed and step.get("expand_plugin_steps"):
+        target = next(
+            (
+                item
+                for item in run["plan"].get("targets", [])
+                if item.get("audit_id") == step.get("target_id")
+            ),
+            None,
+        )
+        inserts = result.get("inserts") if isinstance(result.get("inserts"), list) else []
+        if target is not None and inserts:
+            target["inserts"] = inserts
+            target["strip_path"] = result.get("path") or target.get("strip_path")
+            expanded = mix_audit.build_plugin_inspection_steps(
+                step.get("plugin_prefix") or step["step_id"], target, inserts
+            )
+            run["plan"]["steps"][run["current"] : run["current"]] = expanded
+    if failed and step["phase"] != "restore":
+        remaining = run["plan"]["steps"][run["current"] :]
+        if step["phase"] in ("preflight", "capture"):
+            destination = next(
+                (pending for pending in reversed(remaining) if pending.get("always_run")),
+                None,
+            )
+        else:
+            destination = next(
+                (
+                    pending
+                    for pending in remaining
+                    if pending.get("always_run")
+                    and pending.get("target_id") == step.get("target_id")
+                ),
+                None,
+            )
+            if destination is None:
+                destination = next(
+                    (pending for pending in reversed(remaining) if pending.get("always_run")),
+                    None,
+                )
+        for pending in remaining:
+            if pending is destination:
+                run["current"] = run["plan"]["steps"].index(pending)
+                break
+            pending["status"] = "skipped"
+    next_step = audit_next_step(run)
+    return {
+        "plan_id": plan_id,
+        "accepted": step_id,
+        "failed": failed,
+        "complete": next_step is None,
+        "next_step": materialise_audit_step(run, next_step) if next_step else None,
+    }
+
+
+@tool
+def mix_audit_cancel(plan_id: str) -> dict:
+    """Cancel remaining work and return the mandatory final restore dispatch."""
+    run = AUDIT_PLANS.get(plan_id)
+    if run is None:
+        return {"error": f"unknown plan_id {plan_id!r}"}
+    run["cancelled"] = True
+    steps = run["plan"]["steps"]
+    for step in steps[run["current"] :]:
+        if not step.get("always_run"):
+            step["status"] = "skipped"
+    restore = next(
+        (step for step in reversed(steps) if step.get("always_run") and step["status"] == "pending"),
+        None,
+    )
+    if restore:
+        run["current"] = steps.index(restore)
+    return {
+        "plan_id": plan_id,
+        "cancelled": True,
+        "next_step": materialise_audit_step(run, restore) if restore else None,
+    }
+
+
+@tool
+def mix_audit_status(plan_id: str) -> dict:
+    run = AUDIT_PLANS.get(plan_id)
+    if run is None:
+        return {"error": f"unknown plan_id {plan_id!r}"}
+    counts = {}
+    for step in run["plan"]["steps"]:
+        counts[step["status"]] = counts.get(step["status"], 0) + 1
+    step = audit_next_step(run)
+    return {
+        "plan_id": plan_id,
+        "confirmed": run["confirmed"],
+        "cancelled": run["cancelled"],
+        "step_status": counts,
+        "next_step": materialise_audit_step(run, step) if step else None,
+        "complete": step is None,
+    }
+
+
+@tool
+def mix_audit_review(
+    measurements: list,
+    integrated_lufs: float = -14.0,
+    tolerance_lu: float = 1.0,
+    true_peak_max: float = -1.0,
+) -> dict:
+    """Evaluate per-target measurements and generate non-writing fix recommendations."""
+    return mix_audit.review_measurements(
+        measurements, integrated_lufs, tolerance_lu, true_peak_max
+    )
+
+
+@tool
+def mix_before_after(before: list, after: list) -> dict:
+    """Compare repeated BS.1770 measurements after a confirmed fix plan."""
+    return mix_audit.compare_before_after(before, after)
+
+
+@tool
+def mix_restore_dispatch(initial_state: dict, ax_state: list = None) -> dict:
+    """Convert captured track/transport resources into exact verified restore intents."""
+    return mix_audit.build_restore_dispatch(initial_state, ax_state)
+
+
+@tool
+def mix_isolation_dispatch(initial_state: dict, target: dict, ax_state: list = None) -> dict:
+    """Build exclusive-solo child dispatches for one audit target or the full master."""
+    return mix_audit.build_isolation_dispatch(initial_state, target, ax_state)
 
 
 @tool
@@ -1859,25 +3479,22 @@ def health() -> dict:
     """Report what this server can currently do and which capability is blocking the
     rest."""
     name = logic_process()
-    accessibility = False
-    if name:
-        try:
-            osa(f'tell application "System Events" to tell process "{name}" to return name')
-            accessibility = True
-        except ProbeError:
-            accessibility = False
+    ax = accessibility_status(name)
+    blocking = None
+    if name is None:
+        blocking = "Logic is not running"
+    elif not ax["granted"]:
+        blocking = f"Accessibility is unavailable: {ax.get('reason', 'unknown reason')}"
     return {
         "platform": sys.platform,
         "logic_process": name,
-        "accessibility": accessibility,
+        "accessibility": ax["granted"],
+        "accessibility_detail": ax,
         "auval": shutil.which("auval") or "not found",
         "settings_roots_present": [str(r) for r in SETTINGS_ROOTS if r.is_dir()],
         "tools_defined": len(TOOLS),
         "plans_held": sorted(PLANS),
-        "unvalidated": (
-            "the accessibility read and write paths have never been run against a real "
-            "Logic plugin window. Run plugins_probe then ax_dump before trusting them"
-        ),
+        "blocking": blocking,
     }
 
 
@@ -1974,6 +3591,17 @@ def selfcheck() -> int:
     rows.append(("ok" if shutil.which("auval") else "warn", "auval", shutil.which("auval") or "missing"))
     name = logic_process()
     rows.append(("ok" if name else "warn", "logic", name or "not running"))
+    if name:
+        ax = accessibility_status(name)
+        rows.append(
+            (
+                "ok" if ax["granted"] else "warn",
+                "accessibility",
+                f"{ax.get('window_count', 0)} windows"
+                if ax["granted"]
+                else ax.get("reason", "denied"),
+            )
+        )
     for root in SETTINGS_ROOTS:
         rows.append(("ok" if root.is_dir() else "warn", root.name, str(root) if root.is_dir() else "absent"))
     rows.append(("ok", "tools defined", str(len(TOOLS))))

@@ -210,6 +210,58 @@ class MixerParsingTests(unittest.TestCase):
         )
         self.assertEqual(row["order"], "signal flow, first processed first")
 
+    def test_undocumented_send_slider_value_is_not_reported_as_a_level(self):
+        kids = [
+            {"role": "AXSlider", "description": "send knob", "value": "1,50994944E+9"},
+            {"role": "AXGroup", "description": "Bus 24", "value": ""},
+            {"role": "AXGroup", "description": "insert bar", "value": ""},
+        ]
+        row = plugins.parse_strip("Lead", "1.2", kids)
+        send = row["sends"][0]
+        self.assertIsNone(send["level"])
+        self.assertEqual(send["level_raw"], "1,50994944E+9")
+        self.assertIn("not guessed", send["level_note"])
+
+    def test_survey_retries_from_first_incomplete_strip(self):
+        strips = [
+            {"index": 0, "path": "9.2.1", "name": "A"},
+            {"index": 1, "path": "9.2.2", "name": "B"},
+            {"index": 2, "path": "9.2.3", "name": "C"},
+        ]
+        readable = [
+            {"role": "AXStaticText", "description": "name", "value": "A", "name": "", "path": "9.2.1.1"},
+            {"role": "AXSlider", "description": "volume fader", "value": "173", "name": "", "path": "9.2.1.2"},
+            {"role": "AXStaticText", "description": "volume fader level", "value": "", "name": "0 dB", "path": "9.2.1.3"},
+            {"role": "AXButton", "description": "mute", "value": "off", "name": "", "path": "9.2.1.4"},
+            {"role": "AXButton", "description": "solo", "value": "off", "name": "", "path": "9.2.1.5"},
+            {"role": "AXValueIndicator", "description": "peak level meter", "value": "clipping off", "name": "", "path": "9.2.1.6"},
+        ]
+        with (
+            mock.patch.object(plugins, "require_logic", return_value="Logic Pro"),
+            mock.patch.object(
+                plugins,
+                "mixer_strips",
+                return_value={
+                    "count": 3,
+                    "strips": strips,
+                    "mixer_path": "9.2",
+                    "window_index": 1,
+                },
+            ),
+            mock.patch.object(
+                plugins,
+                "walk_window",
+                side_effect=[readable, plugins.ProbeError("timed out"), readable],
+            ) as walk,
+        ):
+            result = plugins.mixer_survey(strip_limit=3, total_seconds=60)
+
+        self.assertEqual(result["strips_parsed"], 2)
+        self.assertEqual(result["retry_offsets"], [1])
+        self.assertEqual(result["next_offset"], 1)
+        self.assertEqual([row["index"] for row in result["channels"]], [0, 2])
+        self.assertTrue(all(call.args[2] == 0 for call in walk.call_args_list))
+
 
 class PluginWriteSafetyTests(unittest.TestCase):
     def test_live_write_requires_window_identity(self):

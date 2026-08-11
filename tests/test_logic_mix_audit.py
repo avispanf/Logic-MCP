@@ -184,6 +184,125 @@ class InventoryTests(unittest.TestCase):
         self.assertFalse(kick["mute"])
         self.assertTrue(kick["selected"])
 
+    def test_visible_mixer_position_is_not_guessed_as_project_track_index(self):
+        inventory = audit.normalise_inventory(
+            {
+                "data": [
+                    {"id": 0, "name": "Cloudless #3 -", "type": "audio", "track_ref": "trk_0"},
+                    {"id": 1, "name": "LEAD VOICE", "type": "audio", "track_ref": "trk_1"},
+                ]
+            },
+            {
+                "strips": [
+                    {
+                        "trackIndex": 0,
+                        "mixer_strip_ref": "mxr_visible_0",
+                        "inserts": ["Pro-Q 3", "Compressor"],
+                    }
+                ]
+            },
+            None,
+        )
+        cloudless = next(row for row in inventory["channels"] if row["name"] == "Cloudless #3 -")
+        self.assertNotIn("mixer", cloudless["sources"])
+        self.assertEqual(cloudless["inserts"], [])
+        self.assertFalse(inventory["complete"])
+        self.assertEqual(inventory["unbound_surface_records"], 1)
+
+    def test_ax_name_corroborates_visible_mixer_position(self):
+        inventory = audit.normalise_inventory(
+            {
+                "data": [
+                    {"id": 0, "name": "Cloudless #3 -", "type": "audio", "track_ref": "trk_0"},
+                    {"id": 1, "name": "LEAD VOICE", "type": "audio", "track_ref": "trk_1"},
+                ]
+            },
+            {
+                "strips": [
+                    {
+                        "trackIndex": 0,
+                        "mixer_strip_ref": "mxr_visible_0",
+                        "inserts": ["Pro-Q 3", "Compressor"],
+                    }
+                ]
+            },
+            {
+                "channels": [
+                    {
+                        "index": 0,
+                        "name": "LEAD VOICE",
+                        "path": "9.2.1",
+                        "inserts": ["Pro-Q 3", "Compressor"],
+                        "detail": "full",
+                    }
+                ]
+            },
+        )
+        cloudless = next(row for row in inventory["channels"] if row["name"] == "Cloudless #3 -")
+        lead = next(row for row in inventory["channels"] if row["name"] == "LEAD VOICE")
+        self.assertNotIn("mixer", cloudless["sources"])
+        self.assertEqual(lead["index"], 1)
+        self.assertEqual(lead["surface_index"], 0)
+        self.assertEqual(lead["mixer_ref"], "mxr_visible_0")
+        self.assertEqual(lead["strip_path"], "9.2.1")
+        self.assertEqual(set(lead["sources"]), {"tracks", "ax", "mixer"})
+        self.assertEqual(inventory["unbound_surface_records"], 0)
+
+    def test_all_scope_plan_fails_closed_when_a_surface_row_is_unbound(self):
+        inventory = audit.normalise_inventory(
+            {
+                "data": [
+                    {"id": 0, "name": "Cloudless", "type": "audio", "track_ref": "trk_0"},
+                    {"id": 1, "name": "LEAD VOICE", "type": "audio", "track_ref": "trk_1"},
+                ]
+            },
+            {"strips": [{"trackIndex": 0, "mixer_strip_ref": "mxr_visible_0"}]},
+            None,
+        )
+        plan = audit.build_audit_plan(
+            inventory,
+            "all",
+            "",
+            "/tmp/Test.logicx",
+            "/tmp/logic-audits",
+        )
+        self.assertIn("corroborated identity", plan["error"])
+        self.assertEqual(len(plan["binding_warnings"]), 1)
+
+    def test_stereo_out_surface_alias_binds_unique_master_without_reusing_surface_index(self):
+        inventory = audit.normalise_inventory(
+            {
+                "data": [
+                    {
+                        "id": 51,
+                        "name": "Master",
+                        "type": "aux",
+                        "track_ref": "trk_master",
+                    }
+                ]
+            },
+            {"strips": [{"trackIndex": 7, "mixer_strip_ref": "mxr_master"}]},
+            {
+                "channels": [
+                    {
+                        "index": 7,
+                        "name": "Stereo Out",
+                        "path": "9.2.8",
+                        "detail": "full",
+                    }
+                ]
+            },
+        )
+        self.assertEqual(inventory["count"], 1)
+        master = inventory["channels"][0]
+        self.assertEqual(master["name"], "Master")
+        self.assertEqual(master["index"], 51)
+        self.assertEqual(master["surface_index"], 7)
+        self.assertEqual(master["strip_path"], "9.2.8")
+        self.assertEqual(master["mixer_ref"], "mxr_master")
+        self.assertEqual(master["kind"], "master")
+        self.assertTrue(inventory["complete"])
+
 
 class PlanTests(unittest.TestCase):
     def test_plan_has_isolation_bounce_analysis_and_restore(self):

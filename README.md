@@ -22,6 +22,10 @@ guessed.
 **Mixer.** `mixer_strips` indexes the channel strips; `mixer_survey` reads name, fader level
 in decibels, pan, mute, solo, clipping state, output bus, sends and insert chain for each.
 Insert and send lists are reversed from AX order into actual signal-flow order.
+The survey reads only each strip's direct grouped properties instead of recursively walking
+every insert/send subtree, and returns `retry_offsets` plus the first incomplete offset for
+bounded resumption. Undocumented non-finite or out-of-range send slider encodings are kept
+as raw evidence with `level=null`; they are never presented as guessed decibels.
 `main_window` and `mixer_locate` find the Tracks window and Mixer pane in the accessibility
 tree, because opening an editor changes every window index.
 
@@ -37,7 +41,11 @@ assignment. `ax_show_menu` exposes context-menu capabilities without clicking th
 
 **Mix audit orchestration.** `mix_inventory` merges the mature server's `logic://tracks`
 and `logic://mixer` resources with `mixer_survey`, preserving stable track references and
-AX-only Aux/Bus paths. `mix_audit_plan` accepts `track`, `group`, `aux`, `bus`, `master` or
+AX-only Aux/Bus paths. Project-track indices and visible-mixer positions are separate
+namespaces: records bind only through a unique exact name/master identity, a named AX strip,
+or demonstrably complete positional sets. Unbound rows remain explicit warnings, and an
+`all` plan fails closed until every surface identity is corroborated. `mix_audit_plan`
+accepts `track`, `group`, `aux`, `bus`, `master` or
 `all`, then emits an ordered capture → inspect every insert → isolate → bounce/meter →
 BS.1770 → restore plan. `mix_audit_start`, `mix_audit_advance`, `mix_audit_status` and
 `mix_audit_cancel` enforce ordering and keep restoration steps mandatory. They return
@@ -112,7 +120,9 @@ code update so its long-running stdio process registers the current tool set.
 
 The companion MCU server used for the verified three-server setup is the patched
 [avispanf/logic-pro-mcp](https://github.com/avispanf/logic-pro-mcp) fork at commit
-`a80ef0d`. Give each concurrently running MCP client its own stable MIDI namespace:
+`d879c6e`. It coalesces overlapping background/explicit AX refreshes and gives the measured
+full-cache operation a bounded 90-second deadline. Give each concurrently running MCP client
+its own stable MIDI namespace:
 
 ```toml
 [mcp_servers.logic-pro]

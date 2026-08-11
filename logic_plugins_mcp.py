@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ctypes
 import json
+import math
 import os
 import pathlib
 import plistlib
@@ -2525,6 +2526,20 @@ def parse_db(text: str):
     return as_number(match.group(1))
 
 
+def usable_send_level(raw):
+    """Return Logic's displayed send value only when it is numerically plausible.
+
+    Some Logic 12.3 send sliders expose an implementation value such as 535750240
+    or 1.50994944E+9 instead of the displayed level. Those numbers are neither dB
+    nor a documented normalized position, so presenting them as a measurement is
+    misleading. Preserve the raw value separately and leave the level unknown.
+    """
+    value = as_number(raw)
+    if value is None or not math.isfinite(value) or value < -200 or value > 100:
+        return None
+    return raw
+
+
 NON_SEND_DESCRIPTIONS = (
     "automation",
     "volume",
@@ -2910,14 +2925,19 @@ def parse_strip(label: str, path: str, kids: list) -> dict:
             )
         elif role == "AXButton" and what and what not in NON_SEND_DESCRIPTIONS:
             output = output or what
-    row["sends"] = list(
-        reversed(
-            [
-                {"bus": bus, "level": send_levels[i] if i < len(send_levels) else None}
-                for i, bus in enumerate(item["name"] for item in sends)
-            ]
-        )
-    )
+    parsed_sends = []
+    for i, bus in enumerate(item["name"] for item in sends):
+        raw_level = send_levels[i] if i < len(send_levels) else None
+        level = usable_send_level(raw_level)
+        send = {"bus": bus, "level": level}
+        if raw_level not in (None, "") and level is None:
+            send["level_raw"] = raw_level
+            send["level_note"] = (
+                "Logic exposed an undocumented internal slider value; the displayed "
+                "send level is unavailable and was not guessed"
+            )
+        parsed_sends.append(send)
+    row["sends"] = list(reversed(parsed_sends))
     row["send_controls"] = list(reversed(sends))
     row["insert_controls"] = list(reversed(inserts))
     row["inserts"] = [item["name"] for item in row["insert_controls"]]
@@ -2968,7 +2988,9 @@ def mixer_strips(mixer_path: str = "") -> dict:
         return located
     mixer_path = located["path"]
     main = located["window_index"]
-    elements = walk_window(process, main, 1, budget=400, seconds=25, root=mixer_path)
+    # Channel strips are direct children of the mixer area. Descending into
+    # every strip here turns the cheap index into a full insert/send survey.
+    elements = walk_window(process, main, 0, budget=400, seconds=25, root=mixer_path)
     strips = [
         {"index": i, "path": e["path"], "name": e["description"] or e["name"]}
         for i, e in enumerate(elements)
@@ -3022,7 +3044,7 @@ def mixer_reveal_strip(
             timeout=20,
         )
         time.sleep(0.45)
-        kids = walk_window(process, main, 1, budget=350, seconds=20, root=strip_path)
+        kids = walk_window(process, main, 0, budget=350, seconds=20, root=strip_path)
     except ProbeError as exc:
         return {"ok": False, **preview, "error": f"scroll/read failed: {exc}"}
     strip = parse_strip("", strip_path, kids)
@@ -3046,7 +3068,7 @@ def mixer_read_strip(strip_path: str, expected_strip: str) -> dict:
     process = require_logic()
     try:
         main = main_window_index(process)
-        kids = walk_window(process, main, 1, budget=350, seconds=20, root=strip_path)
+        kids = walk_window(process, main, 0, budget=350, seconds=20, root=strip_path)
     except ProbeError as exc:
         return {"ok": False, "error": str(exc)}
     strip = parse_strip("", strip_path, kids)
@@ -3084,7 +3106,7 @@ def plugin_open_insert(
     try:
         main = main_window_index(process)
         kids = walk_window(
-            process, main, 1, budget=350, seconds=20, root=strip_path
+            process, main, 0, budget=350, seconds=20, root=strip_path
         )
     except ProbeError as exc:
         return {"ok": False, "error": f"could not re-read the strip: {exc}"}
@@ -3206,7 +3228,7 @@ def mixer_set_toggle(
     process = require_logic()
     try:
         main = main_window_index(process)
-        kids = walk_window(process, main, 1, budget=350, seconds=20, root=strip_path)
+        kids = walk_window(process, main, 0, budget=350, seconds=20, root=strip_path)
     except ProbeError as exc:
         return {"ok": False, "error": f"could not re-read strip: {exc}"}
     strip = parse_strip("", strip_path, kids)
@@ -3302,7 +3324,7 @@ def mixer_survey(
             kids = walk_window(
                 process,
                 index["window_index"],
-                1,
+                0,
                 budget=300,
                 seconds=allowance,
                 root=strip["path"],
@@ -3313,7 +3335,12 @@ def mixer_survey(
         if len(kids) < 6:
             incomplete.append({**strip, "children_read": len(kids), "reason": "strip read was cut short"})
             continue
-        report.append(parse_strip(strip["name"], strip["path"], kids))
+        parsed = parse_strip(strip["name"], strip["path"], kids)
+        # Preserve the visible-surface namespace. `mix_inventory` uses this
+        # index only to bridge the named AX strip to the mature server's
+        # nameless mixer row; it is never treated as a project track index.
+        parsed["index"] = strip["index"]
+        report.append(parsed)
 
     clipping = [r["name"] for r in report if r.get("clipping")]
     muted = [r["name"] for r in report if r.get("mute") == "on"]
@@ -3323,6 +3350,7 @@ def mixer_survey(
     for r in report:
         if r.get("output"):
             outputs[r["output"]] = outputs.get(r["output"], 0) + 1
+    retry_offsets = sorted({int(item["index"]) for item in incomplete})
     return {
         "mixer_path": index["mixer_path"],
         "window_index": index["window_index"],
@@ -3330,7 +3358,10 @@ def mixer_survey(
         "offset": offset,
         "strips_parsed": len(report),
         "strips_incomplete": incomplete,
-        "next_offset": int(offset) + len(window),
+        # Never page past a strip that was not read. A caller can retry from
+        # this offset without silently losing an Aux/Bus/master from the audit.
+        "next_offset": retry_offsets[0] if retry_offsets else int(offset) + len(window),
+        "retry_offsets": retry_offsets,
         "strips_full_detail": len(report) - len(partial),
         "strips_partial_detail": partial,
         "clipping_strips": clipping,
@@ -3842,7 +3873,8 @@ def mix_bounce_target(
 @tool
 def mix_inventory(tracks=None, mixer=None, ax_channels=None) -> dict:
     """Merge mature-server track/mixer resources and mixer_survey output into one typed
-    inventory. Explicit server type metadata wins; name heuristics are only a fallback."""
+    inventory. Track indices and visible-surface positions are never assumed equivalent;
+    uncorroborated rows remain separate and are reported as binding warnings."""
     return mix_audit.normalise_inventory(tracks, mixer, ax_channels)
 
 

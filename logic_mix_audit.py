@@ -237,48 +237,166 @@ def _normalise_record(record: dict, source: str) -> dict:
 
 
 def normalise_inventory(tracks=None, mixer=None, ax_channels=None) -> dict:
+    source_records = {
+        "tracks": _items(tracks, "data", "tracks"),
+        "mixer": _items(mixer, "data", "strips", "channels"),
+        "ax": _items(ax_channels, "channels", "strips", "data"),
+    }
+    # Track indices belong to the project track list. Mixer/AX indices belong to
+    # the currently visible mixer surface and can point at stacks, auxes, and the
+    # master instead. Keep those namespaces separate and only bind records when
+    # another stable identity corroborates the relationship.
     sources = [
-        ("tracks", _items(tracks, "data", "tracks")),
-        ("mixer", _items(mixer, "data", "strips", "channels")),
-        ("ax", _items(ax_channels, "channels", "strips", "data")),
+        ("tracks", source_records["tracks"]),
+        ("ax", source_records["ax"]),
+        ("mixer", source_records["mixer"]),
     ]
     merged: list[dict] = []
-    by_identity: dict[tuple, int] = {}
+    binding_warnings: list[dict] = []
+
+    track_indices = {
+        item
+        for raw in source_records["tracks"]
+        if (item := _integer(_first(raw, "index", "id", "trackIndex", "track_index")))
+        is not None
+    }
+    mixer_indices = {
+        item
+        for raw in source_records["mixer"]
+        if (item := _integer(_first(raw, "index", "id", "trackIndex", "track_index")))
+        is not None
+    }
+    ax_indices = {
+        item
+        for raw in source_records["ax"]
+        if (item := _integer(_first(raw, "index", "id", "trackIndex", "track_index")))
+        is not None
+    }
+    positional_mixer_alignment = (
+        bool(source_records["tracks"])
+        and len(source_records["tracks"]) == len(source_records["mixer"])
+        and len(track_indices) == len(source_records["tracks"])
+        and track_indices == mixer_indices
+    )
+    positional_ax_alignment = (
+        bool(source_records["tracks"])
+        and len(source_records["tracks"]) == len(source_records["ax"])
+        and len(track_indices) == len(source_records["tracks"])
+        and track_indices == ax_indices
+    )
+
+    def positions_with_source(source: str) -> list[int]:
+        return [
+            position
+            for position, current in enumerate(merged)
+            if source in current.get("sources", [])
+        ]
+
+    def unique_named_position(item: dict) -> int | None:
+        name = str(item.get("name") or "").strip().casefold()
+        if name in GENERIC_NAMES:
+            return None
+        matches = [
+            position
+            for position, current in enumerate(merged)
+            if str(current.get("name") or "").strip().casefold() == name
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def unique_master_position(item: dict) -> int | None:
+        if item.get("kind") != "master":
+            return None
+        matches = [
+            position
+            for position, current in enumerate(merged)
+            if current.get("kind") == "master" and "tracks" in current.get("sources", [])
+        ]
+        return matches[0] if len(matches) == 1 else None
+
+    def merge_at(position: int, item: dict, source: str) -> None:
+        current = merged[position]
+        track_identity = "tracks" in current.get("sources", [])
+        for key, value in item.items():
+            if key == "sources":
+                if source not in current["sources"]:
+                    current["sources"].append(source)
+            elif key == "raw":
+                current["raw"].update(value)
+            elif track_identity and source != "tracks" and key in {
+                "index",
+                "name",
+                "kind",
+                "track_ref",
+                "target_ref",
+            }:
+                continue
+            elif key == "name" and str(value).casefold() in GENERIC_NAMES and current.get("name"):
+                continue
+            elif value not in (None, "", [], "unknown"):
+                current[key] = value
+
     for source, records in sources:
         for raw in records:
             item = _normalise_record(raw, source)
-            identity = _record_identity(item)
-            position = by_identity.get(identity)
-            if position is None and source in {"mixer", "ax"} and item.get("index") is not None:
-                by_index = [
-                    index
-                    for index, current in enumerate(merged)
-                    if current.get("index") == item["index"]
+            position = None
+            if source == "tracks":
+                identity = _record_identity(item)
+                matches = [
+                    candidate
+                    for candidate in positions_with_source("tracks")
+                    if _record_identity(merged[candidate]) == identity
                 ]
-                if len(by_index) == 1 and (
-                    item.get("name", "").casefold() in GENERIC_NAMES
-                    or merged[by_index[0]].get("name", "").casefold()
-                    == item.get("name", "").casefold()
-                ):
-                    position = by_index[0]
+                position = matches[0] if len(matches) == 1 else None
+            else:
+                item["surface_index"] = item.get("index")
+                position = unique_named_position(item)
+                if position is None:
+                    position = unique_master_position(item)
+
+                if position is None and source == "ax" and item.get("index") is not None:
+                    # Generic labels are useful only when AX and the track list
+                    # are demonstrably the same complete positional set.
+                    by_track_index = [
+                        candidate
+                        for candidate in positions_with_source("tracks")
+                        if merged[candidate].get("index") == item["index"]
+                    ]
+                    if positional_ax_alignment and len(by_track_index) == 1:
+                        position = by_track_index[0]
+
+                if position is None and source == "mixer" and item.get("surface_index") is not None:
+                    # A named AX strip establishes which visible surface slot
+                    # corresponds to a project track. This is the strongest
+                    # available bridge for the mature server's nameless rows.
+                    by_ax_surface_index = [
+                        candidate
+                        for candidate in positions_with_source("ax")
+                        if merged[candidate].get("surface_index") == item["surface_index"]
+                    ]
+                    if len(by_ax_surface_index) == 1:
+                        position = by_ax_surface_index[0]
+                    elif positional_mixer_alignment:
+                        by_track_index = [
+                            candidate
+                            for candidate in positions_with_source("tracks")
+                            if merged[candidate].get("index") == item["surface_index"]
+                        ]
+                        if len(by_track_index) == 1:
+                            position = by_track_index[0]
             if position is None:
                 position = len(merged)
-                by_identity[identity] = position
                 merged.append(item)
+                if source in {"ax", "mixer"} and source_records["tracks"]:
+                    binding_warnings.append(
+                        {
+                            "source": source,
+                            "surface_index": item.get("surface_index"),
+                            "name": item.get("name") or None,
+                            "reason": "no corroborated track identity; record kept unbound",
+                        }
+                    )
                 continue
-            current = merged[position]
-            for key, value in item.items():
-                if key == "sources":
-                    if source not in current["sources"]:
-                        current["sources"].append(source)
-                elif key == "raw":
-                    current["raw"].update(value)
-                elif key == "kind" and "tracks" in current["sources"] and source != "tracks":
-                    continue
-                elif key == "name" and str(value).casefold() in GENERIC_NAMES and current.get("name"):
-                    continue
-                elif value not in (None, "", [], "unknown"):
-                    current[key] = value
+            merge_at(position, item, source)
     for item in merged:
         token = item.get("target_ref") or f'{item.get("kind")}:{item.get("index")}:{item.get("name")}'
         item["audit_id"] = hashlib.sha256(str(token).encode()).hexdigest()[:12]
@@ -297,7 +415,10 @@ def normalise_inventory(tracks=None, mixer=None, ax_channels=None) -> dict:
         "count": len(merged),
         "channels": merged,
         "source_counts": {source: len(records) for source, records in sources},
+        "binding_warnings": binding_warnings,
+        "unbound_surface_records": len(binding_warnings),
         "complete": bool(merged)
+        and not binding_warnings
         and all(item.get("name") and item.get("detail") != "partial" for item in merged),
     }
 
@@ -602,6 +723,11 @@ def build_audit_plan(
         return {"error": "project_path must be absolute"}
     if not Path(output_root).is_absolute():
         return {"error": "output_root must be absolute"}
+    if scope.strip().casefold() == "all" and inventory.get("binding_warnings"):
+        return {
+            "error": "all-scope audit requires every mixer/AX row to have a corroborated identity",
+            "binding_warnings": inventory["binding_warnings"],
+        }
     selected = resolve_targets(inventory.get("channels", []), scope, selector)
     if "error" in selected:
         return selected

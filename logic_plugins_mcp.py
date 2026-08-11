@@ -730,11 +730,26 @@ def read_plugin_identity(process: str, window_index: int) -> dict:
     }
 
 
-def identity_matches(identity: dict, expected_plugin: str = "", expected_channel: str = "") -> bool:
+def identity_matches(
+    identity: dict,
+    expected_plugin: str = "",
+    expected_channel: str = "",
+    allow_truncated_plugin: bool = False,
+) -> bool:
     def same(left, right):
         return str(left or "").strip().casefold() == str(right or "").strip().casefold()
 
-    return (not expected_plugin or same(identity.get("plugin"), expected_plugin)) and (
+    actual_plugin = str(identity.get("plugin") or "").strip().casefold()
+    wanted_plugin = str(expected_plugin or "").strip().casefold()
+    plugin_matches = not expected_plugin or same(actual_plugin, wanted_plugin)
+    if (
+        not plugin_matches
+        and allow_truncated_plugin
+        and len(wanted_plugin) >= 8
+        and actual_plugin.startswith(wanted_plugin)
+    ):
+        plugin_matches = True
+    return plugin_matches and (
         not expected_channel or same(identity.get("channel"), expected_channel)
     )
 
@@ -3153,6 +3168,39 @@ def plugin_open_insert(
             "note": "nothing was opened; re-call with dry_run false",
         }
     before = ax_windows()
+    plugin_is_unique = sum(
+        1
+        for control in controls
+        if str(control.get("name") or "").strip().casefold()
+        == observed_plugin.strip().casefold()
+    ) == 1
+    if plugin_is_unique:
+        for window in before.get("windows", []):
+            if window.get("subrole") == "AXStandardWindow":
+                continue
+            try:
+                existing_identity = read_plugin_identity(process, int(window["index"]))
+            except ProbeError:
+                continue
+            if identity_matches(
+                existing_identity,
+                expected_plugin or observed_plugin,
+                expected_strip,
+                allow_truncated_plugin=True,
+            ):
+                return {
+                    "ok": True,
+                    "verified": True,
+                    **preview,
+                    "already_open": True,
+                    "open_path": None,
+                    "press_method": "existing verified editor",
+                    "window_index": int(window["index"]),
+                    "identity": existing_identity,
+                    "windows_before": before["count"],
+                    "windows_after": before["count"],
+                    "note": "",
+                }
     try:
         descendants = walk_window(
             process, main, 1, budget=20, seconds=10, root=target["path"]
@@ -3160,7 +3208,8 @@ def plugin_open_insert(
         open_buttons = [
             entry
             for entry in descendants
-            if entry["role"] == "AXButton" and entry["name"].casefold() == "open"
+            if entry["role"] == "AXButton"
+            and (entry["name"] or entry["description"]).casefold() == "open"
         ]
         if len(open_buttons) != 1:
             return {
@@ -3170,6 +3219,7 @@ def plugin_open_insert(
                 "error": f"insert exposes {len(open_buttons)} exact Open buttons; refusing to guess",
             }
         open_path = open_buttons[0]["path"]
+        press_method = "exact child Open button"
         osa(
             f'tell application "System Events" to tell process "{process}" to '
             f'perform action "AXPress" of {element_reference(open_path, main)}',
@@ -3192,12 +3242,15 @@ def plugin_open_insert(
         identity,
         expected_plugin or observed_plugin,
         expected_strip,
+        allow_truncated_plugin=True,
     )
     return {
         "ok": verified,
         "verified": verified,
         **preview,
         "open_path": open_path,
+        "press_method": press_method,
+        "already_open": False,
         "window_index": 1,
         "identity": identity,
         "windows_before": before["count"],

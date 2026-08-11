@@ -347,6 +347,50 @@ class PluginWriteSafetyTests(unittest.TestCase):
 
 
 class PluginOpenTests(unittest.TestCase):
+    def test_insert_open_reuses_unique_verified_editor_without_toggling_it_closed(self):
+        strip = {
+            "name": "Stereo Out",
+            "inserts": ["Ozone 9 El"],
+            "insert_controls": [
+                {"name": "Ozone 9 El", "path": "9.2.8.15", "role": "AXGroup"}
+            ],
+        }
+        identity = {
+            "plugin": "Ozone 9 Elements",
+            "channel": "Stereo Out",
+            "view_selector": "Controls",
+        }
+        with (
+            mock.patch.object(plugins, "require_logic", return_value="Logic Pro"),
+            mock.patch.object(plugins, "main_window_index", return_value=2),
+            mock.patch.object(plugins, "parse_strip", return_value=strip),
+            mock.patch.object(plugins, "walk_window", return_value=[]),
+            mock.patch.object(
+                plugins,
+                "ax_windows",
+                return_value={
+                    "count": 2,
+                    "windows": [
+                        {"index": 1, "subrole": "AXDialog"},
+                        {"index": 2, "subrole": "AXStandardWindow"},
+                    ],
+                },
+            ),
+            mock.patch.object(plugins, "read_plugin_identity", return_value=identity),
+            mock.patch.object(plugins, "osa") as osa,
+        ):
+            result = plugins.plugin_open_insert(
+                "9.2.8",
+                0,
+                "Stereo Out",
+                expected_plugin="Ozone 9 El",
+                dry_run=False,
+            )
+        self.assertTrue(result["verified"])
+        self.assertTrue(result["already_open"])
+        self.assertEqual(result["press_method"], "existing verified editor")
+        osa.assert_not_called()
+
     def test_insert_open_presses_exact_child_button(self):
         strip = {
             "name": "Stereo Out",
@@ -356,7 +400,7 @@ class PluginOpenTests(unittest.TestCase):
             ],
         }
         identity = {
-            "plugin": "Ozone 9 El",
+            "plugin": "Ozone 9 Elements",
             "channel": "Stereo Out",
             "view_selector": "Editor",
         }
@@ -387,6 +431,60 @@ class PluginOpenTests(unittest.TestCase):
             )
         self.assertTrue(result["verified"])
         self.assertEqual(result["open_path"], "9.2.8.15.2")
+        self.assertEqual(result["press_method"], "exact child Open button")
+        self.assertIn("UI element 2 of UI element 15", osa.call_args.args[0])
+
+    def test_insert_open_accepts_description_only_open_button(self):
+        strip = {
+            "name": "Stereo Out",
+            "inserts": ["Ozone 9 El"],
+            "insert_controls": [
+                {"name": "Ozone 9 El", "path": "9.2.8.15", "role": "AXGroup"}
+            ],
+        }
+        identity = {
+            "plugin": "Ozone 9 Elements",
+            "channel": "Stereo Out",
+            "view_selector": "Editor",
+        }
+        with (
+            mock.patch.object(plugins, "require_logic", return_value="Logic Pro"),
+            mock.patch.object(plugins, "main_window_index", return_value=1),
+            mock.patch.object(plugins, "parse_strip", return_value=strip),
+            mock.patch.object(
+                plugins,
+                "walk_window",
+                side_effect=[
+                    [],
+                    [
+                        {
+                            "path": "9.2.8.15.2",
+                            "role": "AXButton",
+                            "name": "",
+                            "description": "open",
+                        }
+                    ],
+                ],
+            ),
+            mock.patch.object(
+                plugins,
+                "ax_windows",
+                side_effect=[{"count": 1}, {"count": 2}],
+            ),
+            mock.patch.object(plugins, "read_plugin_identity", return_value=identity),
+            mock.patch.object(plugins, "osa") as osa,
+            mock.patch.object(plugins.time, "sleep"),
+        ):
+            result = plugins.plugin_open_insert(
+                "9.2.8",
+                0,
+                "Stereo Out",
+                expected_plugin="Ozone 9 El",
+                dry_run=False,
+            )
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["open_path"], "9.2.8.15.2")
+        self.assertEqual(result["press_method"], "exact child Open button")
         self.assertIn("UI element 2 of UI element 15", osa.call_args.args[0])
 
 

@@ -121,6 +121,18 @@ def classify_channel(record: dict) -> str:
             default="",
         )
     ).strip().casefold()
+    name = str(_first(record, "name", "title", "label", default="")).strip()
+    folded = name.casefold()
+
+    # LogicProMCP's live track resource currently reports Logic's special Master
+    # channel as type ``aux``.  The exact Master/output names are authoritative for
+    # that narrow ambiguity; explicit audio/instrument types must still win so a
+    # normal track merely named "Master" is not turned into the output channel.
+    if (
+        folded in MASTER_NAMES or folded.endswith(" stereo out")
+    ) and explicit in {"", "aux", "auxiliary", "output", "master", "stereo output"}:
+        return "master"
+
     aliases = {
         "audio": "track",
         "instrument": "track",
@@ -144,8 +156,6 @@ def classify_channel(record: dict) -> str:
     }
     if explicit in aliases:
         return aliases[explicit]
-    name = str(_first(record, "name", "title", "label", default="")).strip()
-    folded = name.casefold()
     if folded in MASTER_NAMES or folded.endswith(" stereo out"):
         return "master"
     if re.fullmatch(r"bus\s+\d+", folded) or folded.endswith(" bus"):

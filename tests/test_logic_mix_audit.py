@@ -15,6 +15,16 @@ class ClassificationTests(unittest.TestCase):
         self.assertEqual(audit.classify_channel({"name": "Stereo Out"}), "master")
         self.assertEqual(audit.classify_channel({"name": "Bus 12"}), "bus")
 
+    def test_logic_live_master_aux_ambiguity_uses_exact_master_name(self):
+        self.assertEqual(
+            audit.classify_channel({"name": "Master", "type": "aux"}),
+            "master",
+        )
+        self.assertEqual(
+            audit.classify_channel({"name": "Master", "type": "audio"}),
+            "track",
+        )
+
 
 class MatureDispatchContractTests(unittest.TestCase):
     def test_valid_v313_track_payload_is_accepted(self):
@@ -86,6 +96,26 @@ class InventoryTests(unittest.TestCase):
         drums = next(item for item in inventory["channels"] if item["name"] == "Drums")
         self.assertEqual(drums["kind"], "group")
         self.assertEqual(drums["target_ref"], "trk_drums")
+
+    def test_live_master_reported_as_aux_remains_a_master_after_merge(self):
+        inventory = audit.normalise_inventory(
+            {
+                "data": [
+                    {
+                        "id": 51,
+                        "name": "Master",
+                        "type": "aux",
+                        "track_ref": "trk_master",
+                    }
+                ]
+            },
+            {"strips": [{"trackIndex": 51, "mixer_strip_ref": "mix_master"}]},
+            {"strips": [{"index": 51, "name": "Master", "path": "9.2.52"}]},
+        )
+        master = inventory["channels"][0]
+        self.assertEqual(master["kind"], "master")
+        self.assertEqual(master["track_ref"], "trk_master")
+        self.assertEqual(master["strip_path"], "9.2.52")
 
     def test_group_resolution_collects_explicit_members(self):
         channels = audit.normalise_inventory(self.tracks, self.mixer, self.ax)["channels"]

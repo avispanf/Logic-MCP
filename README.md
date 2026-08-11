@@ -120,8 +120,9 @@ code update so its long-running stdio process registers the current tool set.
 
 The companion MCU server used for the verified three-server setup is the patched
 [avispanf/logic-pro-mcp](https://github.com/avispanf/logic-pro-mcp) fork at commit
-`d879c6e`. It coalesces overlapping background/explicit AX refreshes and gives the measured
-full-cache operation a bounded 90-second deadline. Give each concurrently running MCP client
+`c6f7e7e`. It coalesces overlapping background/explicit AX refreshes, gives the measured
+full-cache operation a bounded 90-second deadline, and returns schema-valid structured
+content even for legacy prose responses. Give each concurrently running MCP client
 its own stable MIDI namespace:
 
 ```toml

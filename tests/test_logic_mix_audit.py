@@ -442,6 +442,44 @@ class RestoreTests(unittest.TestCase):
             2,
         )
 
+    def test_real_transport_resource_wrapper_is_restored(self):
+        restore = audit.build_restore_dispatch(
+            {
+                "logic://tracks": {
+                    "data": [
+                        {
+                            "id": 0,
+                            "track_ref": "trk_kick",
+                            "isSoloed": False,
+                            "isMuted": False,
+                        }
+                    ]
+                },
+                "logic://transport/state": {
+                    "cache_age_sec": 0.2,
+                    "data": {
+                        "state": {
+                            "isPlaying": False,
+                            "isCycleEnabled": True,
+                            "position": "101.3.1.1",
+                        },
+                        "has_document": True,
+                    },
+                },
+            }
+        )
+        transport_dispatches = [
+            item
+            for item in restore["dispatches"]
+            if item["operation"] in {"logic_transport", "ensure_resource_state"}
+        ]
+        self.assertEqual(
+            transport_dispatches[0]["arguments"],
+            {"command": "goto_position", "params": {"position": "101.3.1.1"}},
+        )
+        self.assertEqual(len(transport_dispatches), 3)
+        self.assertTrue(restore["complete"])
+
     def test_master_isolation_clears_all_preexisting_solos(self):
         result = audit.build_isolation_dispatch(
             {

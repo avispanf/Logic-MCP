@@ -1287,11 +1287,18 @@ def build_isolation_dispatch(
 def build_restore_dispatch(initial_state: dict, ax_state: list[dict] | None = None) -> dict:
     """Turn captured mature-server resources into explicit idempotent restore intents."""
     tracks_payload = initial_state.get("logic://tracks") or initial_state.get("tracks") or {}
-    transport = (
+    transport_payload = (
         initial_state.get("logic://transport/state")
         or initial_state.get("transport")
         or {}
     )
+    transport = transport_payload
+    if isinstance(transport_payload, dict):
+        data = transport_payload.get("data")
+        if isinstance(data, dict) and isinstance(data.get("state"), dict):
+            transport = data["state"]
+        elif isinstance(transport_payload.get("state"), dict):
+            transport = transport_payload["state"]
     track_rows = _items(tracks_payload, "data", "tracks")
     dispatches = []
     selected = None

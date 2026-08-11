@@ -1391,22 +1391,16 @@ def build_isolation_dispatch(
     target_is_master = target.get("kind") == "master"
     dispatches = []
     target_addressed = target_is_master
-    ax_target_available = any(
-        not row.get("track_ref")
-        and row.get("strip_path") == target.get("strip_path")
-        and str(row.get("name") or "").casefold()
-        == str(target.get("name") or "").casefold()
-        for row in ax_state or []
-    )
+    project_names = {
+        str(_first(row, "name", "title", "label", default="")).strip().casefold()
+        for row in track_rows
+        if str(_first(row, "name", "title", "label", default="")).strip()
+    }
     for row in track_rows:
         ref = str(_first(row, "target_ref", "track_ref", default=""))
         index = _integer(_first(row, "index", "id", "trackIndex", "track_index"))
-        # Audit plans may be assembled from a resource snapshot obtained through a
-        # different MCP client connection.  target_ref is deliberately session-scoped,
-        # while the explicit project index is accepted and independently read back by
-        # logic_tracks.  Never leak a captured ref into an executable audit dispatch.
-        selector = {"index": index} if index is not None else {}
-        if not selector:
+        row_name = str(_first(row, "name", "title", "label", default="")).strip()
+        if index is None or not row_name:
             continue
         enabled = False
         if not target_is_master:
@@ -1416,24 +1410,24 @@ def build_isolation_dispatch(
         if enabled:
             target_addressed = True
         current = _boolean(_first(row, "solo", "soloed", "isSoloed"))
-        # A corroborated mixer strip is much cheaper and more reliable than scanning
-        # every Arrange track header in a large project.  The AX dispatch below owns
-        # the target toggle in that case; do not issue a duplicate mature-server write.
-        ax_owns_target = enabled and ax_target_available
-        if (current is None or current != enabled) and not ax_owns_target:
+        if current is None or current != enabled:
             dispatches.append(
                 {
-                    "server": "logic-pro",
-                    "operation": "logic_tracks",
+                    "server": "logic-plugins",
+                    "operation": "arrange_track_set_toggle",
                     "arguments": {
-                        "command": "solo",
-                        "params": {**selector, "enabled": enabled},
+                        "index": index,
+                        "expected_track": row_name,
+                        "control": "solo",
+                        "enabled": enabled,
+                        "dry_run": False,
                     },
-                    "verify": {"resource": "logic://tracks", "field": "isSoloed", "equals": enabled},
                 }
             )
     for row in ax_state or []:
         if row.get("track_ref") or not row.get("strip_path"):
+            continue
+        if str(row.get("name") or "").strip().casefold() in project_names:
             continue
         enabled = False
         if not target_is_master:
@@ -1504,18 +1498,11 @@ def build_restore_dispatch(initial_state: dict, ax_state: list[dict] | None = No
     track_rows = _items(tracks_payload, "data", "tracks")
     dispatches = []
     selected = None
-    track_name_counts = {}
-    ax_name_counts = {}
+    project_names = set()
     for row in track_rows:
         name = str(_first(row, "name", "title", "label", default="")).strip().casefold()
         if name:
-            track_name_counts[name] = track_name_counts.get(name, 0) + 1
-    for row in ax_state or []:
-        if row.get("track_ref") or not row.get("strip_path"):
-            continue
-        name = str(row.get("name") or "").strip().casefold()
-        if name:
-            ax_name_counts[name] = ax_name_counts.get(name, 0) + 1
+            project_names.add(name)
     for row in track_rows:
         index = _integer(_first(row, "index", "id", "trackIndex", "track_index"))
         # See build_isolation_dispatch: restore steps must remain executable even when
@@ -1523,12 +1510,9 @@ def build_restore_dispatch(initial_state: dict, ax_state: list[dict] | None = No
         selector = {"index": index} if index is not None else {}
         if not selector:
             continue
-        row_name = str(_first(row, "name", "title", "label", default="")).strip().casefold()
-        ax_owns_toggles = (
-            bool(row_name)
-            and track_name_counts.get(row_name) == 1
-            and ax_name_counts.get(row_name) == 1
-        )
+        row_name = str(_first(row, "name", "title", "label", default="")).strip()
+        if not row_name:
+            continue
         for command, keys in (
             ("solo", ("solo", "soloed", "isSoloed")),
             ("mute", ("mute", "muted", "isMuted")),
@@ -1537,20 +1521,16 @@ def build_restore_dispatch(initial_state: dict, ax_state: list[dict] | None = No
             enabled = _boolean(raw)
             if enabled is None:
                 continue
-            if ax_owns_toggles:
-                continue
             dispatches.append(
                 {
-                    "server": "logic-pro",
-                    "operation": "logic_tracks",
+                    "server": "logic-plugins",
+                    "operation": "arrange_track_set_toggle",
                     "arguments": {
-                        "command": command,
-                        "params": {**selector, "enabled": enabled},
-                    },
-                    "verify": {
-                        "resource": "logic://tracks",
-                        "field": "isSoloed" if command == "solo" else "isMuted",
-                        "equals": enabled,
+                        "index": index,
+                        "expected_track": row_name,
+                        "control": command,
+                        "enabled": enabled,
+                        "dry_run": False,
                     },
                 }
             )
@@ -1609,6 +1589,8 @@ def build_restore_dispatch(initial_state: dict, ax_state: list[dict] | None = No
         )
     for row in ax_state or []:
         if row.get("track_ref") or not row.get("strip_path"):
+            continue
+        if str(row.get("name") or "").strip().casefold() in project_names:
             continue
         for control in ("solo", "mute"):
             enabled = _boolean(row.get(control))

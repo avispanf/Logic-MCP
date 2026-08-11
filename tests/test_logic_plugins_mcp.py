@@ -80,6 +80,97 @@ class TransportPositionTests(unittest.TestCase):
         self.assertFalse(result["write_attempted"])
 
 
+class ArrangeTrackToggleTests(unittest.TestCase):
+    def test_toggle_is_bound_to_exact_index_name_and_checkbox_readback(self):
+        children = [
+            {
+                "path": "8.2.1.2.1.1.1.4",
+                "role": "AXCheckBox",
+                "name": "",
+                "description": "Solo",
+                "value": "0",
+            },
+            {
+                "path": "8.2.1.2.1.1.1.9",
+                "role": "AXTextField",
+                "name": "",
+                "description": "Cloudless #3 -",
+                "value": "",
+            },
+        ]
+        inspector = [
+            {
+                "path": "7.1.4.1.1.1",
+                "role": "AXTextField",
+                "name": "",
+                "description": "name",
+                "value": "Cloudless #3 -",
+            },
+            {
+                "path": "7.1.4.1.1.3",
+                "role": "AXButton",
+                "name": "",
+                "description": "solo",
+                "value": "off",
+            },
+        ]
+        with (
+            mock.patch.object(plugins, "require_logic", return_value="Logic Pro"),
+            mock.patch.object(plugins, "main_window_index", return_value=1),
+            mock.patch.object(
+                plugins, "find_tracks_header_path", return_value="8.2.1.2.1.1"
+            ),
+            mock.patch.object(
+                plugins, "find_selected_track_strip_path", return_value="7.1.4.1.1"
+            ),
+            mock.patch.object(plugins, "walk_window", side_effect=[children, inspector]),
+            mock.patch.object(plugins, "read_value", return_value="on"),
+            mock.patch.object(plugins, "osa") as osa,
+            mock.patch.object(plugins.time, "sleep"),
+        ):
+            result = plugins.arrange_track_set_toggle(
+                0, "Cloudless #3 -", "solo", True, dry_run=False
+            )
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["after"], True)
+        self.assertEqual(result["control_path"], "7.1.4.1.1.3")
+        self.assertEqual(result["row_path"], "8.2.1.2.1.1.1")
+        self.assertIn("AXPress", osa.call_args.args[0])
+
+    def test_toggle_refuses_stale_track_identity_before_press(self):
+        children = [
+            {
+                "path": "8.2.1.2.1.1.1.4",
+                "role": "AXCheckBox",
+                "name": "",
+                "description": "Solo",
+                "value": "0",
+            },
+            {
+                "path": "8.2.1.2.1.1.1.9",
+                "role": "AXTextField",
+                "name": "",
+                "description": "Another Track",
+                "value": "",
+            },
+        ]
+        with (
+            mock.patch.object(plugins, "require_logic", return_value="Logic Pro"),
+            mock.patch.object(plugins, "main_window_index", return_value=1),
+            mock.patch.object(
+                plugins, "find_tracks_header_path", return_value="8.2.1.2.1.1"
+            ),
+            mock.patch.object(plugins, "walk_window", return_value=children),
+            mock.patch.object(plugins, "osa") as osa,
+        ):
+            result = plugins.arrange_track_set_toggle(
+                0, "Cloudless #3 -", "solo", True, dry_run=False
+            )
+        self.assertFalse(result["verified"])
+        self.assertFalse(result["write_attempted"])
+        osa.assert_not_called()
+
+
 class BounceSafetyTests(unittest.TestCase):
     def test_accessible_bounce_opens_directly_with_command_b(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -2878,6 +2878,344 @@ def main_window_index(process: str) -> int:
     return standard[0][0]
 
 
+_TRACKS_HEADER_CACHE: dict[tuple[str, int], str] = {}
+_SELECTED_TRACK_STRIP_CACHE: dict[tuple[str, int], str] = {}
+
+
+def find_tracks_header_path(process: str, window_index: int) -> str:
+    """Find Logic's Arrange track-header group without walking every track child."""
+    key = (process, int(window_index))
+    cached = _TRACKS_HEADER_CACHE.get(key, "")
+    if cached:
+        try:
+            observed = osa(
+                f'tell application "System Events" to tell process "{process}" to '
+                f'return description of {element_reference(cached, window_index)} as string',
+                timeout=10,
+            )
+            if observed == "Tracks header":
+                return cached
+        except ProbeError:
+            pass
+        _TRACKS_HEADER_CACHE.pop(key, None)
+
+    # Descend through containers only. AXLayoutItem rows and controls are leaves for
+    # this search, which avoids the thousands of elements inside a large Arrange area.
+    script = (
+        "global foundPath\n"
+        "global deadline\n"
+        "global seen\n"
+        "on seek(parent, prefix, depth, maxDepth)\n"
+        'if foundPath is not "" then return\n'
+        "if depth > maxDepth then return\n"
+        "if seen > 500 then return\n"
+        "if (current date) > deadline then return\n"
+        'tell application "System Events"\n'
+        "set rs to {}\n"
+        "set ds to {}\n"
+        "try\nset rs to role of every UI element of parent\nend try\n"
+        "try\nset ds to description of every UI element of parent\nend try\n"
+        "set n to count of rs\n"
+        "repeat with i from 1 to n\n"
+        "set seen to seen + 1\n"
+        'set dd to ""\n'
+        "try\nset dd to (item i of ds) as string\nend try\n"
+        'if dd is "Tracks header" then\n'
+        "set foundPath to prefix & i\nreturn\nend if\n"
+        "end repeat\n"
+        "repeat with i from 1 to n\n"
+        'if foundPath is not "" then return\n'
+        'set rr to ""\n'
+        "try\nset rr to (item i of rs) as string\nend try\n"
+        'if rr is in {"AXGroup", "AXScrollArea", "AXLayoutArea", "AXSplitGroup", "AXList", "AXOutline"} then\n'
+        "try\nmy seek(UI element i of parent, prefix & i & \".\", depth + 1, maxDepth)\nend try\n"
+        "end if\nend repeat\nend tell\nend seek\n"
+        'set foundPath to ""\nset seen to 0\nset deadline to (current date) + 35\n'
+        'tell application "System Events"\n'
+        f'tell process "{process}"\n'
+        f'my seek(window {int(window_index)}, "", 0, 8)\n'
+        "end tell\nend tell\nreturn foundPath"
+    )
+    path = osa(script, timeout=50).strip()
+    if not path:
+        raise ProbeError("Tracks header was not found in the main window")
+    _TRACKS_HEADER_CACHE[key] = path
+    return path
+
+
+def find_selected_track_strip_path(process: str, window_index: int) -> str:
+    """Find the Inspector strip whose direct children expose name, mute and solo.
+
+    Logic's Arrange-header Solo/Mute checkboxes advertise AXPress but ignore it on
+    12.3.  The corresponding Inspector buttons do actuate and read back reliably.
+    This finder binds that surface by structure instead of a version-specific path.
+    """
+    key = (process, int(window_index))
+    cached = _SELECTED_TRACK_STRIP_CACHE.get(key, "")
+    if cached:
+        try:
+            observed_role = osa(
+                f'tell application "System Events" to tell process "{process}" to '
+                f'return role of {element_reference(cached, window_index)} as string',
+                timeout=10,
+            )
+            if observed_role == "AXLayoutItem":
+                return cached
+        except ProbeError:
+            pass
+        _SELECTED_TRACK_STRIP_CACHE.pop(key, None)
+
+    script = (
+        "global foundPath\n"
+        "global deadline\n"
+        "global seen\n"
+        "on seek(parent, prefix, depth, maxDepth)\n"
+        'if foundPath is not "" then return\n'
+        "if depth > maxDepth then return\n"
+        "if seen > 650 then return\n"
+        "if (current date) > deadline then return\n"
+        'tell application "System Events"\n'
+        "set rs to {}\nset ds to {}\n"
+        "try\nset rs to role of every UI element of parent\nend try\n"
+        "try\nset ds to description of every UI element of parent\nend try\n"
+        "set n to count of rs\n"
+        "set hasName to false\nset hasMute to false\nset hasSolo to false\n"
+        "repeat with i from 1 to n\n"
+        "set seen to seen + 1\n"
+        'set rr to ""\nset dd to ""\n'
+        "try\nset rr to (item i of rs) as string\nend try\n"
+        "try\nset dd to (item i of ds) as string\nend try\n"
+        'if rr is "AXTextField" and dd is "name" then set hasName to true\n'
+        'if rr is "AXButton" and dd is "mute" then set hasMute to true\n'
+        'if rr is "AXButton" and dd is "solo" then set hasSolo to true\n'
+        "end repeat\n"
+        'if hasName and hasMute and hasSolo then\nset foundPath to prefix\nreturn\nend if\n'
+        "repeat with i from 1 to n\n"
+        'if foundPath is not "" then return\n'
+        'set rr to ""\n'
+        "try\nset rr to (item i of rs) as string\nend try\n"
+        'if rr is in {"AXGroup", "AXScrollArea", "AXLayoutArea", "AXLayoutItem", "AXSplitGroup", "AXList", "AXOutline"} then\n'
+        "try\nmy seek(UI element i of parent, prefix & i & \".\", depth + 1, maxDepth)\nend try\n"
+        "end if\nend repeat\nend tell\nend seek\n"
+        'set foundPath to ""\nset seen to 0\nset deadline to (current date) + 25\n'
+        'tell application "System Events"\n'
+        f'tell process "{process}"\n'
+        f'my seek(window {int(window_index)}, "", 0, 9)\n'
+        "end tell\nend tell\nreturn foundPath"
+    )
+    path = osa(script, timeout=40).strip().rstrip(".")
+    if not path:
+        raise ProbeError("selected-track Inspector strip was not found")
+    _SELECTED_TRACK_STRIP_CACHE[key] = path
+    return path
+
+
+@tool
+def selected_track_identity(expected_track: str = "") -> dict:
+    """Read the track currently selected in Logic from the Inspector name field."""
+    process = require_logic()
+    try:
+        window = main_window_index(process)
+        strip = find_selected_track_strip_path(process, window)
+        entries = walk_window(process, window, 1, budget=80, seconds=10, root=strip)
+    except ProbeError as exc:
+        return {"ok": False, "verified": False, "error": str(exc)}
+    observed = next(
+        (
+            entry["value"] or entry["name"]
+            for entry in entries
+            if entry["role"] == "AXTextField"
+            and entry["description"].casefold() == "name"
+        ),
+        "",
+    ).strip()
+    expected = str(expected_track).strip()
+    matches = bool(observed) and (
+        not expected or observed.casefold() == expected.casefold()
+    )
+    return {
+        "ok": matches,
+        "verified": matches,
+        "observed_track": observed,
+        "expected_track": expected,
+        "strip_path": strip,
+        **({} if matches else {"error": "selected track identity mismatch"}),
+    }
+
+
+@tool
+def arrange_track_set_toggle(
+    index: int,
+    expected_track: str,
+    control: str,
+    enabled: bool,
+    dry_run: bool = True,
+) -> dict:
+    """Set one project's Solo or Mute after exact Arrange-row and Inspector identity
+    checks. The caller must first select ``index``. Actuation/read-back both use the
+    selected-track Inspector button because Logic 12.3 ignores AXPress on the
+    corresponding Arrange checkbox. MCU feedback is never accepted as verification."""
+    if int(index) < 0:
+        return {"ok": False, "verified": False, "error": "index must be non-negative"}
+    control_name = str(control).strip().casefold()
+    if control_name not in {"solo", "mute"}:
+        return {"ok": False, "verified": False, "error": "control must be solo or mute"}
+    expected = str(expected_track).strip()
+    if not expected:
+        return {"ok": False, "verified": False, "error": "expected_track is required"}
+    process = require_logic()
+    try:
+        window = main_window_index(process)
+        header = find_tracks_header_path(process, window)
+        row_path = f"{header}.{int(index) + 1}"
+        children = walk_window(
+            process,
+            window,
+            1,
+            budget=60,
+            seconds=15,
+            root=row_path,
+        )
+    except ProbeError as exc:
+        return {"ok": False, "verified": False, "error": str(exc)}
+    observed_name = next(
+        (
+            entry["description"] or entry["value"] or entry["name"]
+            for entry in children
+            if entry["role"] == "AXTextField"
+            and (entry["description"] or entry["value"] or entry["name"])
+        ),
+        "",
+    )
+    if observed_name.casefold() != expected.casefold():
+        return {
+            "ok": False,
+            "verified": False,
+            "write_attempted": False,
+            "error": "track identity mismatch",
+            "index": int(index),
+            "expected_track": expected,
+            "observed_track": observed_name,
+            "row_path": row_path,
+        }
+    arrange_target = next(
+        (
+            entry
+            for entry in children
+            if entry["role"] == "AXCheckBox"
+            and entry["description"].casefold() == control_name
+        ),
+        None,
+    )
+    if arrange_target is None:
+        return {
+            "ok": False,
+            "verified": False,
+            "write_attempted": False,
+            "error": f"{control_name} checkbox is unavailable",
+            "index": int(index),
+            "expected_track": expected,
+            "row_path": row_path,
+        }
+    try:
+        inspector_path = find_selected_track_strip_path(process, window)
+        inspector = walk_window(
+            process, window, 1, budget=80, seconds=10, root=inspector_path
+        )
+    except ProbeError as exc:
+        return {"ok": False, "verified": False, "error": str(exc), "index": int(index)}
+    selected_name = next(
+        (
+            entry["value"] or entry["name"]
+            for entry in inspector
+            if entry["role"] == "AXTextField"
+            and entry["description"].casefold() == "name"
+        ),
+        "",
+    ).strip()
+    if selected_name.casefold() != expected.casefold():
+        return {
+            "ok": False,
+            "verified": False,
+            "write_attempted": False,
+            "error": "selected track identity mismatch",
+            "index": int(index),
+            "expected_track": expected,
+            "observed_track": selected_name,
+            "row_path": row_path,
+            "inspector_path": inspector_path,
+        }
+    target = next(
+        (
+            entry
+            for entry in inspector
+            if entry["role"] == "AXButton"
+            and entry["description"].casefold() == control_name
+        ),
+        None,
+    )
+    if target is None:
+        return {
+            "ok": False,
+            "verified": False,
+            "write_attempted": False,
+            "error": f"{control_name} Inspector button is unavailable",
+            "index": int(index),
+            "expected_track": expected,
+            "inspector_path": inspector_path,
+        }
+    before = str(target["value"]).strip().casefold() in {"1", "true", "on"}
+    preview = {
+        "index": int(index),
+        "track": observed_name,
+        "control": control_name,
+        "enabled": bool(enabled),
+        "row_path": row_path,
+        "control_path": target["path"],
+        "inspector_path": inspector_path,
+        "before": before,
+    }
+    if dry_run:
+        return {"ok": True, "verified": False, "dry_run": True, **preview}
+    if before == bool(enabled):
+        return {
+            "ok": True,
+            "verified": True,
+            "write_attempted": False,
+            "changed": False,
+            "after": before,
+            **preview,
+        }
+    reference = element_reference(target["path"], window)
+    try:
+        osa(
+            f'tell application "System Events" to tell process "{process}" to '
+            f'perform action "AXPress" of {reference}',
+            timeout=20,
+        )
+        time.sleep(0.4)
+        after_raw = read_value(process, reference)
+    except ProbeError as exc:
+        return {
+            "ok": False,
+            "verified": False,
+            "write_attempted": True,
+            "error": str(exc),
+            **preview,
+        }
+    after = str(after_raw).strip().casefold() in {"1", "true", "on"}
+    matches = after == bool(enabled)
+    return {
+        "ok": matches,
+        "verified": matches,
+        "write_attempted": True,
+        "changed": after != before,
+        "after": after,
+        **preview,
+        **({} if matches else {"error": "AX checkbox readback did not match"}),
+    }
+
+
 @tool
 def main_window() -> dict:
     """Report which window index currently holds Logic's main Tracks window. Window indices

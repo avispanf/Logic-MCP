@@ -158,7 +158,11 @@ the explicit `--confirmed` flag:
 Give the runner its own persistent Logic Control surface by assigning both ports to
 `LogicProMCP-MCU-Internal [standalone-audit]`. The runner rejects the generic `Track 1…8`
 bank that appears during MCU startup and asks the patched core for a full AX refresh
-before planning. Each target is isolated and independently read back, bounced to a new
+before planning. The runner uses MCU only to select an indexed track, then requires the
+Inspector name to match the exact Arrange-row name before it presses anything. Solo/Mute
+are actuated and read back on the selected-track Inspector buttons because Logic 12.3
+advertises AXPress on the Arrange-header checkboxes but silently ignores it. MCU LED
+feedback is never accepted as verification. Each target is isolated, bounced to a new
 non-overwriting WAV, measured with BS.1770, and restored before the next target. Full
 evidence is stored in `runner.jsonl`; `summary.json` and bounded stdout contain compact
 progress and results. Off-screen tracks whose insert names Logic does not expose are

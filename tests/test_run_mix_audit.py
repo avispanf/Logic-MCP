@@ -85,6 +85,45 @@ class AuditRunnerTests(unittest.IsolatedAsyncioTestCase):
             {"command": "toggle_cycle", "params": {}},
         )
 
+    async def test_arrange_toggle_updates_known_state_only_after_verified_readback(self):
+        runner = runner_module.AuditRunner(arguments())
+        runner.track_state = {
+            0: {
+                "name": "Cloudless #3 -",
+                "solo": False,
+                "mute": True,
+                "selected": False,
+            }
+        }
+        runner.tool = mock.AsyncMock(
+            return_value={"ok": True, "verified": True, "after": True}
+        )
+        dispatch = {
+            "server": "logic-plugins",
+            "operation": "arrange_track_set_toggle",
+            "arguments": {
+                "index": 0,
+                "expected_track": "Cloudless #3 -",
+                "control": "solo",
+                "enabled": True,
+                "dry_run": False,
+            },
+        }
+
+        result = await runner.execute_child(dispatch)
+
+        self.assertTrue(result["verified"])
+        self.assertTrue(runner.track_state[0]["solo"])
+        self.assertEqual(
+            runner.tool.await_args_list,
+            [
+                mock.call(
+                    "core", "logic_tracks", {"command": "select", "params": {"index": 0}}
+                ),
+                mock.call("plugins", "arrange_track_set_toggle", dispatch["arguments"]),
+            ],
+        )
+
     async def test_known_playback_state_is_no_op(self):
         runner = runner_module.AuditRunner(arguments())
         runner.transport_playing = False

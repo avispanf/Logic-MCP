@@ -104,7 +104,7 @@ class AuditRunner:
             return {"error": f"empty resource {uri}"}
         return json.loads(result.contents[0].text)
 
-    async def wait_for_tracks(self, timeout: int = 75) -> dict:
+    async def wait_for_tracks(self, timeout: int = 150) -> dict:
         deadline = asyncio.get_running_loop().time() + timeout
         last = {}
         refresh_requested = False
@@ -257,22 +257,35 @@ class AuditRunner:
                     "command": command,
                     "observed": wanted,
                 }
+            return {
+                "ok": False,
+                "verified": False,
+                "error": "direct core solo/mute is disabled; use verified Inspector toggle",
+            }
         elif command == "select":
             if current.get("selected"):
                 return {"ok": True, "verified": True, "state": "A", "action": "known-state no-op"}
-        result = await self.tool("core", "logic_tracks", arguments)
-        if not verified(result) and result.get("error") == "operation_timeout" and command in {"solo", "mute"}:
-            observed = await self.refresh_track_observation(index, command)
-            if observed == bool(params.get("enabled")):
+            result = await self.tool("core", "logic_tracks", arguments)
+            identity = await self.tool(
+                "plugins",
+                "selected_track_identity",
+                {"expected_track": str(current.get("name") or "")},
+            )
+            if verified(identity):
                 result = {
                     **result,
                     "ok": True,
+                    "success": True,
                     "verified": True,
                     "state": "A",
-                    "observed": observed,
-                    "reconciled_after_timeout": True,
+                    "observed": index,
+                    "verification_source": "inspector_name",
+                    "mcu_feedback_accepted": False,
+                    "core_result": result,
                     "error": None,
                 }
+        else:
+            result = await self.tool("core", "logic_tracks", arguments)
         if verified(result):
             if command in {"solo", "mute"}:
                 current[command] = bool(params.get("enabled"))
@@ -288,6 +301,42 @@ class AuditRunner:
         arguments = dispatch.get("arguments", {})
         if server == "logic-pro" and operation == "logic_tracks":
             return await self.execute_track_child(arguments)
+        if server == "logic-plugins" and operation == "arrange_track_set_toggle":
+            index = int(arguments.get("index", -1))
+            control = str(arguments.get("control") or "")
+            wanted = bool(arguments.get("enabled"))
+            current = self.track_state.get(index)
+            if current is None or control not in {"solo", "mute"}:
+                return {
+                    "ok": False,
+                    "verified": False,
+                    "error": f"unknown Arrange track/control {index}/{control}",
+                }
+            if current[control] == wanted:
+                return {
+                    "ok": True,
+                    "verified": True,
+                    "action": "known-state no-op",
+                    "index": index,
+                    "control": control,
+                    "observed": wanted,
+                }
+            # The core MCU route intentionally returns honest State B. The
+            # following Inspector toggle independently verifies both the exact
+            # selected-track name and the control read-back, so a separate
+            # Inspector identity round-trip would be redundant here.
+            select_result = await self.tool(
+                "core", "logic_tracks", {"command": "select", "params": {"index": index}}
+            )
+            result = await self.tool("plugins", operation, arguments)
+            if verified(result):
+                for row in self.track_state.values():
+                    row["selected"] = False
+                current["selected"] = True
+                current[control] = wanted
+            elif not result.get("selection"):
+                result = {**result, "selection": select_result}
+            return result
         if server == "logic-plugins" and operation == "mixer_set_toggle":
             key = f"{arguments.get('strip_path')}:{arguments.get('control')}"
             wanted = bool(arguments.get("enabled"))
@@ -487,8 +536,18 @@ class AuditRunner:
             for field in ("solo", "mute"):
                 if current.get(field) == initial.get(field):
                     continue
-                result = await self.execute_track_child(
-                    {"command": field, "params": {"index": index, "enabled": initial[field]}}
+                result = await self.execute_child(
+                    {
+                        "server": "logic-plugins",
+                        "operation": "arrange_track_set_toggle",
+                        "arguments": {
+                            "index": index,
+                            "expected_track": str(initial.get("name") or ""),
+                            "control": field,
+                            "enabled": initial[field],
+                            "dry_run": False,
+                        },
+                    }
                 )
                 self.emit("emergency_track_restore", index=index, field=field, result=result)
         for key, initial in self.initial_surface_state.items():
@@ -612,6 +671,7 @@ class AuditRunner:
     async def run(self) -> dict:
         env = dict(os.environ)
         env["LOGIC_PRO_MCP_MIDI_INSTANCE_ID"] = self.args.midi_instance
+        env["LOGIC_PRO_MCP_TRACK_SELECT_MCU_FIRST"] = "1"
         async with AsyncExitStack() as stack:
             await self.connect(stack, "plugins", self.args.python, ROOT / "logic_plugins_mcp.py")
             await self.connect(stack, "audio", self.args.python, ROOT / "logic_audio_mcp.py")

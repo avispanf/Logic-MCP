@@ -365,9 +365,16 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(
             isolation["dispatches"][0]["arguments"],
             {
-                "command": "solo",
-                "params": {"index": 4, "enabled": True},
+                "index": 4,
+                "expected_track": "Bass",
+                "control": "solo",
+                "enabled": True,
+                "dry_run": False,
             },
+        )
+        self.assertEqual(isolation["dispatches"][0]["server"], "logic-plugins")
+        self.assertEqual(
+            isolation["dispatches"][0]["operation"], "arrange_track_set_toggle"
         )
 
     def test_mature_server_steps_use_real_command_params_wire_shape(self):
@@ -610,14 +617,25 @@ class RestoreTests(unittest.TestCase):
             },
         )
         self.assertTrue(isolation["complete"])
-        self.assertEqual(isolation["dispatches"][0]["arguments"]["command"], "solo")
+        self.assertEqual(
+            isolation["dispatches"][0]["operation"], "arrange_track_set_toggle"
+        )
+        self.assertEqual(isolation["dispatches"][0]["arguments"]["control"], "solo")
         restore = audit.build_restore_dispatch(initial)
-        commands = [
-            item["arguments"].get("command")
+        controls = [
+            item["arguments"].get("control")
             for item in restore["dispatches"]
-            if item["operation"] == "logic_tracks"
+            if item["operation"] == "arrange_track_set_toggle"
         ]
-        self.assertEqual(commands, ["solo", "mute", "select"])
+        self.assertEqual(controls, ["solo", "mute"])
+        self.assertEqual(
+            [
+                item["arguments"].get("command")
+                for item in restore["dispatches"]
+                if item["operation"] == "logic_tracks"
+            ],
+            ["select"],
+        )
         self.assertEqual(
             sum(item["operation"] == "ensure_resource_state" for item in restore["dispatches"]),
             2,
@@ -667,8 +685,8 @@ class RestoreTests(unittest.TestCase):
             {
                 "logic://tracks": {
                     "data": [
-                        {"index": 0, "target_ref": "trk_a", "solo": True},
-                        {"index": 1, "target_ref": "trk_b", "solo": False},
+                        {"index": 0, "name": "A", "target_ref": "trk_a", "solo": True},
+                        {"index": 1, "name": "B", "target_ref": "trk_b", "solo": False},
                     ]
                 }
             },
@@ -679,8 +697,11 @@ class RestoreTests(unittest.TestCase):
         self.assertEqual(
             result["dispatches"][0]["arguments"],
             {
-                "command": "solo",
-                "params": {"index": 0, "enabled": False},
+                "index": 0,
+                "expected_track": "A",
+                "control": "solo",
+                "enabled": False,
+                "dry_run": False,
             },
         )
 
@@ -690,6 +711,7 @@ class RestoreTests(unittest.TestCase):
                 "data": [
                     {
                         "index": 2,
+                        "name": "Vox",
                         "target_ref": "trk_from_another_session",
                         "solo": False,
                         "mute": False,
@@ -712,18 +734,21 @@ class RestoreTests(unittest.TestCase):
             + audit.build_restore_dispatch(captured)["dispatches"]
         )
         track_dispatches = [
-            item for item in dispatches if item["operation"] == "logic_tracks"
+            item
+            for item in dispatches
+            if item["operation"] == "arrange_track_set_toggle"
         ]
         self.assertTrue(track_dispatches)
         self.assertTrue(
             all(
-                item["arguments"]["params"].get("index") == 2
-                and "target_ref" not in item["arguments"]["params"]
+                item["arguments"].get("index") == 2
+                and item["arguments"].get("expected_track") == "Vox"
+                and "target_ref" not in item["arguments"]
                 for item in track_dispatches
             )
         )
 
-    def test_visible_target_isolated_only_through_verified_mixer_toggle(self):
+    def test_visible_project_target_isolated_through_arrange_toggle(self):
         captured = {
             "logic://tracks": {
                 "data": [{"index": 1, "name": "Lead", "solo": False}]
@@ -744,9 +769,12 @@ class RestoreTests(unittest.TestCase):
         )
         self.assertTrue(result["complete"])
         self.assertEqual(result["dispatch_count"], 1)
-        self.assertEqual(result["dispatches"][0]["operation"], "mixer_set_toggle")
+        self.assertEqual(
+            result["dispatches"][0]["operation"], "arrange_track_set_toggle"
+        )
+        self.assertEqual(result["dispatches"][0]["arguments"]["expected_track"], "Lead")
 
-    def test_unique_visible_track_restores_toggle_only_through_mixer(self):
+    def test_unique_visible_project_track_restores_only_through_arrange(self):
         result = audit.build_restore_dispatch(
             {
                 "logic://tracks": {
@@ -767,14 +795,13 @@ class RestoreTests(unittest.TestCase):
         track_toggles = [
             item
             for item in result["dispatches"]
-            if item["operation"] == "logic_tracks"
-            and item["arguments"].get("command") in {"solo", "mute"}
+            if item["operation"] == "arrange_track_set_toggle"
         ]
         mixer_toggles = [
             item for item in result["dispatches"] if item["operation"] == "mixer_set_toggle"
         ]
-        self.assertEqual(track_toggles, [])
-        self.assertEqual(len(mixer_toggles), 2)
+        self.assertEqual(len(track_toggles), 2)
+        self.assertEqual(mixer_toggles, [])
 
     def test_restore_dispatch_preserves_solo_mute_selection_transport_and_cycle(self):
         result = audit.build_restore_dispatch(
@@ -783,6 +810,7 @@ class RestoreTests(unittest.TestCase):
                     "data": [
                         {
                             "index": 2,
+                            "name": "Vox",
                             "target_ref": "trk_vox",
                             "solo": True,
                             "mute": False,
@@ -797,14 +825,20 @@ class RestoreTests(unittest.TestCase):
                 },
             }
         )
-        mature_commands = [
-            item["arguments"].get("command")
+        arrange_controls = [
+            item["arguments"].get("control")
             for item in result["dispatches"]
-            if item["operation"] == "logic_tracks"
+            if item["operation"] == "arrange_track_set_toggle"
         ]
-        self.assertIn("solo", mature_commands)
-        self.assertIn("mute", mature_commands)
-        self.assertIn("select", mature_commands)
+        self.assertEqual(arrange_controls, ["solo", "mute"])
+        self.assertIn(
+            "select",
+            [
+                item["arguments"].get("command")
+                for item in result["dispatches"]
+                if item["operation"] == "logic_tracks"
+            ],
+        )
         position_restore = next(
             item
             for item in result["dispatches"]

@@ -781,7 +781,12 @@ def build_audit_plan(
     for position, target in enumerate(selected["targets"], start=1):
         prefix = f"target-{position:03d}-{target['audit_id']}"
         refs = target.get("isolation_refs", [])
-        if "tracks" in target.get("sources", []) and target.get("index") is not None:
+        surface_index = _integer(target.get("surface_index"))
+        if (
+            "tracks" in target.get("sources", [])
+            and target.get("strip_path")
+            and surface_index is not None
+        ):
             steps.append(
                 _step(
                     f"{prefix}-inventory",
@@ -790,7 +795,12 @@ def build_audit_plan(
                     "logic_plugins",
                     {
                         "command": "get_inventory",
-                        "params": {"track": target["index"]},
+                        # v3.13.0's live AX inventory selector addresses the
+                        # visible mixer surface, not the project-track resource.
+                        # Only a corroborated surface binding may cross that
+                        # boundary; project index and surface index routinely
+                        # differ in real sessions.
+                        "params": {"track": surface_index},
                     },
                     target_id=target["audit_id"],
                     continue_on_failure=True,
@@ -805,8 +815,9 @@ def build_audit_plan(
                     "client",
                     "record_limitation",
                     {
-                        "reason": "mature plugin inventory has no track reference for this mixer-only strip",
-                        "fallback": "AX insert inventory",
+                        "reason": "target has no corroborated visible mixer-surface binding",
+                        "fallback": "bounce BS.1770 measurement without plugin parameter inspection",
+                        "project_index": target.get("index"),
                     },
                     target_id=target["audit_id"],
                 )

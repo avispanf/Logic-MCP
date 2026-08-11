@@ -407,6 +407,67 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(locate["arguments"], {"position": "1.1.1.1", "dry_run": False})
         self.assertTrue(locate["requires_verified_result"])
 
+    def test_plugin_inventory_uses_surface_index_not_project_track_index(self):
+        inventory = audit.normalise_inventory(
+            {
+                "data": [
+                    {"index": 0, "name": "Hidden", "type": "Audio", "target_ref": "trk_hidden"},
+                    {"index": 9, "name": "Lead", "type": "Audio", "target_ref": "trk_lead"},
+                ]
+            },
+            {
+                "data": [
+                    {"trackIndex": 0, "name": "Lead", "mixer_strip_ref": "mix_lead"}
+                ]
+            },
+            {
+                "channels": [
+                    {"index": 0, "name": "Lead", "path": "8.1", "inserts": ["Compressor"]}
+                ]
+            },
+        )
+        lead = next(row for row in inventory["channels"] if row["name"] == "Lead")
+        self.assertEqual(lead["index"], 9)
+        self.assertEqual(lead["surface_index"], 0)
+        plan = audit.build_audit_plan(
+            inventory,
+            "track",
+            "Lead",
+            "/tmp/Test.logicx",
+            "/tmp/logic-audits",
+        )
+        inventory_step = next(
+            step for step in plan["steps"] if step["operation"] == "logic_plugins"
+        )
+        self.assertEqual(
+            inventory_step["arguments"],
+            {"command": "get_inventory", "params": {"track": 0}},
+        )
+
+    def test_offscreen_project_track_records_plugin_inspection_limitation(self):
+        inventory = audit.normalise_inventory(
+            {
+                "data": [
+                    {"index": 4, "name": "Hidden", "type": "Audio", "target_ref": "trk_hidden"}
+                ]
+            },
+            None,
+            None,
+        )
+        plan = audit.build_audit_plan(
+            inventory,
+            "track",
+            "Hidden",
+            "/tmp/Test.logicx",
+            "/tmp/logic-audits",
+        )
+        self.assertFalse(any(step["operation"] == "logic_plugins" for step in plan["steps"]))
+        limitation = next(
+            step for step in plan["steps"] if step["operation"] == "record_limitation"
+        )
+        self.assertEqual(limitation["arguments"]["project_index"], 4)
+        self.assertIn("no corroborated", limitation["arguments"]["reason"])
+
     def test_mixer_only_aux_uses_verified_ax_solo_not_track_index(self):
         inventory = audit.normalise_inventory(
             None,

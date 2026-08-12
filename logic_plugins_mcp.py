@@ -710,7 +710,7 @@ def read_plugin_identity(process: str, window_index: int) -> dict:
     # The Controls table is authoritative; a percentage without a table means Editor.
     if has_parameter_table or raw_view_selector == "Controls":
         view_selector = "Controls"
-    elif re.fullmatch(r"\d+(?:[.,]\d+)?%", raw_view_selector or ""):
+    elif re.search(r"\d+(?:[.,]\d+)?%$", raw_view_selector or ""):
         view_selector = "Editor"
     else:
         view_selector = raw_view_selector
@@ -739,6 +739,54 @@ def read_plugin_identity(process: str, window_index: int) -> dict:
         "controls_view": view_selector == "Controls",
         "bypass_control": bypass,
     }
+
+
+def read_plugin_window_size(process: str, window_index: int) -> tuple[int, int]:
+    """Read a plugin window size with an unambiguous field separator."""
+    raw = osa(
+        f'tell application "System Events" to tell process "{process}"\n'
+        f"set windowSize to size of window {int(window_index)}\n"
+        'return (item 1 of windowSize as string) & "~" & '
+        '(item 2 of windowSize as string)\n'
+        "end tell",
+        timeout=10,
+    )
+    width, separator, height = raw.partition("~")
+    if not separator:
+        raise ProbeError(f"could not parse plugin window size {raw!r}")
+    try:
+        return int(float(width.replace(",", "."))), int(
+            float(height.replace(",", "."))
+        )
+    except ValueError as exc:
+        raise ProbeError(f"could not parse plugin window size {raw!r}") from exc
+
+
+def restorable_plugin_view(process: str, window_index: int, identity: dict) -> tuple[str, dict]:
+    """Return the exact menu view needed to restore a native plugin editor.
+
+    Apple's Loudness Meter exposes ``Vertical`` and ``Horizontal`` instead of a
+    generic ``Editor`` item.  In vertical mode the AX label is only a zoom value,
+    so window geometry is the independent discriminator.
+    """
+    if identity.get("controls_view"):
+        return "Controls", {}
+    raw = str(identity.get("raw_view_selector") or "").strip()
+    folded = raw.casefold()
+    if folded.startswith("horizontal"):
+        return "Horizontal", {}
+    if folded.startswith("vertical"):
+        return "Vertical", {}
+    if re.fullmatch(r"\d+(?:[.,]\d+)?%", raw):
+        try:
+            width, height = read_plugin_window_size(process, window_index)
+        except ProbeError:
+            return "Editor", {}
+        return (
+            "Vertical" if height > width else "Editor",
+            {"width": width, "height": height},
+        )
+    return "Editor", {}
 
 
 def identity_matches(
@@ -937,6 +985,12 @@ def plugin_snapshot(
         "parameter_count": 0,
         "parameters": [],
     }
+    restore_view, original_size = restorable_plugin_view(
+        name, int(window_index), identity
+    )
+    result["restore_view"] = restore_view
+    if original_size:
+        result["window_size"] = original_size
     if not identity["controls_view"]:
         result["note"] = (
             "the plugin is drawing its own interface, so parameters are not exposed. "
@@ -1192,8 +1246,11 @@ def plugin_set_view(
     plugins that draw themselves, so this is the gate to every parameter operation. The
     change is verified by reading the view menu back."""
     process = require_logic()
-    if view not in ("Controls", "Editor"):
-        return {"ok": False, "error": "view must be 'Controls' or 'Editor'"}
+    if view not in ("Controls", "Editor", "Vertical", "Horizontal"):
+        return {
+            "ok": False,
+            "error": "view must be Controls, Editor, Vertical, or Horizontal",
+        }
     identity = None
     if expected_plugin or expected_channel:
         try:
@@ -1222,11 +1279,27 @@ def plugin_set_view(
     current_view = identity.get("view_selector") if identity else (
         "Controls" if current == "Controls" else "Editor"
     )
-    if current_view == view:
+    def view_is_active(observed: dict, requested: str) -> bool:
+        controls_active = observed.get("controls_view")
+        if controls_active is None:
+            controls_active = observed.get("view_selector") == "Controls"
+        if requested == "Controls":
+            return controls_active is True
+        if requested == "Editor":
+            return controls_active is False
+        if controls_active:
+            return False
+        try:
+            width, height = read_plugin_window_size(process, int(window_index))
+        except ProbeError:
+            return False
+        return height > width if requested == "Vertical" else width > height
+
+    if identity and view_is_active(identity, view):
         return {
             "ok": True,
             "verified": True,
-            "view": current_view,
+            "view": view,
             "raw_view": current,
             "changed": False,
             "note": "already in that view",
@@ -1321,10 +1394,13 @@ def plugin_set_view(
     except ProbeError as exc:
         return {"ok": False, "error": f"selected but could not verify: {exc}"}
     now = after_identity["view_selector"]
+    matches = view_is_active(after_identity, view)
     return {
-        "ok": now == view,
-        "verified": now == view,
-        "view": now,
+        "ok": matches,
+        "verified": matches,
+        "view": view if matches else now,
+        "observed_view": now,
+        "raw_view": after_identity.get("raw_view_selector"),
         "was": current,
         "selected_menu_item": target["name"],
         "changed": now != current,

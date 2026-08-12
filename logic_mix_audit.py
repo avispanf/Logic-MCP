@@ -625,7 +625,7 @@ def build_plugin_inspection_steps(prefix: str, target: dict, inserts: list[str])
                     },
                     arguments_from={
                         **identity_sources,
-                        "view": f"{plugin_prefix}-snapshot.view_selector",
+                        "view": f"{plugin_prefix}-snapshot.restore_view",
                     },
                     target_id=target["audit_id"],
                     mutates_ui=True,
@@ -1222,7 +1222,7 @@ def build_fix_plan(inventory: dict, fixes: list[dict], project_path: str) -> dic
                     },
                     arguments_from={
                         **identity_sources,
-                        "view": f"{prefix}-snapshot.view_selector",
+                        "view": f"{prefix}-snapshot.restore_view",
                     },
                     target_id=target["audit_id"],
                     always_run=True,

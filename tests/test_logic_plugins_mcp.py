@@ -514,6 +514,33 @@ class PluginOpenTests(unittest.TestCase):
         self.assertEqual(identity["view_selector"], "Editor")
         self.assertFalse(identity["controls_view"])
 
+    def test_horizontal_percent_view_label_is_normalised_to_editor(self):
+        shallow = [
+            {
+                "path": "4",
+                "role": "AXMenuButton",
+                "name": "Horizontal: 100%",
+                "value": "",
+                "description": "view",
+            }
+        ]
+        with mock.patch.object(plugins, "walk_window", return_value=shallow):
+            identity = plugins.read_plugin_identity("Logic Pro", 1)
+        self.assertEqual(identity["view_selector"], "Editor")
+
+    def test_tall_percent_editor_restores_as_vertical(self):
+        identity = {
+            "view_selector": "Editor",
+            "raw_view_selector": "100%",
+            "controls_view": False,
+        }
+        with mock.patch.object(
+            plugins, "read_plugin_window_size", return_value=(220, 558)
+        ):
+            view, size = plugins.restorable_plugin_view("Logic Pro", 1, identity)
+        self.assertEqual(view, "Vertical")
+        self.assertEqual(size, {"width": 220, "height": 558})
+
     def test_parameter_table_is_authoritative_controls_view(self):
         shallow = [
             {
@@ -588,6 +615,35 @@ class PluginOpenTests(unittest.TestCase):
             )
         self.assertTrue(result["verified"])
         self.assertEqual(result["selected_menu_item"], "Pro-DS")
+
+    def test_set_vertical_view_verifies_orientation(self):
+        identities = iter(
+            [
+                {"plugin": "Loudness Meter", "channel": "Stereo Out", "view_selector": "Controls", "controls_view": True},
+                {"plugin": "Loudness Meter", "channel": "Stereo Out", "view_selector": "Editor", "controls_view": False, "raw_view_selector": "100%"},
+            ]
+        )
+        shallow = [
+            {"path": "4", "role": "AXMenuButton", "name": "Controls", "value": "", "description": "view"}
+        ]
+        menu_items = [
+            {"path": "4.1.1", "role": "AXMenuItem", "name": "Controls", "value": "", "description": ""},
+            {"path": "4.1.2", "role": "AXMenuItem", "name": "Vertical", "value": "", "description": ""},
+            {"path": "4.1.3", "role": "AXMenuItem", "name": "Horizontal", "value": "", "description": ""},
+        ]
+        with (
+            mock.patch.object(plugins, "require_logic", return_value="Logic Pro"),
+            mock.patch.object(plugins, "read_plugin_identity", side_effect=lambda *_: next(identities)),
+            mock.patch.object(plugins, "read_plugin_window_size", return_value=(220, 558)),
+            mock.patch.object(plugins, "walk_window", side_effect=[shallow, menu_items]),
+            mock.patch.object(plugins, "osa"),
+            mock.patch.object(plugins.time, "sleep"),
+        ):
+            result = plugins.plugin_set_view(
+                1, "Vertical", expected_plugin="Loudness Meter", expected_channel="Stereo Out"
+            )
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["selected_menu_item"], "Vertical")
 
     def test_set_view_retries_with_press_when_show_menu_is_empty(self):
         identities = iter(

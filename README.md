@@ -164,6 +164,19 @@ generic eight-strip MCU bank, pass the prior evidence file with
 accepted, and the open project path plus every selected Inspector name are still
 verified live.
 
+Several journals (including continuation runs) can be consolidated without opening
+Logic. The report preserves every WAV path, LUFS-I/True Peak result, readable insert
+chain, plugin parameter count, runner status, and failed step:
+
+```bash
+~/dev/venv/bin/python generate_mix_audit_report.py \
+  /path/to/first/runner.jsonl /path/to/continuation/runner.jsonl \
+  --json /path/to/report.json --markdown /path/to/report.md
+```
+
+The report deliberately treats loudness values as measurements rather than automatic
+gain targets. It never writes to Logic.
+
 Give the runner its own persistent Logic Control surface by assigning both ports to
 `LogicProMCP-MCU-Internal [standalone-audit]`. The runner rejects the generic `Track 1…8`
 bank that appears during MCU startup and asks the patched core for a full AX refresh

@@ -14,6 +14,13 @@ def arguments() -> argparse.Namespace:
 
 
 class AuditRunnerTests(unittest.IsolatedAsyncioTestCase):
+    def test_snapshot_filter_keeps_only_exact_names_and_master_alias(self):
+        names = {"lead voice", "master"}
+        self.assertTrue(runner_module.track_name_in_snapshot("LEAD VOICE", names))
+        self.assertTrue(runner_module.track_name_in_snapshot("Stereo Out", names))
+        self.assertFalse(runner_module.track_name_in_snapshot("Master 2", names))
+        self.assertFalse(runner_module.track_name_in_snapshot("LEAD VOICE DOUBLES", names))
+
     def test_tracks_snapshot_requires_ax_live_resource(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / "runner.jsonl"

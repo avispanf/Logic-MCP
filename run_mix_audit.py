@@ -57,6 +57,16 @@ def verified(result: dict) -> bool:
     )
 
 
+def track_name_in_snapshot(observed: str, snapshot_names: set[str]) -> bool:
+    """Match exact project names plus Logic's one measured output alias."""
+    folded = str(observed or "").strip().casefold()
+    if folded in snapshot_names:
+        return True
+    return folded in {"master", "stereo out"} and bool(
+        snapshot_names.intersection({"master", "stereo out"})
+    )
+
+
 class AuditRunner:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -764,7 +774,7 @@ class AuditRunner:
                 survey["channels"] = [
                     row
                     for row in survey.get("channels", [])
-                    if str(row.get("name") or "").strip().casefold() in remaining_names
+                    if track_name_in_snapshot(row.get("name") or "", remaining_names)
                 ]
             plan = await self.tool(
                 "plugins",

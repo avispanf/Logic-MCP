@@ -1066,6 +1066,11 @@ def plugin_parameters(
     reference = element_reference(table, int(window_index))
     start_row = 1 if needle else page_offset + 1
     end_row = "n" if needle else str(page_offset + page_limit)
+    fallback_limit = (
+        ""
+        if needle
+        else "if not bulkOK and endRow > (startRow + 39) then set endRow to (startRow + 39)\n"
+    )
     raw = osa(
         f'tell application "System Events" to tell process "{process}"\n'
         f"set t to {reference}\n"
@@ -1073,14 +1078,40 @@ def plugin_parameters(
         "try\n"
         "set n to count of rows of t\n"
         "end try\n"
+        "set labels to {}\n"
+        "set displays to {}\n"
+        "set roles to {}\n"
+        "try\n"
+        "set labels to value of static text 1 of UI element 1 of every row of t\n"
+        "end try\n"
+        "try\n"
+        "set displays to value of UI element 2 of UI element 1 of every row of t\n"
+        "end try\n"
+        "try\n"
+        "set roles to role of UI element 2 of UI element 1 of every row of t\n"
+        "end try\n"
+        "set bulkOK to ((count of labels) is n and (count of displays) is n and (count of roles) is n)\n"
         'set out to ""\n'
         f"set startRow to {start_row}\n"
         f"set endRow to {end_row}\n"
         "if endRow > n then set endRow to n\n"
+        + fallback_limit
+        +
         "repeat with i from startRow to endRow\n"
         'set lbl to ""\n'
         'set disp to ""\n'
         'set rol to ""\n'
+        "if bulkOK then\n"
+        "try\n"
+        "set lbl to (item i of labels) as string\n"
+        "end try\n"
+        "try\n"
+        "set disp to (item i of displays) as string\n"
+        "end try\n"
+        "try\n"
+        "set rol to (item i of roles) as string\n"
+        "end try\n"
+        "else\n"
         "try\n"
         "set c to UI element 1 of row i of t\n"
         "try\n"
@@ -1093,6 +1124,7 @@ def plugin_parameters(
         "set rol to (role of UI element 2 of c) as string\n"
         "end try\n"
         "end try\n"
+        "end if\n"
         'set out to out & (i as string) & "~" & lbl & "~" & disp & "~" & rol & "|:|"\n'
         "end repeat\n"
         'return (n as string) & "#" & out\n'
@@ -1123,6 +1155,15 @@ def plugin_parameters(
     matched_total = len(parameters) if needle else row_count
     if needle:
         parameters = parameters[page_offset : page_offset + page_limit]
+    if needle:
+        next_offset = (
+            page_offset + page_limit
+            if page_offset + page_limit < matched_total
+            else None
+        )
+    else:
+        last_row = parameters[-1].get("row") if parameters else None
+        next_offset = last_row if last_row is not None and last_row < row_count else None
     return {
         "window_index": window_index,
         "table_path": table,
@@ -1130,9 +1171,7 @@ def plugin_parameters(
         "offset": page_offset,
         "returned": len(parameters),
         "matched_total": matched_total,
-        "next_offset": page_offset + page_limit
-        if page_offset + page_limit < matched_total
-        else None,
+        "next_offset": next_offset,
         "filter": contains or None,
         "parameters": parameters,
     }

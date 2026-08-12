@@ -281,6 +281,23 @@ class WindowSelectionTests(unittest.TestCase):
 
 
 class ParameterTableTests(unittest.TestCase):
+    def test_unfiltered_next_offset_uses_last_returned_row(self):
+        rows = "100#" + "".join(
+            f"{number}~Band {number}~0~AXGroup|:|" for number in range(41, 81)
+        )
+        with (
+            mock.patch.object(plugins, "require_logic", return_value="Logic Pro"),
+            mock.patch.object(plugins, "find_parameter_table", return_value="2.4"),
+            mock.patch.object(plugins, "osa", return_value=rows),
+        ):
+            result = plugins.plugin_parameters(
+                window_index=1,
+                offset=40,
+                limit=500,
+            )
+        self.assertEqual(result["returned"], 40)
+        self.assertEqual(result["next_offset"], 80)
+
     def test_filter_is_applied_before_match_pagination(self):
         rows = (
             "4#"

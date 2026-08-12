@@ -177,6 +177,13 @@ chain, plugin parameter label/display value and count, runner status, and failed
 The report deliberately treats loudness values as measurements rather than automatic
 gain targets. It never writes to Logic.
 
+Large Controls tables are read with grouped label/value/role requests on the AX table,
+then serialized locally. A 320-row Pro-Q 3 table measured about 36 seconds in one bulk
+page instead of roughly 12 minutes over eight sequential pages. If a plugin exposes a
+heterogeneous table that rejects the grouped request, the tool automatically falls back
+to verified 40-row pages. The runner requests a 500-row page by default so the fast path
+does not repeat the same whole-table query.
+
 Give the runner its own persistent Logic Control surface by assigning both ports to
 `LogicProMCP-MCU-Internal [standalone-audit]`. The runner rejects the generic `Track 1…8`
 bank that appears during MCU startup and asks the patched core for a full AX refresh
@@ -205,6 +212,11 @@ recursion with bulk per-container property queries works and is what the walker 
 third-party plugins that render custom interfaces are fully readable and writable while
 that view is active. Instrument editors are the exception: they expose thousands of
 elements and are skipped by a size probe.
+
+**Native editor restoration is orientation-aware.** Apple's Loudness Meter offers
+`Vertical` and `Horizontal` rather than a generic `Editor` menu item. Snapshots preserve
+the exact restorable orientation, and restore verifies the resulting window geometry
+before closing the editor.
 
 **Sliders do not accept absolute writes.** `set value` moves the control one step toward
 the requested value per call regardless of the value passed. The writer attempts an

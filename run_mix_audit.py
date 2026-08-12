@@ -493,7 +493,7 @@ class AuditRunner:
 
     async def read_plugin_parameters(self, arguments: dict) -> dict:
         requested_offset = max(0, int(arguments.get("offset", 0)))
-        page_size = max(1, min(int(self.args.parameter_page_size), 100))
+        page_size = max(1, min(int(self.args.parameter_page_size), 500))
         max_parameters = max(page_size, int(self.args.max_parameters))
         offset = requested_offset
         parameters: list[dict] = []
@@ -839,7 +839,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--per-strip-seconds", type=int, default=12)
     result.add_argument("--survey-seconds", type=int, default=180)
     result.add_argument("--bounce-timeout", type=int, default=900)
-    result.add_argument("--parameter-page-size", type=int, default=40)
+    result.add_argument(
+        "--parameter-page-size",
+        type=int,
+        default=500,
+        help="bulk AX page request; heterogeneous tables automatically fall back to 40 rows",
+    )
     result.add_argument("--max-parameters", type=int, default=2000)
     result.add_argument("--max-steps", type=int, default=5000)
     result.add_argument(

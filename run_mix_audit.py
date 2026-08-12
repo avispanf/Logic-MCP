@@ -755,9 +755,9 @@ class AuditRunner:
                     for row in tracks.get("data", [])
                 }
                 survey = copy.deepcopy(survey)
-                survey["strips"] = [
+                survey["channels"] = [
                     row
-                    for row in survey.get("strips", [])
+                    for row in survey.get("channels", [])
                     if str(row.get("name") or "").strip().casefold() in remaining_names
                 ]
             plan = await self.tool(

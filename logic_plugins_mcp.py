@@ -3031,7 +3031,7 @@ def selected_track_identity(expected_track: str = "") -> dict:
     ).strip()
     expected = str(expected_track).strip()
     matches = bool(observed) and (
-        not expected or observed.casefold() == expected.casefold()
+        not expected or track_identity_matches(observed, expected)
     )
     return {
         "ok": matches,
@@ -3041,6 +3041,18 @@ def selected_track_identity(expected_track: str = "") -> dict:
         "strip_path": strip,
         **({} if matches else {"error": "selected track identity mismatch"}),
     }
+
+
+def track_identity_matches(observed: str, expected: str) -> bool:
+    """Compare exact Logic track identities with one measured output alias.
+
+    Logic's project resource labels its final output row ``Master`` while the
+    selected-track Inspector labels the same row ``Stereo Out``. No other
+    aliases or fuzzy matching are accepted.
+    """
+    left = str(observed).strip().casefold()
+    right = str(expected).strip().casefold()
+    return left == right or {left, right} == {"master", "stereo out"}
 
 
 @tool
@@ -3087,7 +3099,7 @@ def arrange_track_set_toggle(
         ),
         "",
     )
-    if observed_name.casefold() != expected.casefold():
+    if not track_identity_matches(observed_name, expected):
         return {
             "ok": False,
             "verified": False,
@@ -3133,7 +3145,7 @@ def arrange_track_set_toggle(
         ),
         "",
     ).strip()
-    if selected_name.casefold() != expected.casefold():
+    if not track_identity_matches(selected_name, expected):
         return {
             "ok": False,
             "verified": False,

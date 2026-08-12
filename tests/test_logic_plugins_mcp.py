@@ -81,6 +81,13 @@ class TransportPositionTests(unittest.TestCase):
 
 
 class ArrangeTrackToggleTests(unittest.TestCase):
+    def test_master_and_stereo_out_are_the_only_identity_alias(self):
+        self.assertTrue(plugins.track_identity_matches("Stereo Out", "Master"))
+        self.assertTrue(plugins.track_identity_matches("Master", "Stereo Out"))
+        self.assertTrue(plugins.track_identity_matches("LEAD VOICE", "LEAD VOICE"))
+        self.assertFalse(plugins.track_identity_matches("Output 1-2", "Master"))
+        self.assertFalse(plugins.track_identity_matches("Stereo Out", "Master 2"))
+
     def test_toggle_is_bound_to_exact_index_name_and_checkbox_readback(self):
         children = [
             {

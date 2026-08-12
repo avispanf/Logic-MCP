@@ -155,6 +155,11 @@ the explicit `--confirmed` flag:
   --output-root ~/Desktop/Logic-MCP-Audits/nightly
 ```
 
+To continue after a safely stopped long run without repeating earlier project
+tracks, add `--start-index N` (zero-based). The runner filters both the project
+resource and AX survey before planning, so omitted tracks cannot re-enter as
+unbound mixer rows.
+
 Give the runner its own persistent Logic Control surface by assigning both ports to
 `LogicProMCP-MCU-Internal [standalone-audit]`. The runner rejects the generic `Track 1…8`
 bank that appears during MCU startup and asks the patched core for a full AX refresh

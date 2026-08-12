@@ -681,6 +681,17 @@ class AuditRunner:
                 raise RuntimeError(f"open project could not be verified: {project}")
             project_path = project["observed_project_path"]
             tracks = await self.wait_for_tracks()
+            if self.args.start_index:
+                tracks = copy.deepcopy(tracks)
+                tracks["data"] = [
+                    row
+                    for row in tracks.get("data", [])
+                    if int(row.get("index", row.get("id", -1))) >= self.args.start_index
+                ]
+                if not tracks["data"]:
+                    raise RuntimeError(
+                        f"no project tracks remain at or after index {self.args.start_index}"
+                    )
             survey = await self.tool(
                 "plugins",
                 "mixer_survey",
@@ -691,6 +702,17 @@ class AuditRunner:
                     "total_seconds": self.args.survey_seconds,
                 },
             )
+            if self.args.start_index:
+                remaining_names = {
+                    str(row.get("name") or "").strip().casefold()
+                    for row in tracks.get("data", [])
+                }
+                survey = copy.deepcopy(survey)
+                survey["strips"] = [
+                    row
+                    for row in survey.get("strips", [])
+                    if str(row.get("name") or "").strip().casefold() in remaining_names
+                ]
             plan = await self.tool(
                 "plugins",
                 "mix_audit_plan",
@@ -735,6 +757,12 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--measurement", default="bounce_bs1770", choices=["bounce_bs1770", "existing_meter", "both"])
     result.add_argument("--start-position", default="1.1.1.1")
     result.add_argument("--target-name", default="streaming")
+    result.add_argument(
+        "--start-index",
+        type=int,
+        default=0,
+        help="omit project tracks below this zero-based index (for safe continuation)",
+    )
     result.add_argument("--output-root", type=Path, default=Path.home() / "Desktop" / "Logic-MCP-Audits")
     result.add_argument("--python", type=Path, default=DEFAULT_PYTHON)
     result.add_argument("--core", type=Path, default=DEFAULT_CORE)

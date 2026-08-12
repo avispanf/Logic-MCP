@@ -122,7 +122,12 @@ def build_report(journals: list[Path]) -> dict:
                 slot, action = plugin_match.groups()
                 key = (target_id, slot)
                 if action == "open":
-                    open_plugins[key] = result.get("plugin") or f"insert {int(slot) + 1}"
+                    identity = result.get("identity") or {}
+                    open_plugins[key] = (
+                        identity.get("plugin")
+                        or result.get("plugin")
+                        or f"insert {int(slot) + 1}"
+                    )
                 else:
                     target["plugins"].append(
                         {
@@ -216,6 +221,46 @@ def markdown(report: dict) -> str:
                 artifact=artifact_link,
             )
         )
+    inspected = [row for row in report["targets"] if row.get("plugins")]
+    if inspected:
+        lines.extend(
+            [
+                "",
+                "## Plugin chains",
+                "",
+                "Full parameter labels and display values are preserved in `report.json`.",
+                "",
+            ]
+        )
+        for row in inspected:
+            lines.append(f"### {row.get('name') or row['target_id']}")
+            lines.append("")
+            for plugin in row["plugins"]:
+                lines.append(
+                    f"{plugin['slot'] + 1}. {plugin['name']} ({plugin.get('parameter_count') or 0} parameters)"
+                )
+            lines.append("")
+    failures = [
+        (run.get("plan_id") or "unknown", failure)
+        for run in report["runs"]
+        for failure in run["failed_steps"]
+    ]
+    if failures:
+        lines.extend(
+            [
+                "## Failed steps",
+                "",
+                "These are durable fail-closed events across all attempts; later successful retries remain separate evidence.",
+                "",
+                "| Plan | Target | Step | Error |",
+                "|---|---|---|---|",
+            ]
+        )
+        for plan_id, failure in failures:
+            error = str(failure.get("error") or "").replace("|", "\\|")
+            lines.append(
+                f"| {plan_id} | {failure.get('target_id') or ''} | {failure.get('step_id') or ''} | {error} |"
+            )
     lines.extend(
         [
             "",

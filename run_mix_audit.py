@@ -76,6 +76,44 @@ class AuditRunner:
         self.log_path: Path | None = None
         self.summary: list[dict] = []
 
+    def load_tracks_snapshot(self, expected_project_path: str = "") -> dict | None:
+        """Load one previously journaled, project-specific AX track resource."""
+        source = self.args.tracks_snapshot
+        if source is None:
+            return None
+        try:
+            rows = source.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            raise RuntimeError(f"could not read tracks snapshot {source}: {exc}") from exc
+        journal_project = ""
+        decoded = []
+        for line in rows:
+            try:
+                event = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            decoded.append(event)
+            if event.get("event") == "plan_created":
+                journal_project = str(event.get("project_path") or "")
+        if expected_project_path and journal_project != expected_project_path:
+            raise RuntimeError(
+                "tracks snapshot project mismatch: "
+                f"expected {expected_project_path!r}, journal has {journal_project!r}"
+            )
+        for event in reversed(decoded):
+            if event.get("event") != "step_finished":
+                continue
+            result = event.get("result", {})
+            tracks = result.get("logic://tracks") if isinstance(result, dict) else None
+            if (
+                isinstance(tracks, dict)
+                and tracks.get("source") == "ax_live"
+                and tracks.get("readable") is True
+                and tracks.get("data")
+            ):
+                return tracks
+        raise RuntimeError(f"no readable ax_live logic://tracks snapshot in {source}")
+
     async def connect(
         self,
         stack: AsyncExitStack,
@@ -680,7 +718,16 @@ class AuditRunner:
             if not project.get("verified"):
                 raise RuntimeError(f"open project could not be verified: {project}")
             project_path = project["observed_project_path"]
-            tracks = await self.wait_for_tracks()
+            tracks = self.load_tracks_snapshot(project_path)
+            if tracks is None:
+                tracks = await self.wait_for_tracks()
+            else:
+                self.emit(
+                    "tracks_snapshot_loaded",
+                    source=str(self.args.tracks_snapshot),
+                    track_count=len(tracks.get("data", [])),
+                    project_path=project_path,
+                )
             if self.args.start_index:
                 tracks = copy.deepcopy(tracks)
                 tracks["data"] = [
@@ -762,6 +809,11 @@ def parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="omit project tracks below this zero-based index (for safe continuation)",
+    )
+    result.add_argument(
+        "--tracks-snapshot",
+        type=Path,
+        help="reuse the ax_live logic://tracks capture from a prior runner JSONL",
     )
     result.add_argument("--output-root", type=Path, default=Path.home() / "Desktop" / "Logic-MCP-Audits")
     result.add_argument("--python", type=Path, default=DEFAULT_PYTHON)

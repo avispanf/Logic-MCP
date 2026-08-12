@@ -158,7 +158,11 @@ the explicit `--confirmed` flag:
 To continue after a safely stopped long run without repeating earlier project
 tracks, add `--start-index N` (zero-based). The runner filters both the project
 resource and AX survey before planning, so omitted tracks cannot re-enter as
-unbound mixer rows.
+unbound mixer rows. If a newly connected core temporarily exposes only its
+generic eight-strip MCU bank, pass the prior evidence file with
+`--tracks-snapshot /path/to/runner.jsonl`; only a readable `ax_live` capture is
+accepted, and the open project path plus every selected Inspector name are still
+verified live.
 
 Give the runner its own persistent Logic Control surface by assigning both ports to
 `LogicProMCP-MCU-Internal [standalone-audit]`. The runner rejects the generic `Track 1…8`

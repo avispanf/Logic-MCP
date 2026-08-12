@@ -14,6 +14,33 @@ def arguments() -> argparse.Namespace:
 
 
 class AuditRunnerTests(unittest.IsolatedAsyncioTestCase):
+    def test_tracks_snapshot_requires_ax_live_resource(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "runner.jsonl"
+            path.write_text(
+                json.dumps({"event": "plan_created", "project_path": "/tmp/test.logicx"})
+                + "\n"
+                + json.dumps(
+                    {
+                        "event": "step_finished",
+                        "result": {
+                            "logic://tracks": {
+                                "source": "ax_live",
+                                "readable": True,
+                                "data": [{"id": 8, "name": "Track 9"}],
+                            }
+                        },
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            runner = runner_module.AuditRunner(arguments())
+            runner.args.tracks_snapshot = path
+            self.assertEqual(
+                runner.load_tracks_snapshot("/tmp/test.logicx")["data"][0]["id"], 8
+            )
+
     async def test_wait_for_tracks_rejects_transient_generic_mcu_bank(self):
         runner = runner_module.AuditRunner(arguments())
         generic = {

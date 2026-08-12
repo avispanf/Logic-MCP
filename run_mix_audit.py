@@ -75,6 +75,7 @@ class AuditRunner:
         self.initial_cycle_enabled = False
         self.log_path: Path | None = None
         self.summary: list[dict] = []
+        self.snapshot_tracks: dict | None = None
 
     def load_tracks_snapshot(self, expected_project_path: str = "") -> dict | None:
         """Load one previously journaled, project-specific AX track resource."""
@@ -250,7 +251,11 @@ class AuditRunner:
         self.initial_surface_state = dict(self.surface_state)
 
     async def capture_resources(self) -> dict:
-        tracks = await self.wait_for_tracks()
+        tracks = (
+            copy.deepcopy(self.snapshot_tracks)
+            if self.snapshot_tracks is not None
+            else await self.wait_for_tracks()
+        )
         resources = {
             "logic://tracks": tracks,
             "logic://mixer": await self.resource("logic://mixer"),
@@ -722,6 +727,7 @@ class AuditRunner:
             if tracks is None:
                 tracks = await self.wait_for_tracks()
             else:
+                self.snapshot_tracks = copy.deepcopy(tracks)
                 self.emit(
                     "tracks_snapshot_loaded",
                     source=str(self.args.tracks_snapshot),

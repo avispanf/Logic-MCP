@@ -129,6 +129,7 @@ def build_report(journals: list[Path]) -> dict:
                             "slot": int(slot),
                             "name": open_plugins.get(key, f"insert {int(slot) + 1}"),
                             "parameter_count": summary.get("parameter_count"),
+                            "parameters": result.get("parameters") or [],
                         }
                     )
 

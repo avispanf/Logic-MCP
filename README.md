@@ -166,7 +166,7 @@ verified live.
 
 Several journals (including continuation runs) can be consolidated without opening
 Logic. The report preserves every WAV path, LUFS-I/True Peak result, readable insert
-chain, plugin parameter count, runner status, and failed step:
+chain, plugin parameter label/display value and count, runner status, and failed step:
 
 ```bash
 ~/dev/venv/bin/python generate_mix_audit_report.py \

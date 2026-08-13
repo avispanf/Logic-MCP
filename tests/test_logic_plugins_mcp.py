@@ -280,6 +280,106 @@ class WindowSelectionTests(unittest.TestCase):
         self.assertIn("-25211", status["reason"])
 
 
+class SurfaceDoctorTests(unittest.TestCase):
+    def test_non_mcu_duplicates_warn_without_blocking_manual_editing(self):
+        endpoints = [
+            {
+                "direction": "source",
+                "name": "LogicProMCP-MCU-Internal [codex]",
+                "unique_id": 1,
+            },
+            {
+                "direction": "destination",
+                "name": "LogicProMCP-MCU-Internal [codex]",
+                "unique_id": 2,
+            },
+            {
+                "direction": "source",
+                "name": "LogicProMCP-MIDI-Internal",
+                "unique_id": 3,
+            },
+            {
+                "direction": "source",
+                "name": "LogicProMCP-MIDI-Internal",
+                "unique_id": 4,
+            },
+        ]
+        preference = {
+            "path": "/tmp/com.apple.logic.pro.cs",
+            "present": True,
+            "port_refs": [
+                "LogicProMCP-MCU-Internal [codex]",
+                "LogicProMCP-MCU-Internal [standalone-audit]",
+            ],
+        }
+        with (
+            mock.patch.object(plugins, "coremidi_endpoints", return_value=endpoints),
+            mock.patch.object(plugins, "logicpromcp_processes", return_value=[]),
+            mock.patch.object(
+                plugins, "logic_surface_preference_refs", return_value=preference
+            ),
+            mock.patch.object(
+                plugins,
+                "surfaces_bypass",
+                return_value={"ok": True, "bypassed": False},
+            ),
+        ):
+            result = plugins.surfaces_doctor()
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["manual_editing_safe"])
+        self.assertEqual(result["duplicate_mcu_endpoints"], [])
+        self.assertEqual(
+            result["stale_temporary_preference_refs"],
+            ["LogicProMCP-MCU-Internal [standalone-audit]"],
+        )
+        self.assertTrue(any("non-MCU" in warning for warning in result["warnings"]))
+
+    def test_second_live_mcu_namespace_blocks_safe_status(self):
+        endpoints = [
+            {
+                "direction": "source",
+                "name": "LogicProMCP-MCU-Internal [codex]",
+                "unique_id": 1,
+            },
+            {
+                "direction": "destination",
+                "name": "LogicProMCP-MCU-Internal [codex]",
+                "unique_id": 2,
+            },
+            {
+                "direction": "source",
+                "name": "LogicProMCP-MCU-Internal [audit]",
+                "unique_id": 3,
+            },
+            {
+                "direction": "destination",
+                "name": "LogicProMCP-MCU-Internal [audit]",
+                "unique_id": 4,
+            },
+        ]
+        with (
+            mock.patch.object(plugins, "coremidi_endpoints", return_value=endpoints),
+            mock.patch.object(plugins, "logicpromcp_processes", return_value=[]),
+            mock.patch.object(
+                plugins,
+                "logic_surface_preference_refs",
+                return_value={"path": "/tmp/cs", "present": True, "port_refs": []},
+            ),
+            mock.patch.object(
+                plugins,
+                "surfaces_bypass",
+                return_value={"ok": True, "bypassed": False},
+            ),
+        ):
+            result = plugins.surfaces_doctor()
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["manual_editing_safe"])
+        self.assertEqual(
+            result["other_live_mcu_names"],
+            ["LogicProMCP-MCU-Internal [audit]"],
+        )
+
+
 class ParameterTableTests(unittest.TestCase):
     def test_unfiltered_next_offset_uses_last_returned_row(self):
         rows = "100#" + "".join(

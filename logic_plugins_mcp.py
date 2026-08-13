@@ -2968,6 +2968,260 @@ def surfaces_bypass(state: str = "read") -> dict:
     }
 
 
+def coremidi_endpoints() -> list[dict]:
+    """Return live CoreMIDI sources/destinations without third-party packages.
+
+    ``system_profiler SPMIDIDataType`` omits process-owned virtual endpoints on
+    recent macOS releases, so the control-surface doctor asks CoreMIDI itself.
+    The ctypes bridge is deliberately private and read-only: it only calls the
+    endpoint-count, endpoint-get and property-get functions.
+    """
+    if sys.platform != "darwin":
+        return []
+    coremidi = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreMIDI.framework/CoreMIDI"
+    )
+    corefoundation = ctypes.CDLL(
+        "/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation"
+    )
+    coremidi.MIDIGetNumberOfSources.restype = ctypes.c_ulong
+    coremidi.MIDIGetSource.argtypes = [ctypes.c_ulong]
+    coremidi.MIDIGetSource.restype = ctypes.c_uint32
+    coremidi.MIDIGetNumberOfDestinations.restype = ctypes.c_ulong
+    coremidi.MIDIGetDestination.argtypes = [ctypes.c_ulong]
+    coremidi.MIDIGetDestination.restype = ctypes.c_uint32
+    coremidi.MIDIObjectGetStringProperty.argtypes = [
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    coremidi.MIDIObjectGetStringProperty.restype = ctypes.c_int32
+    coremidi.MIDIObjectGetIntegerProperty.argtypes = [
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_int32),
+    ]
+    coremidi.MIDIObjectGetIntegerProperty.restype = ctypes.c_int32
+    corefoundation.CFStringGetCString.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_long,
+        ctypes.c_uint32,
+    ]
+    corefoundation.CFStringGetCString.restype = ctypes.c_bool
+    corefoundation.CFRelease.argtypes = [ctypes.c_void_p]
+    name_key = ctypes.c_void_p.in_dll(coremidi, "kMIDIPropertyName")
+    unique_id_key = ctypes.c_void_p.in_dll(coremidi, "kMIDIPropertyUniqueID")
+
+    def endpoint_name(endpoint: int) -> str:
+        value = ctypes.c_void_p()
+        status = coremidi.MIDIObjectGetStringProperty(
+            endpoint, name_key, ctypes.byref(value)
+        )
+        if status != 0 or not value.value:
+            return ""
+        try:
+            buffer = ctypes.create_string_buffer(2048)
+            # kCFStringEncodingUTF8
+            converted = corefoundation.CFStringGetCString(
+                value, buffer, len(buffer), 0x08000100
+            )
+            return buffer.value.decode("utf-8", errors="replace") if converted else ""
+        finally:
+            corefoundation.CFRelease(value)
+
+    endpoints = []
+    directions = (
+        ("source", coremidi.MIDIGetNumberOfSources, coremidi.MIDIGetSource),
+        (
+            "destination",
+            coremidi.MIDIGetNumberOfDestinations,
+            coremidi.MIDIGetDestination,
+        ),
+    )
+    for direction, count_fn, get_fn in directions:
+        for index in range(int(count_fn())):
+            endpoint = int(get_fn(index))
+            name = endpoint_name(endpoint)
+            unique_id = ctypes.c_int32()
+            id_status = coremidi.MIDIObjectGetIntegerProperty(
+                endpoint, unique_id_key, ctypes.byref(unique_id)
+            )
+            endpoints.append(
+                {
+                    "direction": direction,
+                    "index": index,
+                    "name": name,
+                    "unique_id": unique_id.value if id_status == 0 else None,
+                }
+            )
+    return endpoints
+
+
+def logicpromcp_processes() -> list[dict]:
+    result = subprocess.run(
+        ["ps", "-axo", "pid=,ppid=,etime=,command="],
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    if result.returncode != 0:
+        return []
+    processes = []
+    for line in result.stdout.splitlines():
+        match = re.match(r"\s*(\d+)\s+(\d+)\s+(\S+)\s+(.+)", line)
+        if not match:
+            continue
+        command = match.group(4).strip()
+        executable = command.split(maxsplit=1)[0]
+        if not re.search(r"(?:^|/)LogicProMCP(?:-codex)?$", executable):
+            continue
+        processes.append(
+            {
+                "pid": int(match.group(1)),
+                "ppid": int(match.group(2)),
+                "elapsed": match.group(3),
+                "executable": executable,
+            }
+        )
+    return processes
+
+
+def logic_surface_preference_refs() -> dict:
+    path = Path.home() / "Library" / "Preferences" / "com.apple.logic.pro.cs"
+    if not path.is_file():
+        return {"path": str(path), "present": False, "port_refs": []}
+    data = path.read_bytes()
+    printable = re.findall(rb"[ -~]{4,160}", data)
+    refs = set()
+    for chunk in printable:
+        text = chunk.decode("utf-8", errors="ignore")
+        for match in re.finditer(r"LogicProMCP-[A-Za-z0-9_. \[\]-]{3,120}", text):
+            refs.add(match.group(0).strip())
+    return {
+        "path": str(path),
+        "present": True,
+        "modified_at": path.stat().st_mtime,
+        "port_refs": sorted(refs),
+    }
+
+
+@tool
+def surfaces_doctor(expected_namespace: str = "codex") -> dict:
+    """Diagnose the control-surface state behind phantom fader/automation jumps.
+
+    Reports the bypass switch, live CoreMIDI endpoints, duplicate server processes,
+    and stale temporary LogicProMCP port names retained by Logic's control-surface
+    preferences. It never changes a port assignment or project value. A healthy MCU
+    instance has exactly one source and one destination for the expected namespace.
+    """
+    namespace = str(expected_namespace or "default").strip() or "default"
+    expected = "LogicProMCP-MCU-Internal"
+    if namespace != "default":
+        expected += f" [{namespace}]"
+    live = [e for e in coremidi_endpoints() if e["name"].startswith("LogicProMCP-")]
+    live_names = {e["name"] for e in live}
+    expected_counts = {
+        direction: sum(
+            1
+            for endpoint in live
+            if endpoint["direction"] == direction and endpoint["name"] == expected
+        )
+        for direction in ("source", "destination")
+    }
+    duplicate_endpoints = []
+    for direction in ("source", "destination"):
+        names = sorted({e["name"] for e in live if e["direction"] == direction})
+        for name in names:
+            count = sum(
+                1
+                for endpoint in live
+                if endpoint["direction"] == direction and endpoint["name"] == name
+            )
+            if count > 1:
+                duplicate_endpoints.append(
+                    {"direction": direction, "name": name, "count": count}
+                )
+    other_mcu_names = sorted(
+        {
+            endpoint["name"]
+            for endpoint in live
+            if endpoint["name"].startswith("LogicProMCP-MCU-Internal")
+            and endpoint["name"] != expected
+        }
+    )
+    preference = logic_surface_preference_refs()
+    stale_temporary_refs = sorted(
+        ref
+        for ref in preference["port_refs"]
+        if ref not in live_names
+        and re.search(r"\[(?:standalone|audit|test)[^\]]*\]", ref, re.I)
+    )
+    processes = logicpromcp_processes()
+    process_groups = {}
+    for process in processes:
+        process_groups.setdefault(process["executable"], []).append(process["pid"])
+    duplicate_processes = [
+        {"executable": executable, "pids": pids, "count": len(pids)}
+        for executable, pids in sorted(process_groups.items())
+        if len(pids) > 1
+    ]
+    try:
+        bypass = surfaces_bypass("read")
+    except ProbeError as exc:
+        bypass = {"ok": False, "error": str(exc)}
+
+    blockers = []
+    warnings = []
+    if expected_counts != {"source": 1, "destination": 1}:
+        blockers.append(
+            "expected MCU pair is not exactly one source plus one destination"
+        )
+    if other_mcu_names:
+        blockers.append("other live LogicProMCP MCU namespaces are present")
+    duplicate_mcu_endpoints = [
+        endpoint
+        for endpoint in duplicate_endpoints
+        if endpoint["name"].startswith("LogicProMCP-MCU-Internal")
+    ]
+    if duplicate_mcu_endpoints:
+        blockers.append("duplicate live CoreMIDI endpoint names are present")
+    elif duplicate_endpoints:
+        warnings.append(
+            "non-MCU virtual MIDI names are duplicated by multiple server processes; "
+            "they do not drive the configured control surface"
+        )
+    if duplicate_processes:
+        warnings.append(
+            "multiple server processes are running; stable MCU IDs prevented a second "
+            "MCU pair, but the supervisor should ideally keep one instance"
+        )
+    if stale_temporary_refs:
+        warnings.append(
+            "Logic preferences still reference temporary audit/test ports that are not live"
+        )
+    if bypass.get("bypassed"):
+        warnings.append("all Logic control surfaces are currently bypassed")
+    return {
+        "ok": not blockers,
+        "expected_namespace": namespace,
+        "expected_mcu_name": expected,
+        "expected_mcu_counts": expected_counts,
+        "other_live_mcu_names": other_mcu_names,
+        "duplicate_endpoints": duplicate_endpoints,
+        "duplicate_mcu_endpoints": duplicate_mcu_endpoints,
+        "live_endpoints": live,
+        "server_processes": processes,
+        "duplicate_server_processes": duplicate_processes,
+        "preference_scan": preference,
+        "stale_temporary_preference_refs": stale_temporary_refs,
+        "bypass": bypass,
+        "blockers": blockers,
+        "warnings": warnings,
+        "manual_editing_safe": not blockers and not bypass.get("bypassed", False),
+    }
+
+
 def main_window_index(process: str) -> int:
     raw = osa(
         f'tell application "System Events" to tell process "{process}"\n'

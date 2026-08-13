@@ -14,6 +14,19 @@ def arguments() -> argparse.Namespace:
 
 
 class AuditRunnerTests(unittest.IsolatedAsyncioTestCase):
+    def test_standalone_core_uses_ax_first_track_selection(self):
+        env = runner_module.core_process_environment(
+            "audit-test",
+            {
+                "PATH": "/test/bin",
+                "LOGIC_PRO_MCP_TRACK_SELECT_MCU_FIRST": "1",
+            },
+        )
+
+        self.assertEqual(env["PATH"], "/test/bin")
+        self.assertEqual(env["LOGIC_PRO_MCP_MIDI_INSTANCE_ID"], "audit-test")
+        self.assertEqual(env["LOGIC_PRO_MCP_TRACK_SELECT_MCU_FIRST"], "0")
+
     def test_resource_normalizer_decodes_nested_json_state_only(self):
         payload = {
             "data": {

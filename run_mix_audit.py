@@ -113,6 +113,23 @@ def normalise_resource_value(value: Any) -> Any:
     return value
 
 
+def core_process_environment(
+    midi_instance: str,
+    base: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Build the standalone core environment without selecting through its private MCU.
+
+    The audit process intentionally owns a session-scoped MIDI namespace, so that MCU
+    endpoint is not the control surface registered in Logic. Track selection must use
+    the core server's default AX-first route; the custom runner independently verifies
+    the result against the selected-track Inspector before any solo/mute write.
+    """
+    env = dict(os.environ if base is None else base)
+    env["LOGIC_PRO_MCP_MIDI_INSTANCE_ID"] = str(midi_instance)
+    env["LOGIC_PRO_MCP_TRACK_SELECT_MCU_FIRST"] = "0"
+    return env
+
+
 class AuditRunner:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -800,9 +817,7 @@ class AuditRunner:
         }
 
     async def run(self) -> dict:
-        env = dict(os.environ)
-        env["LOGIC_PRO_MCP_MIDI_INSTANCE_ID"] = self.args.midi_instance
-        env["LOGIC_PRO_MCP_TRACK_SELECT_MCU_FIRST"] = "1"
+        env = core_process_environment(self.args.midi_instance)
         async with AsyncExitStack() as stack:
             await self.connect(stack, "plugins", self.args.python, ROOT / "logic_plugins_mcp.py")
             await self.connect(stack, "audio", self.args.python, ROOT / "logic_audio_mcp.py")

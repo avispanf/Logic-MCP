@@ -67,6 +67,29 @@ def track_name_in_snapshot(observed: str, snapshot_names: set[str]) -> bool:
     )
 
 
+def filter_tracks_by_index_range(
+    tracks: dict,
+    start_index: int = 0,
+    end_index: int | None = None,
+) -> dict:
+    """Return a copied track resource bounded by inclusive project indices."""
+    if start_index < 0:
+        raise ValueError("start_index must be non-negative")
+    if end_index is not None and end_index < start_index:
+        raise ValueError("end_index must be greater than or equal to start_index")
+    bounded = copy.deepcopy(tracks)
+    bounded["data"] = [
+        row
+        for row in tracks.get("data", [])
+        if int(row.get("index", row.get("id", -1))) >= start_index
+        and (
+            end_index is None
+            or int(row.get("index", row.get("id", -1))) <= end_index
+        )
+    ]
+    return bounded
+
+
 class AuditRunner:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -336,6 +359,18 @@ class AuditRunner:
                     "mcu_feedback_accepted": False,
                     "core_result": result,
                     "error": None,
+                }
+            else:
+                result = {
+                    "ok": False,
+                    "success": False,
+                    "verified": False,
+                    "state": "C",
+                    "error": "track selection did not match the Inspector identity",
+                    "index": index,
+                    "expected_track": current.get("name"),
+                    "selection": result,
+                    "identity": identity,
                 }
         else:
             result = await self.tool("core", "logic_tracks", arguments)
@@ -697,6 +732,16 @@ class AuditRunner:
                 )
                 if advanced.get("error"):
                     raise RuntimeError(f"coordinator rejected result: {advanced}")
+                if advanced.get("failed"):
+                    # The coordinator can impose stronger verification requirements
+                    # than the raw tool's `ok` field.  Preserve that failure in the
+                    # durable summary even though cleanup steps must continue.
+                    summary["ok"] = False
+                    summary["verified"] = False
+                    summary["error"] = (
+                        summary.get("error")
+                        or "coordinator marked the step failed; mandatory restore continued"
+                    )
                 step = advanced.get("next_step")
                 if advanced.get("complete"):
                     break
@@ -744,16 +789,16 @@ class AuditRunner:
                     track_count=len(tracks.get("data", [])),
                     project_path=project_path,
                 )
-            if self.args.start_index:
-                tracks = copy.deepcopy(tracks)
-                tracks["data"] = [
-                    row
-                    for row in tracks.get("data", [])
-                    if int(row.get("index", row.get("id", -1))) >= self.args.start_index
-                ]
+            if self.args.start_index or self.args.end_index is not None:
+                tracks = filter_tracks_by_index_range(
+                    tracks,
+                    start_index=self.args.start_index,
+                    end_index=self.args.end_index,
+                )
                 if not tracks["data"]:
                     raise RuntimeError(
-                        f"no project tracks remain at or after index {self.args.start_index}"
+                        "no project tracks remain in requested index range "
+                        f"{self.args.start_index}..{self.args.end_index}"
                     )
             survey = await self.tool(
                 "plugins",
@@ -765,7 +810,7 @@ class AuditRunner:
                     "total_seconds": self.args.survey_seconds,
                 },
             )
-            if self.args.start_index:
+            if self.args.start_index or self.args.end_index is not None:
                 remaining_names = {
                     str(row.get("name") or "").strip().casefold()
                     for row in tracks.get("data", [])
@@ -816,7 +861,11 @@ class AuditRunner:
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(description=__doc__)
     result.add_argument("--scope", default="track", choices=["track", "group", "aux", "bus", "master", "all"])
-    result.add_argument("--selector", default="LEAD VOICE")
+    result.add_argument(
+        "--selector",
+        default="",
+        help="exact target name/ref; empty means every target allowed by --scope",
+    )
     result.add_argument("--measurement", default="bounce_bs1770", choices=["bounce_bs1770", "existing_meter", "both"])
     result.add_argument("--start-position", default="1.1.1.1")
     result.add_argument("--target-name", default="streaming")
@@ -827,6 +876,11 @@ def parser() -> argparse.ArgumentParser:
         help="omit project tracks below this zero-based index (for safe continuation)",
     )
     result.add_argument(
+        "--end-index",
+        type=int,
+        help="omit project tracks above this inclusive zero-based index",
+    )
+    result.add_argument(
         "--tracks-snapshot",
         type=Path,
         help="reuse the ax_live logic://tracks capture from a prior runner JSONL",
@@ -835,7 +889,7 @@ def parser() -> argparse.ArgumentParser:
     result.add_argument("--python", type=Path, default=DEFAULT_PYTHON)
     result.add_argument("--core", type=Path, default=DEFAULT_CORE)
     result.add_argument("--midi-instance", default="standalone-audit")
-    result.add_argument("--strip-limit", type=int, default=64)
+    result.add_argument("--strip-limit", type=int, default=128)
     result.add_argument("--per-strip-seconds", type=int, default=12)
     result.add_argument("--survey-seconds", type=int, default=180)
     result.add_argument("--bounce-timeout", type=int, default=900)

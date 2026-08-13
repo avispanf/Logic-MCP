@@ -615,6 +615,40 @@ def element_reference(path: str, window: int) -> str:
     return reference
 
 
+def plugin_window_preamble(expected_plugin: str, expected_channel: str) -> str:
+    """Build an atomic AppleScript selector for one exact plugin editor.
+
+    Unlike ``window N``, the resulting ``pluginWindow`` object does not change when a
+    sharing overlay moves in front between verification and action.  Both plugin and
+    channel are required and ambiguity is refused inside the same System Events call.
+    """
+    if not expected_plugin or not expected_channel:
+        return ""
+    plugin = apple_script_string(expected_plugin)
+    channel = apple_script_string(expected_channel)
+    return (
+        "set pluginMatches to {}\n"
+        "repeat with pluginCandidate in windows\n"
+        "try\n"
+        f'if subrole of pluginCandidate is "AXDialog" and name of pluginCandidate is {channel} then\n'
+        "set pluginLabels to value of every static text of pluginCandidate\n"
+        f"if pluginLabels contains {plugin} then set end of pluginMatches to pluginCandidate\n"
+        "end if\n"
+        "end try\n"
+        "end repeat\n"
+        'if (count of pluginMatches) is not 1 then error "plugin editor identity is not unique"\n'
+        "set pluginWindow to item 1 of pluginMatches\n"
+    )
+
+
+def plugin_element_reference(path: str, window: int, atomic_identity: bool) -> str:
+    parts = [int(x) for x in path.split(".") if x.strip()]
+    reference = "pluginWindow" if atomic_identity else f"window {int(window)}"
+    for index in parts:
+        reference = f"UI element {index} of {reference}"
+    return reference
+
+
 def walk_window(
     process: str,
     window: int,
@@ -813,6 +847,72 @@ def identity_matches(
     )
 
 
+def resolve_plugin_window(
+    process: str,
+    window_index: int,
+    expected_plugin: str,
+    expected_channel: str,
+) -> dict:
+    """Resolve an editor again when Logic's z-order changes during an operation.
+
+    Window indices are not stable: a system window-sharing overlay or another Logic
+    dialog can appear in front of an already verified editor.  We first try the supplied
+    index, then search only AXDialog windows and accept a relocation only when exactly one
+    editor has the expected plugin *and* channel identity.  Zero or multiple matches fail
+    closed, so this never turns a stale path into a guessed write target.
+    """
+    requested = int(window_index)
+    observed = None
+    try:
+        observed = read_plugin_identity(process, requested)
+    except ProbeError:
+        pass
+    if observed is not None and identity_matches(
+        observed, expected_plugin, expected_channel
+    ):
+        return {
+            "ok": True,
+            "window_index": requested,
+            "identity": observed,
+            "relocated_from": None,
+        }
+
+    matches = []
+    try:
+        windows = ax_windows().get("windows", [])
+    except (ProbeError, AttributeError):
+        windows = []
+    for window in windows:
+        candidate_index = int(window.get("index", 0) or 0)
+        if (
+            candidate_index <= 0
+            or candidate_index == requested
+            or window.get("subrole") != "AXDialog"
+        ):
+            continue
+        try:
+            candidate = read_plugin_identity(process, candidate_index)
+        except ProbeError:
+            continue
+        if identity_matches(candidate, expected_plugin, expected_channel):
+            matches.append((candidate_index, candidate))
+    if len(matches) == 1:
+        resolved_index, identity = matches[0]
+        return {
+            "ok": True,
+            "window_index": resolved_index,
+            "identity": identity,
+            "relocated_from": requested,
+        }
+    return {
+        "ok": False,
+        "window_index": requested,
+        "identity": observed,
+        "matching_window_indices": [index for index, _ in matches],
+        "error": "plugin window identity is stale and could not be uniquely relocated",
+    }
+
+
 @tool
 def ax_windows() -> dict:
     """List Logic's windows with their titles and subroles. Plugin editors appear as
@@ -967,6 +1067,8 @@ def plugin_snapshot(
     max_depth: int = 6,
     budget: int = 1500,
     seconds: int = 60,
+    expected_plugin: str = "",
+    expected_channel: str = "",
 ) -> dict:
     """Read one open plugin editor: which plugin it is, which channel it belongs to, which
     view it is showing, whether it is bypassed, and, when the view is Controls, every
@@ -975,16 +1077,35 @@ def plugin_snapshot(
     runs when Controls view is active, because a plugin drawing its own interface exposes
     thousands of elements and would otherwise time out."""
     name = require_logic()
-    try:
-        identity = read_plugin_identity(name, int(window_index))
-    except ProbeError as exc:
-        return {"window_index": window_index, "error": str(exc)}
+    relocation = None
+    if expected_plugin or expected_channel:
+        resolved = resolve_plugin_window(
+            name, int(window_index), expected_plugin, expected_channel
+        )
+        if not resolved.get("ok"):
+            return {
+                **resolved,
+                "expected": {
+                    "plugin": expected_plugin,
+                    "channel": expected_channel,
+                },
+            }
+        window_index = int(resolved["window_index"])
+        identity = resolved["identity"]
+        relocation = resolved.get("relocated_from")
+    else:
+        try:
+            identity = read_plugin_identity(name, int(window_index))
+        except ProbeError as exc:
+            return {"window_index": window_index, "error": str(exc)}
     result = {
         **identity,
         "view_mode": identity["view_selector"],
         "parameter_count": 0,
         "parameters": [],
     }
+    if relocation is not None:
+        result["relocated_from_window_index"] = relocation
     restore_view, original_size = restorable_plugin_view(
         name, int(window_index), identity
     )
@@ -1041,19 +1162,32 @@ def plugin_parameters(
     tree does not finish; this reads each row directly. Use contains to filter by label,
     and offset with limit to page through a long list."""
     process = require_logic()
+    relocation = None
     if expected_plugin or expected_channel:
-        try:
-            identity = read_plugin_identity(process, int(window_index))
-        except ProbeError as exc:
-            return {"window_index": window_index, "error": str(exc)}
-        if not identity_matches(identity, expected_plugin, expected_channel):
+        resolved = resolve_plugin_window(
+            process, int(window_index), expected_plugin, expected_channel
+        )
+        if not resolved.get("ok"):
             return {
-                "window_index": window_index,
-                "error": "plugin identity changed; refusing to read a stale window",
+                **resolved,
                 "expected": {"plugin": expected_plugin, "channel": expected_channel},
-                "observed": identity,
             }
-    table = find_parameter_table(process, int(window_index))
+        window_index = int(resolved["window_index"])
+        relocation = resolved.get("relocated_from")
+    try:
+        table = find_parameter_table(process, int(window_index))
+    except ProbeError:
+        table = ""
+    if not table and (expected_plugin or expected_channel):
+        refreshed = resolve_plugin_window(
+            process, int(window_index), expected_plugin, expected_channel
+        )
+        if refreshed.get("ok"):
+            window_index = int(refreshed["window_index"])
+            try:
+                table = find_parameter_table(process, int(window_index))
+            except ProbeError:
+                table = ""
     if not table:
         return {
             "window_index": window_index,
@@ -1063,7 +1197,10 @@ def plugin_parameters(
     page_offset = max(0, int(offset))
     page_limit = max(1, min(int(limit), 500))
     needle = contains.lower()
-    reference = element_reference(table, int(window_index))
+    atomic_preamble = plugin_window_preamble(expected_plugin, expected_channel)
+    reference = plugin_element_reference(
+        table, int(window_index), bool(atomic_preamble)
+    )
     start_row = 1 if needle else page_offset + 1
     end_row = "n" if needle else str(page_offset + page_limit)
     fallback_limit = (
@@ -1073,6 +1210,7 @@ def plugin_parameters(
     )
     raw = osa(
         f'tell application "System Events" to tell process "{process}"\n'
+        f"{atomic_preamble}"
         f"set t to {reference}\n"
         "set n to 0\n"
         "try\n"
@@ -1164,7 +1302,7 @@ def plugin_parameters(
     else:
         last_row = parameters[-1].get("row") if parameters else None
         next_offset = last_row if last_row is not None and last_row < row_count else None
-    return {
+    result = {
         "window_index": window_index,
         "table_path": table,
         "rows_total": row_count,
@@ -1175,6 +1313,9 @@ def plugin_parameters(
         "filter": contains or None,
         "parameters": parameters,
     }
+    if relocation is not None:
+        result["relocated_from_window_index"] = relocation
+    return result
 
 
 @tool
@@ -1291,19 +1432,20 @@ def plugin_set_view(
             "error": "view must be Controls, Editor, Vertical, or Horizontal",
         }
     identity = None
+    relocation = None
     if expected_plugin or expected_channel:
-        try:
-            identity = read_plugin_identity(process, int(window_index))
-        except ProbeError as exc:
-            return {"ok": False, "error": str(exc)}
-        if not identity_matches(identity, expected_plugin, expected_channel):
+        resolved = resolve_plugin_window(
+            process, int(window_index), expected_plugin, expected_channel
+        )
+        if not resolved.get("ok"):
             return {
-                "ok": False,
+                **resolved,
                 "write_attempted": False,
-                "error": "plugin identity changed; refusing to operate on a stale window",
                 "expected": {"plugin": expected_plugin, "channel": expected_channel},
-                "observed": identity,
             }
+        window_index = int(resolved["window_index"])
+        identity = resolved["identity"]
+        relocation = resolved.get("relocated_from")
     try:
         shallow = walk_window(process, int(window_index), 1, budget=200, seconds=20)
     except ProbeError as exc:
@@ -1335,17 +1477,43 @@ def plugin_set_view(
         return height > width if requested == "Vertical" else width > height
 
     if identity and view_is_active(identity, view):
-        return {
+        result = {
             "ok": True,
             "verified": True,
+            "window_index": window_index,
             "view": view,
             "raw_view": current,
             "changed": False,
             "note": "already in that view",
         }
-    reference = element_reference(menu["path"], int(window_index))
+        if relocation is not None:
+            result["relocated_from_window_index"] = relocation
+        return result
+    atomic_preamble = plugin_window_preamble(expected_plugin, expected_channel)
+    reference = plugin_element_reference(
+        menu["path"], int(window_index), bool(atomic_preamble)
+    )
+
+    def perform_plugin_action(action: str, target_reference: str) -> None:
+        osa(
+            'tell application "System Events"\n'
+            f'tell process "{process}"\n'
+            f"{atomic_preamble}"
+            f'perform action "{action}" of {target_reference}\n'
+            "end tell\n"
+            "end tell",
+            timeout=30,
+        )
 
     def read_view_items() -> list[dict]:
+        nonlocal window_index
+        if expected_plugin or expected_channel:
+            current_window = resolve_plugin_window(
+                process, int(window_index), expected_plugin, expected_channel
+            )
+            if not current_window.get("ok"):
+                return []
+            window_index = int(current_window["window_index"])
         scoped = walk_window(
             process,
             int(window_index),
@@ -1376,33 +1544,24 @@ def plugin_set_view(
 
     try:
         try:
-            osa(
-                f'tell application "System Events" to tell process "{process}" to '
-                f'perform action "AXShowMenu" of {reference}',
-                timeout=30,
-            )
+            perform_plugin_action("AXShowMenu", reference)
         except ProbeError:
-            osa(
-                f'tell application "System Events" to tell process "{process}" to '
-                f'perform action "AXPress" of {reference}',
-                timeout=30,
-            )
+            perform_plugin_action("AXPress", reference)
         time.sleep(0.6)
         menu_items = read_view_items()
-        if not menu_items:
-            # AXShowMenu can report success without opening this control. Dismiss any
-            # transient state, then use the ordinary press action and read it again.
+        for _ in range(3):
+            if menu_items:
+                break
+            # AXShowMenu can report success without opening this control, and a
+            # window-sharing overlay can steal the first transient popup. Dismiss it,
+            # press the verified View control again, and re-read the offered items.
             osa(
                 f'tell application "System Events" to tell process "{process}" to key code 53',
                 timeout=10,
             )
             time.sleep(0.2)
-            osa(
-                f'tell application "System Events" to tell process "{process}" to '
-                f'perform action "AXPress" of {reference}',
-                timeout=30,
-            )
-            time.sleep(0.6)
+            perform_plugin_action("AXPress", reference)
+            time.sleep(0.8)
             menu_items = read_view_items()
     except ProbeError as exc:
         return {"ok": False, "error": f"could not open the view menu: {exc}"}
@@ -1420,23 +1579,38 @@ def plugin_set_view(
         offered = [e["name"] for e in menu_items]
         return {"ok": False, "error": f"{view!r} not offered", "available": offered}
     try:
-        osa(
-            f'tell application "System Events" to tell process "{process}" to '
-            f'perform action "AXPress" of {element_reference(target["path"], int(window_index))}',
-            timeout=30,
+        perform_plugin_action(
+            "AXPress",
+            plugin_element_reference(
+                target["path"], int(window_index), bool(atomic_preamble)
+            ),
         )
     except ProbeError as exc:
         return {"ok": False, "error": f"could not select {view!r}: {exc}"}
     time.sleep(1.0)
     try:
-        after_identity = read_plugin_identity(process, int(window_index))
+        if expected_plugin or expected_channel:
+            after_window = resolve_plugin_window(
+                process, int(window_index), expected_plugin, expected_channel
+            )
+            if not after_window.get("ok"):
+                return {
+                    **after_window,
+                    "ok": False,
+                    "error": "selected but exact editor could not be relocated for readback",
+                }
+            window_index = int(after_window["window_index"])
+            after_identity = after_window["identity"]
+        else:
+            after_identity = read_plugin_identity(process, int(window_index))
     except ProbeError as exc:
         return {"ok": False, "error": f"selected but could not verify: {exc}"}
     now = after_identity["view_selector"]
     matches = view_is_active(after_identity, view)
-    return {
+    result = {
         "ok": matches,
         "verified": matches,
+        "window_index": window_index,
         "view": view if matches else now,
         "observed_view": now,
         "raw_view": after_identity.get("raw_view_selector"),
@@ -1444,6 +1618,9 @@ def plugin_set_view(
         "selected_menu_item": target["name"],
         "changed": now != current,
     }
+    if relocation is not None:
+        result["relocated_from_window_index"] = relocation
+    return result
 
 
 @tool
@@ -1490,18 +1667,18 @@ def plugin_close_verified(
     process = require_logic()
     if not (expected_plugin or expected_channel):
         return {"ok": False, "error": "expected_plugin or expected_channel is required"}
-    try:
-        identity = read_plugin_identity(process, int(window_index))
-    except ProbeError as exc:
-        return {"ok": False, "error": str(exc)}
-    if not identity_matches(identity, expected_plugin, expected_channel):
+    resolved = resolve_plugin_window(
+        process, int(window_index), expected_plugin, expected_channel
+    )
+    if not resolved.get("ok"):
         return {
-            "ok": False,
+            **resolved,
             "write_attempted": False,
-            "error": "plugin identity changed; refusing to close a different window",
             "expected": {"plugin": expected_plugin, "channel": expected_channel},
-            "observed": identity,
         }
+    window_index = int(resolved["window_index"])
+    identity = resolved["identity"]
+    relocation = resolved.get("relocated_from")
     try:
         top = walk_window(process, int(window_index), 0, budget=80, seconds=10)
     except ProbeError as exc:
@@ -1522,18 +1699,30 @@ def plugin_close_verified(
             "identity": identity,
         }
     if dry_run:
-        return {
+        result = {
             "ok": True,
             "dry_run": True,
+            "window_index": window_index,
             "identity": identity,
             "close_path": close_button["path"],
             "note": "nothing was closed",
         }
+        if relocation is not None:
+            result["relocated_from_window_index"] = relocation
+        return result
     before = ax_windows()
+    atomic_preamble = plugin_window_preamble(expected_plugin, expected_channel)
+    close_reference = plugin_element_reference(
+        close_button["path"], int(window_index), bool(atomic_preamble)
+    )
     try:
         osa(
-            f'tell application "System Events" to tell process "{process}" to '
-            f'perform action "AXPress" of {element_reference(close_button["path"], int(window_index))}',
+            'tell application "System Events"\n'
+            f'tell process "{process}"\n'
+            f"{atomic_preamble}"
+            f'perform action "AXPress" of {close_reference}\n'
+            "end tell\n"
+            "end tell",
             timeout=20,
         )
     except ProbeError as exc:
@@ -1541,14 +1730,18 @@ def plugin_close_verified(
     time.sleep(0.4)
     after = ax_windows()
     closed = after["count"] < before["count"]
-    return {
+    result = {
         "ok": closed,
         "verified": closed,
+        "window_index": window_index,
         "identity": identity,
         "windows_before": before["count"],
         "windows_after": after["count"],
         "note": "window count did not decrease" if not closed else "",
     }
+    if relocation is not None:
+        result["relocated_from_window_index"] = relocation
+    return result
 
 
 @tool
@@ -1583,30 +1776,26 @@ def plugin_write_path(
             "to identity returned by plugin_snapshot",
         }
     if expected_plugin or expected_channel:
-        try:
-            identity = read_plugin_identity(process, int(window_index))
-        except ProbeError as exc:
+        resolved = resolve_plugin_window(
+            process, int(window_index), expected_plugin, expected_channel
+        )
+        if not resolved.get("ok"):
             return {
-                "ok": False,
+                **resolved,
                 "verified": False,
                 "write_attempted": False,
-                "error": f"could not verify plugin identity: {exc}",
-            }
-        if not identity_matches(identity, expected_plugin, expected_channel):
-            return {
-                "ok": False,
-                "verified": False,
-                "write_attempted": False,
-                "error": "plugin identity changed; refusing the stale path",
                 "expected": {
                     "plugin": expected_plugin or None,
                     "channel": expected_channel or None,
                 },
-                "observed": identity,
             }
-    reference = element_reference(path, int(window_index))
+        window_index = int(resolved["window_index"])
+    atomic_preamble = plugin_window_preamble(expected_plugin, expected_channel)
+    reference = plugin_element_reference(
+        path, int(window_index), bool(atomic_preamble)
+    )
     try:
-        role, current = read_role_and_value(process, reference)
+        role, current = read_role_and_value(process, reference, atomic_preamble)
     except ProbeError as exc:
         return {"ok": False, "error": f"path does not resolve: {exc}"}
     if role == "AXGroup":
@@ -1617,6 +1806,7 @@ def plugin_write_path(
             value,
             dry_run=dry_run,
             max_steps=max_steps,
+            atomic_preamble=atomic_preamble,
         )
     if role not in WRITABLE_ROLES and role not in NUMERIC_ROLES:
         return {
@@ -1644,15 +1834,19 @@ def plugin_write_path(
     try:
         if toggle:
             for _ in range(3):
-                if values_match(value, read_value(process, reference)):
+                if values_match(value, read_value(process, reference, atomic_preamble)):
                     break
                 osa(
-                    f'tell application "System Events" to tell process "{process}" to '
-                    f'perform action "AXPress" of {reference}',
+                    'tell application "System Events"\n'
+                    f'tell process "{process}"\n'
+                    f"{atomic_preamble}"
+                    f'perform action "AXPress" of {reference}\n'
+                    "end tell\n"
+                    "end tell",
                     timeout=30,
                 )
                 time.sleep(0.35)
-            observed = read_value(process, reference)
+            observed = read_value(process, reference, atomic_preamble)
             return {
                 "ok": values_match(value, observed),
                 "verified": values_match(value, observed),
@@ -1666,8 +1860,8 @@ def plugin_write_path(
                 else "a checkbox is toggled by pressing it, and it did not reach the "
                 "requested state within three presses",
             }
-        send_value(process, reference, value, numeric)
-        observed = read_value(process, reference)
+        send_value(process, reference, value, numeric, atomic_preamble)
+        observed = read_value(process, reference, atomic_preamble)
     except ProbeError as exc:
         return {"ok": False, "verified": False, "error": str(exc), "before": current}
     if values_match(value, observed):
@@ -1698,8 +1892,8 @@ def plugin_write_path(
     while steps < int(max_steps):
         previous = observed
         try:
-            send_value(process, reference, value, numeric)
-            observed = read_value(process, reference)
+            send_value(process, reference, value, numeric, atomic_preamble)
+            observed = read_value(process, reference, atomic_preamble)
         except ProbeError as exc:
             reason = f"stepping failed: {exc}"
             break
@@ -1741,10 +1935,13 @@ def plugin_write_path(
     }
 
 
-def resolve_group_control(process: str, group_reference: str) -> tuple[str, str]:
+def resolve_group_control(
+    process: str, group_reference: str, atomic_preamble: str = ""
+) -> tuple[str, str]:
     """Resolve the single writable child of a Controls-table display group."""
     raw = osa(
         f'tell application "System Events" to tell process "{process}"\n'
+        f"{atomic_preamble}"
         f"set g to {group_reference}\n"
         "set n to count of UI elements of g\n"
         'if n is not 1 then return (n as string) & "~"\n'
@@ -1769,6 +1966,7 @@ def write_group_display_control(
     *,
     dry_run: bool,
     max_steps: int,
+    atomic_preamble: str = "",
 ) -> dict:
     """Write a wrapped Controls-table parameter while verifying its display value.
 
@@ -1777,9 +1975,11 @@ def write_group_display_control(
     number (for example 190). Directional AXIncrement/AXDecrement on the child plus
     read-back from the parent is the only safe mapping-free write.
     """
-    before = read_value(process, group_reference)
+    before = read_value(process, group_reference, atomic_preamble)
     try:
-        control_reference, control_role = resolve_group_control(process, group_reference)
+        control_reference, control_role = resolve_group_control(
+            process, group_reference, atomic_preamble
+        )
     except ProbeError as exc:
         return {
             "ok": False,
@@ -1827,7 +2027,7 @@ def write_group_display_control(
             }
         action = "AXIncrement" if target_number > current_number else "AXDecrement"
         budget = max(1, min(int(max_steps), 256))
-        control_raw = read_value(process, control_reference)
+        control_raw = read_value(process, control_reference, atomic_preamble)
     trail = [before]
     raw_trail = [control_raw] if control_raw is not None else []
     observed = before
@@ -1835,14 +2035,18 @@ def write_group_display_control(
         previous = observed
         try:
             osa(
-                f'tell application "System Events" to tell process "{process}" to '
-                f'perform action "{action}" of {control_reference}',
+                'tell application "System Events"\n'
+                f'tell process "{process}"\n'
+                f"{atomic_preamble}"
+                f'perform action "{action}" of {control_reference}\n'
+                "end tell\n"
+                "end tell",
                 timeout=20,
             )
             time.sleep(0.12)
-            observed = read_value(process, group_reference)
+            observed = read_value(process, group_reference, atomic_preamble)
             observed_raw = (
-                read_value(process, control_reference)
+                read_value(process, control_reference, atomic_preamble)
                 if control_role not in ("AXCheckBox", "AXRadioButton")
                 else None
             )
@@ -1901,10 +2105,20 @@ def write_group_display_control(
                 for fine_step in range(step + 1, budget + 1):
                     prior_raw = raw_trail[-1]
                     try:
-                        send_value(process, control_reference, target_raw_text, numeric=True)
+                        send_value(
+                            process,
+                            control_reference,
+                            target_raw_text,
+                            numeric=True,
+                            atomic_preamble=atomic_preamble,
+                        )
                         time.sleep(0.12)
-                        observed = read_value(process, group_reference)
-                        observed_raw = read_value(process, control_reference)
+                        observed = read_value(
+                            process, group_reference, atomic_preamble
+                        )
+                        observed_raw = read_value(
+                            process, control_reference, atomic_preamble
+                        )
                     except ProbeError as exc:
                         reason = f"calibrated raw stepping failed: {exc}"
                         break
@@ -2201,27 +2415,47 @@ def send_key(process: str, kind: str, key, modifiers: list[str]) -> None:
     )
 
 
-def read_role_and_value(process: str, reference: str) -> tuple[str, str]:
+def read_role_and_value(
+    process: str, reference: str, atomic_preamble: str = ""
+) -> tuple[str, str]:
     raw = osa(
-        f'tell application "System Events" to tell process "{process}" to '
-        f'return (role of {reference} as string) & "~" & (value of {reference} as string)'
+        'tell application "System Events"\n'
+        f'tell process "{process}"\n'
+        f"{atomic_preamble}"
+        f'return (role of {reference} as string) & "~" & (value of {reference} as string)\n'
+        "end tell\n"
+        "end tell"
     )
     role, _, value = raw.partition("~")
     return role, value
 
 
-def read_value(process: str, reference: str) -> str:
+def read_value(process: str, reference: str, atomic_preamble: str = "") -> str:
     return osa(
-        f'tell application "System Events" to tell process "{process}" to '
-        f"return value of {reference} as string"
+        'tell application "System Events"\n'
+        f'tell process "{process}"\n'
+        f"{atomic_preamble}"
+        f"return value of {reference} as string\n"
+        "end tell\n"
+        "end tell"
     )
 
 
-def send_value(process: str, reference: str, value: str, numeric: bool) -> None:
+def send_value(
+    process: str,
+    reference: str,
+    value: str,
+    numeric: bool,
+    atomic_preamble: str = "",
+) -> None:
     literal = value if numeric else apple_script_string(value)
     osa(
-        f'tell application "System Events" to tell process "{process}" to '
-        f"set value of {reference} to {literal}",
+        'tell application "System Events"\n'
+        f'tell process "{process}"\n'
+        f"{atomic_preamble}"
+        f"set value of {reference} to {literal}\n"
+        "end tell\n"
+        "end tell",
         timeout=60,
     )
 
@@ -3412,6 +3646,29 @@ def selected_track_identity(expected_track: str = "") -> dict:
     }
 
 
+@tool
+def selected_track_read_strip(expected_track: str) -> dict:
+    """Read the selected track through the Inspector's always-visible channel strip.
+
+    Mixer strips outside the horizontal viewport expose generic insert labels in Logic
+    12.3.  The selected-track Inspector is a stronger binding: selection is verified by
+    its name first, then the same strip parser returns exact insert paths and names.
+    """
+    identity = selected_track_identity(expected_track)
+    if not identity.get("verified"):
+        return identity
+    observed = str(identity.get("observed_track") or "")
+    result = mixer_read_strip(str(identity["strip_path"]), observed)
+    verified = result.get("ok") is True
+    return {
+        **result,
+        "verified": verified,
+        "expected_track": expected_track,
+        "selection_verified": identity.get("verified") is True,
+        "verification_source": "selected-track Inspector",
+    }
+
+
 def track_identity_matches(observed: str, expected: str) -> bool:
     """Compare exact Logic track identities with one measured output alias.
 
@@ -3764,9 +4021,9 @@ def parse_strip(label: str, path: str, kids: list) -> dict:
     detail_missing = []
     if row.get("fader_db") is None:
         detail_missing.append("fader level in dB")
-    if row["inserts"] and all(i in generic for i in row["inserts"]):
+    if row["inserts"] and any(i in generic for i in row["inserts"]):
         detail_missing.append("plugin names")
-    if row["sends"] and all(s["bus"] in generic for s in row["sends"]):
+    if row["sends"] and any(s["bus"] in generic for s in row["sends"]):
         detail_missing.append("send destinations")
     if detail_missing:
         row["detail"] = "partial"
@@ -3849,7 +4106,11 @@ def mixer_reveal_strip(
         )
         current_strip = parse_strip("", strip_path, current_kids)
         current_name = current_strip.get("name") or ""
-        if current_name and current_name.casefold() == expected_strip.casefold():
+        if (
+            current_name
+            and current_name.casefold() == expected_strip.casefold()
+            and current_strip.get("detail") == "full"
+        ):
             return {
                 "ok": True,
                 "verified": True,
@@ -4257,17 +4518,17 @@ def plugin_meter_read(
     reads the editor view and reports only observable values. It refuses a shifted window
     identity and does not invent LUFS/peak values when a plugin does not expose them."""
     process = require_logic()
-    try:
-        identity = read_plugin_identity(process, int(window_index))
-    except ProbeError as exc:
-        return {"ok": False, "error": f"could not identify meter window: {exc}"}
-    if not identity_matches(identity, expected_plugin, expected_channel):
+    resolved = resolve_plugin_window(
+        process, int(window_index), expected_plugin, expected_channel
+    )
+    if not resolved.get("ok"):
         return {
-            "ok": False,
-            "error": "meter window identity changed",
+            **resolved,
             "expected": {"plugin": expected_plugin, "channel": expected_channel},
-            "observed": identity,
         }
+    window_index = int(resolved["window_index"])
+    identity = resolved["identity"]
+    relocation = resolved.get("relocated_from")
     try:
         elements = walk_window(
             process,
@@ -4318,8 +4579,9 @@ def plugin_meter_read(
             continue
         seen.add((entry["path"], text_value))
         readouts.append({**entry, "text": text_value})
-    return {
+    result = {
         "ok": True,
+        "window_index": window_index,
         "identity": identity,
         "readout_count": len(readouts),
         "readouts": readouts,
@@ -4328,6 +4590,9 @@ def plugin_meter_read(
         if not readouts
         else "values are raw plugin readouts and should be interpreted by label and unit",
     }
+    if relocation is not None:
+        result["relocated_from_window_index"] = relocation
+    return result
 
 
 def select_open_logic_project(project_title: str, candidates: list[Path]) -> Path | None:

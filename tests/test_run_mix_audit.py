@@ -14,6 +14,22 @@ def arguments() -> argparse.Namespace:
 
 
 class AuditRunnerTests(unittest.IsolatedAsyncioTestCase):
+    def test_cli_does_not_silently_narrow_all_scope(self):
+        parsed = runner_module.parser().parse_args(["--scope", "all", "--confirmed"])
+        self.assertEqual(parsed.selector, "")
+
+    def test_track_index_range_is_inclusive_and_does_not_mutate_source(self):
+        source = {"data": [{"id": index, "name": f"Track {index}"} for index in range(12)]}
+
+        bounded = runner_module.filter_tracks_by_index_range(source, 2, 7)
+
+        self.assertEqual([row["id"] for row in bounded["data"]], list(range(2, 8)))
+        self.assertEqual(len(source["data"]), 12)
+
+    def test_track_index_range_rejects_reversed_bounds(self):
+        with self.assertRaisesRegex(ValueError, "greater than or equal"):
+            runner_module.filter_tracks_by_index_range({"data": []}, 8, 7)
+
     def test_snapshot_filter_keeps_only_exact_names_and_master_alias(self):
         names = {"lead voice", "master"}
         self.assertTrue(runner_module.track_name_in_snapshot("LEAD VOICE", names))
@@ -158,6 +174,31 @@ class AuditRunnerTests(unittest.IsolatedAsyncioTestCase):
             ],
         )
 
+    async def test_select_fails_when_inspector_identity_does_not_match(self):
+        runner = runner_module.AuditRunner(arguments())
+        runner.track_state = {
+            54: {"name": "Master", "solo": False, "mute": False, "selected": False}
+        }
+        runner.tool = mock.AsyncMock(
+            side_effect=[
+                {"ok": True, "verified": True, "state": "A"},
+                {
+                    "ok": False,
+                    "verified": False,
+                    "observed_track": "BASS verse low",
+                    "expected_track": "Master",
+                },
+            ]
+        )
+
+        result = await runner.execute_track_child(
+            {"command": "select", "params": {"index": 54}}
+        )
+
+        self.assertFalse(result["verified"])
+        self.assertIn("Inspector identity", result["error"])
+        self.assertFalse(runner.track_state[54]["selected"])
+
     async def test_known_playback_state_is_no_op(self):
         runner = runner_module.AuditRunner(arguments())
         runner.transport_playing = False
@@ -257,6 +298,31 @@ class AuditRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["pages_completed"], 2)
         self.assertEqual([row["row"] for row in result["parameters"]], [1, 2, 3])
         self.assertEqual(runner.tool.await_args_list[1].args[2]["offset"], 2)
+
+    async def test_coordinator_verification_failure_is_kept_in_summary(self):
+        args = arguments()
+        args.max_steps = 10
+        runner = runner_module.AuditRunner(args)
+        runner.plan = {"plan_id": "audit-test"}
+        step = {
+            "step_id": "inspect",
+            "phase": "inspect",
+            "operation": "selected_track_read_strip",
+            "target_id": "track-1",
+        }
+        runner.tool = mock.AsyncMock(
+            side_effect=[
+                {"next_step": step},
+                {"failed": True, "complete": True, "next_step": None},
+            ]
+        )
+        runner.invoke = mock.AsyncMock(return_value={"ok": True})
+        runner.emit = mock.Mock()
+
+        result = await runner.run_plan()
+
+        self.assertEqual(len(result["failed_steps"]), 1)
+        self.assertIn("coordinator marked", result["failed_steps"][0]["error"])
 
 
 if __name__ == "__main__":

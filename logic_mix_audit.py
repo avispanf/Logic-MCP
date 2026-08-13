@@ -576,10 +576,12 @@ def build_plugin_inspection_steps(prefix: str, target: dict, inserts: list[str])
                     "inspect",
                     "logic-plugins",
                     "plugin_snapshot",
-                    {"window_index": 1},
-                    arguments_from={
-                        "window_index": f"{plugin_prefix}-open.window_index"
+                    {
+                        "window_index": 1,
+                        "expected_plugin": plugin,
+                        "expected_channel": surface_name,
                     },
+                    arguments_from=identity_sources,
                     target_id=target["audit_id"],
                     plugin=plugin,
                 ),
@@ -817,7 +819,16 @@ def build_audit_plan(
         prefix = f"target-{position:03d}-{target['audit_id']}"
         refs = target.get("isolation_refs", [])
         surface_index = _integer(target.get("surface_index"))
-        if (
+        inspect_via_selected_track = (
+            target.get("kind") == "track"
+            and "tracks" in target.get("sources", [])
+        )
+        if inspect_via_selected_track:
+            # Selection is made explicit during isolation. Reading the always-visible
+            # Inspector afterwards avoids generic names from off-screen Mixer strips and
+            # gives plugin_open_insert a verified, current path.
+            pass
+        elif (
             "tracks" in target.get("sources", [])
             and target.get("strip_path")
             and surface_index is not None
@@ -857,7 +868,7 @@ def build_audit_plan(
                     target_id=target["audit_id"],
                 )
             )
-        if target.get("strip_path"):
+        if target.get("strip_path") and not inspect_via_selected_track:
             surface_name = _surface_name(target)
             steps.extend(
                 [
@@ -904,6 +915,20 @@ def build_audit_plan(
                 compensation={"restore_from": "initial_state"},
             )
         )
+        if inspect_via_selected_track:
+            steps.append(
+                _step(
+                    f"{prefix}-read-selected-strip",
+                    "inspect",
+                    "logic-plugins",
+                    "selected_track_read_strip",
+                    {"expected_track": target.get("name", "")},
+                    target_id=target["audit_id"],
+                    requires_verified_result=True,
+                    expand_plugin_steps=True,
+                    plugin_prefix=prefix,
+                )
+            )
         steps.append(
             _step(
                 f"{prefix}-locate",
@@ -1171,8 +1196,12 @@ def build_fix_plan(inventory: dict, fixes: list[dict], project_path: str) -> dic
                     "fix",
                     "logic-plugins",
                     "plugin_snapshot",
-                    {"window_index": 1},
-                    arguments_from={"window_index": f"{prefix}-open.window_index"},
+                    {
+                        "window_index": 1,
+                        "expected_plugin": fix["plugin"],
+                        "expected_channel": surface_name,
+                    },
+                    arguments_from=identity_sources,
                     target_id=target["audit_id"],
                 ),
                 _step(
@@ -1424,6 +1453,24 @@ def build_isolation_dispatch(
                     },
                 }
             )
+    if (
+        not target_is_master
+        and "tracks" in target.get("sources", [])
+        and target_index is not None
+    ):
+        # Solo state can already match the desired target, in which case no toggle is
+        # emitted.  Selection must still be explicit so the Inspector inventory is
+        # bound to this exact project index on every target.
+        dispatches.append(
+            {
+                "server": "logic-pro",
+                "operation": "logic_tracks",
+                "arguments": {
+                    "command": "select",
+                    "params": {"index": int(target_index)},
+                },
+            }
+        )
     for row in ax_state or []:
         if row.get("track_ref") or not row.get("strip_path"):
             continue

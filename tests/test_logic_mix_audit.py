@@ -305,6 +305,23 @@ class InventoryTests(unittest.TestCase):
 
 
 class PlanTests(unittest.TestCase):
+    def test_project_master_without_surface_records_limitation(self):
+        inventory = audit.normalise_inventory(
+            {"data": [{"index": 55, "name": "Master", "type": "Output"}]},
+            None,
+            None,
+        )
+        plan = audit.build_audit_plan(
+            inventory,
+            "master",
+            "",
+            "/tmp/Test.logicx",
+            "/tmp/logic-audits",
+        )
+        operations = [step["operation"] for step in plan["steps"]]
+        self.assertIn("record_limitation", operations)
+        self.assertNotIn("selected_track_read_strip", operations)
+
     def test_plan_has_isolation_bounce_analysis_and_restore(self):
         inventory = audit.normalise_inventory(
             {"data": [{"index": 0, "name": "Kick", "type": "Audio", "target_ref": "trk_kick"}]},
@@ -322,9 +339,17 @@ class PlanTests(unittest.TestCase):
         self.assertIn("mix_isolation_dispatch", operations)
         self.assertIn("mix_bounce_target", operations)
         self.assertIn("loudness_measure", operations)
-        self.assertIn("mixer_reveal_strip", operations)
-        read_strip = next(step for step in plan["steps"] if step["operation"] == "mixer_read_strip")
+        self.assertIn("selected_track_read_strip", operations)
+        self.assertNotIn("mixer_reveal_strip", operations)
+        read_strip = next(
+            step for step in plan["steps"]
+            if step["operation"] == "selected_track_read_strip"
+        )
         self.assertTrue(read_strip["expand_plugin_steps"])
+        self.assertGreater(
+            operations.index("selected_track_read_strip"),
+            operations.index("mix_isolation_dispatch"),
+        )
         expanded = audit.build_plugin_inspection_steps("target", plan["targets"][0], ["Channel EQ"])
         expanded_operations = [step["operation"] for step in expanded]
         self.assertIn("plugin_set_view", expanded_operations)
@@ -396,14 +421,12 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(project_audit["operation"], "logic_project")
         self.assertEqual(project_audit["arguments"], {"command": "audit", "params": {}})
         inventory_step = next(
-            step
-            for step in plan["steps"]
-            if step["operation"] == "logic_plugins"
-            and step["arguments"].get("command") == "get_inventory"
+            step for step in plan["steps"]
+            if step["operation"] == "selected_track_read_strip"
         )
         self.assertEqual(
             inventory_step["arguments"],
-            {"command": "get_inventory", "params": {"track": 0}},
+            {"expected_track": "Kick"},
         )
         locate = next(
             step
@@ -414,7 +437,7 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(locate["arguments"], {"position": "1.1.1.1", "dry_run": False})
         self.assertTrue(locate["requires_verified_result"])
 
-    def test_plugin_inventory_uses_surface_index_not_project_track_index(self):
+    def test_project_track_inventory_uses_selected_inspector_not_surface_index(self):
         inventory = audit.normalise_inventory(
             {
                 "data": [
@@ -444,14 +467,15 @@ class PlanTests(unittest.TestCase):
             "/tmp/logic-audits",
         )
         inventory_step = next(
-            step for step in plan["steps"] if step["operation"] == "logic_plugins"
+            step for step in plan["steps"]
+            if step["operation"] == "selected_track_read_strip"
         )
         self.assertEqual(
             inventory_step["arguments"],
-            {"command": "get_inventory", "params": {"track": 0}},
+            {"expected_track": "Lead"},
         )
 
-    def test_offscreen_project_track_records_plugin_inspection_limitation(self):
+    def test_offscreen_project_track_uses_selected_inspector(self):
         inventory = audit.normalise_inventory(
             {
                 "data": [
@@ -468,12 +492,10 @@ class PlanTests(unittest.TestCase):
             "/tmp/Test.logicx",
             "/tmp/logic-audits",
         )
-        self.assertFalse(any(step["operation"] == "logic_plugins" for step in plan["steps"]))
-        limitation = next(
-            step for step in plan["steps"] if step["operation"] == "record_limitation"
-        )
-        self.assertEqual(limitation["arguments"]["project_index"], 4)
-        self.assertIn("no corroborated", limitation["arguments"]["reason"])
+        operations = [step["operation"] for step in plan["steps"]]
+        self.assertIn("selected_track_read_strip", operations)
+        self.assertNotIn("record_limitation", operations)
+        self.assertNotIn("mixer_reveal_strip", operations)
 
     def test_mixer_only_aux_uses_verified_ax_solo_not_track_index(self):
         inventory = audit.normalise_inventory(
@@ -768,11 +790,16 @@ class RestoreTests(unittest.TestCase):
             [{"name": "Lead", "strip_path": "9.2.1", "solo": "off"}],
         )
         self.assertTrue(result["complete"])
-        self.assertEqual(result["dispatch_count"], 1)
+        self.assertEqual(result["dispatch_count"], 2)
         self.assertEqual(
             result["dispatches"][0]["operation"], "arrange_track_set_toggle"
         )
         self.assertEqual(result["dispatches"][0]["arguments"]["expected_track"], "Lead")
+        self.assertEqual(result["dispatches"][1]["operation"], "logic_tracks")
+        self.assertEqual(
+            result["dispatches"][1]["arguments"],
+            {"command": "select", "params": {"index": 1}},
+        )
 
     def test_unique_visible_project_track_restores_only_through_arrange(self):
         result = audit.build_restore_dispatch(

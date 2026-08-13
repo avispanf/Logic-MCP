@@ -2,6 +2,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 import tempfile
+import itertools
 
 import logic_plugins_mcp as plugins
 
@@ -87,6 +88,24 @@ class ArrangeTrackToggleTests(unittest.TestCase):
         self.assertTrue(plugins.track_identity_matches("LEAD VOICE", "LEAD VOICE"))
         self.assertFalse(plugins.track_identity_matches("Output 1-2", "Master"))
         self.assertFalse(plugins.track_identity_matches("Stereo Out", "Master 2"))
+
+    def test_selected_track_strip_reuses_verified_inspector_path(self):
+        identity = {
+            "ok": True,
+            "verified": True,
+            "observed_track": "Lead",
+            "strip_path": "7.1.4.1.1",
+        }
+        strip = {"ok": True, "name": "Lead", "path": "7.1.4.1.1", "inserts": ["Pro-DS"]}
+        with (
+            mock.patch.object(plugins, "selected_track_identity", return_value=identity),
+            mock.patch.object(plugins, "mixer_read_strip", return_value=strip) as read,
+        ):
+            result = plugins.selected_track_read_strip("Lead")
+        read.assert_called_once_with("7.1.4.1.1", "Lead")
+        self.assertTrue(result["verified"])
+        self.assertTrue(result["selection_verified"])
+        self.assertEqual(result["inserts"], ["Pro-DS"])
 
     def test_toggle_is_bound_to_exact_index_name_and_checkbox_readback(self):
         children = [
@@ -381,6 +400,69 @@ class SurfaceDoctorTests(unittest.TestCase):
 
 
 class ParameterTableTests(unittest.TestCase):
+    def test_plugin_window_is_uniquely_relocated_after_z_order_shift(self):
+        overlay = {"plugin": "", "channel": "", "view_selector": ""}
+        wanted = {
+            "plugin": "Pro-MB",
+            "channel": "Stereo Out",
+            "view_selector": "Controls",
+        }
+        with (
+            mock.patch.object(
+                plugins,
+                "ax_windows",
+                return_value={
+                    "windows": [
+                        {"index": 1, "subrole": "AXDialog"},
+                        {"index": 2, "subrole": "AXStandardWindow"},
+                        {"index": 3, "subrole": "AXDialog"},
+                    ]
+                },
+            ),
+            mock.patch.object(
+                plugins,
+                "read_plugin_identity",
+                side_effect=lambda _process, index: overlay if index == 1 else wanted,
+            ),
+        ):
+            result = plugins.resolve_plugin_window(
+                "Logic Pro", 1, "Pro-MB", "Stereo Out"
+            )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["window_index"], 3)
+        self.assertEqual(result["relocated_from"], 1)
+
+    def test_plugin_window_relocation_fails_closed_when_ambiguous(self):
+        overlay = {"plugin": "", "channel": "", "view_selector": ""}
+        wanted = {
+            "plugin": "Pro-MB",
+            "channel": "Stereo Out",
+            "view_selector": "Controls",
+        }
+        with (
+            mock.patch.object(
+                plugins,
+                "ax_windows",
+                return_value={
+                    "windows": [
+                        {"index": 1, "subrole": "AXDialog"},
+                        {"index": 3, "subrole": "AXDialog"},
+                        {"index": 4, "subrole": "AXDialog"},
+                    ]
+                },
+            ),
+            mock.patch.object(
+                plugins,
+                "read_plugin_identity",
+                side_effect=lambda _process, index: overlay if index == 1 else wanted,
+            ),
+        ):
+            result = plugins.resolve_plugin_window(
+                "Logic Pro", 1, "Pro-MB", "Stereo Out"
+            )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["matching_window_indices"], [3, 4])
+
     def test_unfiltered_next_offset_uses_last_returned_row(self):
         rows = "100#" + "".join(
             f"{number}~Band {number}~0~AXGroup|:|" for number in range(41, 81)
@@ -442,6 +524,33 @@ class MixerParsingTests(unittest.TestCase):
         self.assertTrue(result["already_visible"])
         self.assertEqual(osa.call_count, 1)
 
+    def test_reveal_scrolls_when_matching_strip_still_has_partial_detail(self):
+        partial = {
+            "name": "Lead",
+            "detail": "partial",
+            "inserts": ["audio plug-in"],
+        }
+        full = {
+            "name": "Lead",
+            "detail": "full",
+            "inserts": ["Channel EQ"],
+        }
+        with (
+            mock.patch.object(plugins, "require_logic", return_value="Logic Pro"),
+            mock.patch.object(plugins, "main_window_index", return_value=2),
+            mock.patch.object(plugins, "osa", return_value="AXLayoutItem") as osa,
+            mock.patch.object(plugins, "walk_window", return_value=[]),
+            mock.patch.object(
+                plugins, "parse_strip", side_effect=[partial, full]
+            ),
+            mock.patch.object(plugins.time, "sleep"),
+        ):
+            result = plugins.mixer_reveal_strip("8.1", "Lead", dry_run=False)
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["detail"], "full")
+        self.assertNotIn("already_visible", result)
+        self.assertEqual(osa.call_count, 2)
+
     def test_ax_order_is_reversed_into_signal_flow(self):
         kids = [
             {"role": "AXSlider", "description": "send knob", "value": "-20"},
@@ -463,6 +572,16 @@ class MixerParsingTests(unittest.TestCase):
             [{"bus": "Bus 1", "level": "-10"}, {"bus": "Bus 2", "level": "-20"}],
         )
         self.assertEqual(row["order"], "signal flow, first processed first")
+
+    def test_one_generic_insert_keeps_strip_partial(self):
+        kids = [
+            {"role": "AXGroup", "description": "insert bar", "value": ""},
+            {"role": "AXGroup", "description": "Channel EQ", "value": ""},
+            {"role": "AXGroup", "description": "audio plug-in", "value": ""},
+        ]
+        row = plugins.parse_strip("Lead", "1.2", kids)
+        self.assertEqual(row["detail"], "partial")
+        self.assertIn("plugin names", row["missing"])
 
     def test_undocumented_send_slider_value_is_not_reported_as_a_level(self):
         kids = [
@@ -596,7 +715,11 @@ class PluginWriteSafetyTests(unittest.TestCase):
         self.assertEqual(result["method"], "calibrated raw stepping")
         self.assertIn("AXDecrement", osa.call_args.args[0])
         send_value.assert_called_once_with(
-            "Logic Pro", "UI element 1 of group", "190", numeric=True
+            "Logic Pro",
+            "UI element 1 of group",
+            "190",
+            numeric=True,
+            atomic_preamble="",
         )
 
 
@@ -681,12 +804,9 @@ class PluginOpenTests(unittest.TestCase):
         self.assertTrue(identity["controls_view"])
 
     def test_set_view_uses_show_menu_and_identity_readback(self):
-        identities = iter(
-            [
-                {"plugin": "Pro-DS", "channel": "Lead", "view_selector": "Editor"},
-                {"plugin": "Pro-DS", "channel": "Lead", "view_selector": "Controls"},
-            ]
-        )
+        before = {"plugin": "Pro-DS", "channel": "Lead", "view_selector": "Editor"}
+        after = {"plugin": "Pro-DS", "channel": "Lead", "view_selector": "Controls"}
+        identities = itertools.chain([before], itertools.repeat(after))
         shallow = [
             {"path": "4", "role": "AXMenuButton", "name": "Editor", "value": "", "description": "view"}
         ]
@@ -707,12 +827,9 @@ class PluginOpenTests(unittest.TestCase):
         self.assertIn("AXShowMenu", osa.call_args_list[0].args[0])
 
     def test_set_editor_view_accepts_unique_plugin_named_menu_item(self):
-        identities = iter(
-            [
-                {"plugin": "Pro-DS", "channel": "Lead", "view_selector": "Controls"},
-                {"plugin": "Pro-DS", "channel": "Lead", "view_selector": "Editor"},
-            ]
-        )
+        before = {"plugin": "Pro-DS", "channel": "Lead", "view_selector": "Controls"}
+        after = {"plugin": "Pro-DS", "channel": "Lead", "view_selector": "Editor"}
+        identities = itertools.chain([before], itertools.repeat(after))
         shallow = [
             {"path": "4", "role": "AXMenuButton", "name": "Controls", "value": "", "description": "view"}
         ]
@@ -734,12 +851,9 @@ class PluginOpenTests(unittest.TestCase):
         self.assertEqual(result["selected_menu_item"], "Pro-DS")
 
     def test_set_vertical_view_verifies_orientation(self):
-        identities = iter(
-            [
-                {"plugin": "Loudness Meter", "channel": "Stereo Out", "view_selector": "Controls", "controls_view": True},
-                {"plugin": "Loudness Meter", "channel": "Stereo Out", "view_selector": "Editor", "controls_view": False, "raw_view_selector": "100%"},
-            ]
-        )
+        before = {"plugin": "Loudness Meter", "channel": "Stereo Out", "view_selector": "Controls", "controls_view": True}
+        after = {"plugin": "Loudness Meter", "channel": "Stereo Out", "view_selector": "Editor", "controls_view": False, "raw_view_selector": "100%"}
+        identities = itertools.chain([before], itertools.repeat(after))
         shallow = [
             {"path": "4", "role": "AXMenuButton", "name": "Controls", "value": "", "description": "view"}
         ]
@@ -763,12 +877,9 @@ class PluginOpenTests(unittest.TestCase):
         self.assertEqual(result["selected_menu_item"], "Vertical")
 
     def test_set_view_retries_with_press_when_show_menu_is_empty(self):
-        identities = iter(
-            [
-                {"plugin": "UADx Oxide", "channel": "Lead", "view_selector": "Editor"},
-                {"plugin": "UADx Oxide", "channel": "Lead", "view_selector": "Controls"},
-            ]
-        )
+        before = {"plugin": "UADx Oxide", "channel": "Lead", "view_selector": "Editor"}
+        after = {"plugin": "UADx Oxide", "channel": "Lead", "view_selector": "Controls"}
+        identities = itertools.chain([before], itertools.repeat(after))
         shallow = [
             {"path": "4", "role": "AXMenuButton", "name": "Editor", "value": "", "description": "view"}
         ]
@@ -1032,7 +1143,7 @@ class AuditStateMachineTests(unittest.TestCase):
         run = plugins.AUDIT_PLANS[plan["plan_id"]]
         read_index = next(
             index for index, step in enumerate(run["plan"]["steps"])
-            if step["operation"] == "mixer_read_strip"
+            if step["operation"] == "selected_track_read_strip"
         )
         for step in run["plan"]["steps"][:read_index]:
             step["status"] = "completed"
@@ -1042,7 +1153,7 @@ class AuditStateMachineTests(unittest.TestCase):
         plugins.mix_audit_advance(
             plan["plan_id"],
             read_step["step_id"],
-            {"ok": True, "path": "8.1", "inserts": ["Channel EQ"]},
+            {"ok": True, "verified": True, "path": "8.1", "inserts": ["Channel EQ"]},
         )
         open_step = plugins.audit_next_step(run)
         open_step["status"] = "completed"
@@ -1161,7 +1272,7 @@ class AuditStateMachineTests(unittest.TestCase):
         read_index = next(
             index
             for index, step in enumerate(run["plan"]["steps"])
-            if step["operation"] == "mixer_read_strip"
+            if step["operation"] == "selected_track_read_strip"
         )
         for step in run["plan"]["steps"][:read_index]:
             step["status"] = "completed"
@@ -1170,7 +1281,13 @@ class AuditStateMachineTests(unittest.TestCase):
         advanced = plugins.mix_audit_advance(
             plan["plan_id"],
             read_step["step_id"],
-            {"ok": True, "name": "Kick", "path": "8.1", "inserts": ["Channel EQ", "Compressor"]},
+            {
+                "ok": True,
+                "verified": True,
+                "name": "Kick",
+                "path": "8.1",
+                "inserts": ["Channel EQ", "Compressor"],
+            },
         )
         self.assertEqual(advanced["next_step"]["operation"], "plugin_open_insert")
         expanded = run["plan"]["steps"][read_index + 1 : read_index + 13]
@@ -1181,11 +1298,11 @@ class AuditStateMachineTests(unittest.TestCase):
 
     def test_mature_inventory_timeout_falls_back_to_ax_instead_of_aborting_target(self):
         plan = plugins.mix_audit_plan(
-            tracks={"data": [{"id": 0, "name": "Kick", "type": "audio"}]},
+            tracks={"data": [{"id": 0, "name": "Aux 1", "type": "Aux"}]},
             mixer={},
-            ax_channels={"strips": [{"index": 0, "name": "Kick", "path": "8.1"}]},
-            scope="track",
-            selector="Kick",
+            ax_channels={"strips": [{"index": 0, "name": "Aux 1", "path": "8.1"}]},
+            scope="aux",
+            selector="Aux 1",
             project_path="/tmp/Test.logicx",
             output_root="/tmp/logic-audits",
         )
@@ -1236,6 +1353,7 @@ class AuditStateMachineTests(unittest.TestCase):
             read_step["step_id"],
             {
                 "ok": True,
+                "verified": True,
                 "name": "Master",
                 "path": "8.1",
                 "inserts": ["Ozone 9 Elements", "Loudness Meter"],

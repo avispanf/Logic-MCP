@@ -360,6 +360,28 @@ class AuditRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["action"], "verified-position no-op")
         runner.tool.assert_not_awaited()
 
+    async def test_position_dispatch_requires_independent_resource_readback(self):
+        runner = runner_module.AuditRunner(arguments())
+        runner.resource = mock.AsyncMock(
+            side_effect=[
+                {"data": {"state": {"position": "43.3.1.1", "isPlaying": False}}},
+                {"data": {"state": {"position": "1.1.1.1", "isPlaying": False}}},
+            ]
+        )
+        runner.tool = mock.AsyncMock(return_value={"ok": True, "verified": True})
+
+        result = await runner.execute_child(
+            {
+                "server": "logic-plugins",
+                "operation": "transport_goto_position",
+                "arguments": {"position": "1.1.1.1", "dry_run": False},
+            }
+        )
+
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["observed_position"], "1.1.1.1")
+        self.assertEqual(result["verification_source"], "logic://transport/state")
+
     async def test_parameter_reader_pages_until_complete(self):
         runner = runner_module.AuditRunner(arguments())
         runner.tool = mock.AsyncMock(

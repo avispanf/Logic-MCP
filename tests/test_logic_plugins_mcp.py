@@ -80,6 +80,35 @@ class TransportPositionTests(unittest.TestCase):
         self.assertFalse(result["ok"])
         self.assertFalse(result["write_attempted"])
 
+    def test_goto_steps_control_bar_and_reads_back_both_fields(self):
+        controls = {"bar": {"path": "6.9.1"}, "beat": {"path": "6.9.2"}}
+        with (
+            mock.patch.object(plugins, "require_logic", return_value="Logic Pro"),
+            mock.patch.object(plugins, "main_window_index", return_value=2),
+            mock.patch.object(plugins, "find_control_bar", return_value=controls),
+            mock.patch.object(
+                plugins,
+                "write_numeric_control_stepwise",
+                side_effect=[
+                    {"ok": True, "verified": True, "after": "1", "steps": 42},
+                    {"ok": True, "verified": True, "after": "1", "steps": 2},
+                ],
+            ) as write,
+        ):
+            result = plugins.transport_goto_position("1.1.1.1", dry_run=False)
+
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["observed_bar"], 1)
+        self.assertEqual(result["observed_beat"], 1)
+        self.assertEqual(write.call_count, 2)
+
+    def test_goto_refuses_unexposed_division_before_write(self):
+        with mock.patch.object(plugins, "require_logic") as require_logic:
+            result = plugins.transport_goto_position("1.1.2.1", dry_run=False)
+        require_logic.assert_not_called()
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["write_attempted"])
+
 
 class ArrangeTrackToggleTests(unittest.TestCase):
     def test_master_and_stereo_out_are_the_only_identity_alias(self):

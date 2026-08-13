@@ -540,6 +540,21 @@ class AuditRunner:
                     "observed": observed.get("position"),
                 }
             result = await self.tool("plugins", operation, arguments)
+            if succeeded(result):
+                observed = await self.refresh_transport_observation()
+                matches = observed.get("position") == arguments.get("position")
+                result = {
+                    **result,
+                    "ok": matches,
+                    "verified": matches,
+                    "observed_position": observed.get("position"),
+                    "verification_source": "logic://transport/state",
+                    **(
+                        {}
+                        if matches
+                        else {"error": "position resource readback did not match"}
+                    ),
+                }
             if verified(result):
                 self.transport_position = arguments.get("position")
             return result
@@ -698,14 +713,13 @@ class AuditRunner:
             return await self.tool("audio", operation, arguments)
         if server == "logic-plugins":
             if operation == "transport_goto_position":
-                observed = await self.refresh_transport_observation()
-                if observed.get("position") == arguments.get("position"):
-                    return {
-                        "ok": True,
-                        "verified": True,
-                        "action": "verified-position no-op",
-                        "observed": observed.get("position"),
+                return await self.execute_child(
+                    {
+                        "server": "logic-plugins",
+                        "operation": operation,
+                        "arguments": arguments,
                     }
+                )
             if operation == "mix_bounce_target":
                 arguments = {**arguments, "timeout_seconds": self.args.bounce_timeout}
             if operation == "plugin_parameters":

@@ -2679,6 +2679,69 @@ def normalise_logic_position(value: str) -> str | None:
     return ".".join(str(value) for value in values)
 
 
+def write_numeric_control_stepwise(
+    process: str,
+    reference: str,
+    target: int,
+    max_steps: int = 2048,
+) -> dict:
+    """Write a Logic numeric display that moves one unit per absolute AX set."""
+    before = read_value(process, reference)
+    observed = before
+    target_number = int(target)
+    trail = [before]
+    if as_number(observed) == target_number:
+        return {
+            "ok": True,
+            "verified": True,
+            "before": before,
+            "after": observed,
+            "steps": 0,
+            "method": "verified no-op",
+        }
+    reason = "step budget exhausted"
+    for step in range(1, max(1, int(max_steps)) + 1):
+        previous = observed
+        try:
+            send_value(process, reference, str(target_number), True)
+            observed = read_value(process, reference)
+        except ProbeError as exc:
+            reason = f"stepping failed: {exc}"
+            break
+        trail.append(observed)
+        observed_number = as_number(observed)
+        previous_number = as_number(previous)
+        if observed_number == target_number:
+            return {
+                "ok": True,
+                "verified": True,
+                "before": before,
+                "after": observed,
+                "steps": step,
+                "method": "stepped",
+                "trail": trail[:12],
+            }
+        if observed_number is None or previous_number is None:
+            reason = "value stopped being numeric"
+            break
+        if observed_number == previous_number:
+            reason = "control stopped moving"
+            break
+        if abs(observed_number - target_number) >= abs(previous_number - target_number):
+            reason = "control moved away from the target"
+            break
+    return {
+        "ok": False,
+        "verified": False,
+        "before": before,
+        "after": observed,
+        "steps": len(trail) - 1,
+        "method": "stepped",
+        "trail": trail[:12],
+        "error": reason,
+    }
+
+
 def close_goto_position_dialog(process: str) -> None:
     try:
         osa(
@@ -2692,9 +2755,12 @@ def close_goto_position_dialog(process: str) -> None:
 
 @tool
 def transport_goto_position(position: str, dry_run: bool = True) -> dict:
-    """Set an exact bar.beat.division.tick position through Logic's own Go To Position
-    dialog and independently reopen the dialog to read Current back. This avoids an
-    abandoned mature-server operation continuing after its timeout. Dry-run is default."""
+    """Set an exact bar.beat.1.1 position through Control Bar numeric displays.
+
+    Logic 12.3 moves these sliders only one unit per absolute AX set, so this uses a
+    bounded directed loop with read-back after every step. Positions below beat
+    resolution fail before writing. Dry-run is default.
+    """
     requested = normalise_logic_position(position)
     if requested is None or requested != str(position).strip():
         return {
@@ -2704,41 +2770,42 @@ def transport_goto_position(position: str, dry_run: bool = True) -> dict:
             "error": "position must be four positive dot-separated integers",
             "requested": position,
         }
-    preview = {"requested": requested, "method": "logic_go_to_position_dialog"}
+    values = [int(part) for part in requested.split(".")]
+    preview = {"requested": requested, "method": "control_bar_stepwise"}
     if dry_run:
         return {"ok": True, "verified": False, "dry_run": True, **preview}
-    process = require_logic()
-    opened = menu_click(["Navigate", "Go To", "Position…"])
-    if not opened.get("ok") or not any(
-        window.get("title") == "Go To Position" for window in opened.get("opened", [])
-    ):
+    if values[2:] != [1, 1]:
         return {
             "ok": False,
             "verified": False,
             "write_attempted": False,
             **preview,
-            "error": "Go To Position dialog did not open",
-            "open_result": opened,
+            "error": "Control Bar exposes only bar and beat; division and tick must both be 1",
         }
+    process = require_logic()
     try:
-        # The editable New position field is focused on open. Selecting the complete
-        # segmented value and typing the dotted form fills all four segments atomically;
-        # AXSlider writes only move one encoded step and cannot safely set this control.
-        send_key(process, "key", "a", ["cmd"])
-        send_key(process, "key", requested, [])
-        send_key(process, "code", 36, [])
-        time.sleep(0.7)
-        reopened = menu_click(["Navigate", "Go To", "Position…"])
-        if not reopened.get("ok"):
-            raise ProbeError("verification dialog did not reopen")
-        current_raw = osa(
-            f'tell application "System Events" to tell process "{process}" to '
-            "return value of UI element 4 of front window as string",
-            timeout=15,
+        window = main_window_index(process)
+        controls = find_control_bar(process, window)
+        bar = controls.get("bar")
+        beat = controls.get("beat")
+        if not bar or not beat:
+            raise ProbeError("Control Bar bar/beat displays are not readable")
+        bar_result = write_numeric_control_stepwise(
+            process, element_reference(bar["path"], window), values[0]
         )
-        observed = normalise_logic_position(current_raw)
+        if not bar_result.get("verified"):
+            return {
+                "ok": False,
+                "verified": False,
+                "write_attempted": True,
+                **preview,
+                "bar": bar_result,
+                "error": "bar display did not reach the requested value",
+            }
+        beat_result = write_numeric_control_stepwise(
+            process, element_reference(beat["path"], window), values[1]
+        )
     except ProbeError as exc:
-        close_goto_position_dialog(process)
         return {
             "ok": False,
             "verified": False,
@@ -2746,16 +2813,26 @@ def transport_goto_position(position: str, dry_run: bool = True) -> dict:
             **preview,
             "error": str(exc),
         }
-    close_goto_position_dialog(process)
-    verified = observed == requested
+    if not beat_result.get("verified"):
+        return {
+            "ok": False,
+            "verified": False,
+            "write_attempted": True,
+            **preview,
+            "bar": bar_result,
+            "beat": beat_result,
+            "error": "beat display did not reach the requested value",
+        }
     return {
-        "ok": verified,
-        "verified": verified,
+        "ok": True,
+        "verified": True,
         "write_attempted": True,
         **preview,
-        "observed": observed,
-        "observed_raw": current_raw,
-        **({"error": "position readback did not match"} if not verified else {}),
+        "observed_bar": int(as_number(bar_result["after"])),
+        "observed_beat": int(as_number(beat_result["after"])),
+        "bar": bar_result,
+        "beat": beat_result,
+        "verification_source": "Control Bar bar/beat AX readback",
     }
 
 

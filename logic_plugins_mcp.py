@@ -3457,7 +3457,7 @@ def surfaces_doctor(expected_namespace: str = "codex") -> dict:
 
 
 def main_window_index(process: str) -> int:
-    raw = osa(
+    script = (
         f'tell application "System Events" to tell process "{process}"\n'
         'set out to ""\n'
         "repeat with i from 1 to (count of windows)\n"
@@ -3468,17 +3468,27 @@ def main_window_index(process: str) -> int:
         "return out\n"
         "end tell"
     )
-    standard = []
-    for record in split_records(raw):
-        parts = (record.split("~") + ["", "", ""])[:3]
-        if parts[1] == "AXStandardWindow":
-            standard.append((int(parts[0]), parts[2]))
-    if not standard:
-        raise ProbeError("no standard window found; Logic may have only dialogs open")
-    for index, title in standard:
-        if title.endswith(" - Tracks"):
-            return index
-    return standard[0][0]
+    # Logic briefly invalidates every AX window reference while a track selection or
+    # pane refresh is settling. The per-window AppleScript ``try`` then returns an
+    # empty listing even though the Tracks window reappears a fraction of a second
+    # later. Retry the read itself; never guess an index from the stale attempt.
+    for attempt in range(3):
+        raw = osa(script)
+        standard = []
+        for record in split_records(raw):
+            parts = (record.split("~") + ["", "", ""])[:3]
+            if parts[1] == "AXStandardWindow":
+                standard.append((int(parts[0]), parts[2]))
+        if standard:
+            for index, title in standard:
+                if title.endswith(" - Tracks"):
+                    return index
+            return standard[0][0]
+        if attempt < 2:
+            time.sleep(0.35)
+    raise ProbeError(
+        "no standard window found after 3 reads; Logic may have only dialogs open"
+    )
 
 
 _TRACKS_HEADER_CACHE: dict[tuple[str, int], str] = {}

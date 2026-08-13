@@ -291,6 +291,16 @@ class WindowSelectionTests(unittest.TestCase):
         with mock.patch.object(plugins, "osa", return_value=listing):
             self.assertEqual(plugins.main_window_index("Logic Pro"), 3)
 
+    def test_tracks_window_read_retries_during_transient_ax_refresh(self):
+        listing = "1~AXStandardWindow~Example Project - Tracks|:|"
+        with (
+            mock.patch.object(plugins, "osa", side_effect=["", listing]) as osa,
+            mock.patch.object(plugins.time, "sleep") as sleep,
+        ):
+            self.assertEqual(plugins.main_window_index("Logic Pro"), 1)
+        self.assertEqual(osa.call_count, 2)
+        sleep.assert_called_once_with(0.35)
+
     def test_accessibility_probe_reports_real_ax_denial(self):
         denial = plugins.ProbeError("assistive access denied (-25211)")
         with mock.patch.object(plugins, "osa", side_effect=denial):

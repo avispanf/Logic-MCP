@@ -90,6 +90,29 @@ def filter_tracks_by_index_range(
     return bounded
 
 
+def normalise_resource_value(value: Any) -> Any:
+    """Decode JSON text that MCP transports may wrap inside resource JSON.
+
+    MCP SDK versions differ on whether a structured resource field such as transport
+    ``state`` arrives as an object or as serialized JSON text. Decode only strings that
+    visibly contain an object/array, recurse through containers, and leave ordinary Logic
+    names, positions and labels untouched.
+    """
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith(("{", "[")):
+            try:
+                return normalise_resource_value(json.loads(stripped))
+            except json.JSONDecodeError:
+                return value
+        return value
+    if isinstance(value, dict):
+        return {key: normalise_resource_value(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [normalise_resource_value(item) for item in value]
+    return value
+
+
 class AuditRunner:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -174,7 +197,11 @@ class AuditRunner:
         result = await self.sessions["core"].read_resource(uri)
         if not result.contents:
             return {"error": f"empty resource {uri}"}
-        return json.loads(result.contents[0].text)
+        decoded = normalise_resource_value(json.loads(result.contents[0].text))
+        return decoded if isinstance(decoded, dict) else {
+            "error": f"resource {uri} did not decode to an object",
+            "raw": decoded,
+        }
 
     async def wait_for_tracks(self, timeout: int = 150) -> dict:
         deadline = asyncio.get_running_loop().time() + timeout
@@ -266,6 +293,11 @@ class AuditRunner:
         self.initial_track_state = copy.deepcopy(self.track_state)
         transport = resources.get("logic://transport/state", {})
         state = transport.get("data", {}).get("state", transport.get("state", transport))
+        state = normalise_resource_value(state)
+        if not isinstance(state, dict):
+            raise RuntimeError(
+                "logic://transport/state did not contain a readable state object"
+            )
         self.transport_position = state.get("position")
         self.initial_transport_position = self.transport_position
         self.transport_playing = bool(state.get("isPlaying", state.get("playing", False)))
@@ -476,6 +508,7 @@ class AuditRunner:
     async def refresh_transport_observation(self) -> dict:
         payload = await self.resource("logic://transport/state")
         state = payload.get("data", {}).get("state", payload.get("state", payload))
+        state = normalise_resource_value(state)
         if isinstance(state, dict):
             self.transport_position = state.get("position", self.transport_position)
             self.transport_playing = bool(

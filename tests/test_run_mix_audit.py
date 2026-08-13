@@ -14,6 +14,45 @@ def arguments() -> argparse.Namespace:
 
 
 class AuditRunnerTests(unittest.IsolatedAsyncioTestCase):
+    def test_resource_normalizer_decodes_nested_json_state_only(self):
+        payload = {
+            "data": {
+                "state": json.dumps(
+                    {"position": "1.1.1.1", "isPlaying": False}
+                ),
+                "name": "LEAD VOICE",
+            }
+        }
+
+        result = runner_module.normalise_resource_value(payload)
+
+        self.assertEqual(result["data"]["state"]["position"], "1.1.1.1")
+        self.assertFalse(result["data"]["state"]["isPlaying"])
+        self.assertEqual(result["data"]["name"], "LEAD VOICE")
+
+    def test_capture_known_state_accepts_serialized_transport_state(self):
+        runner = runner_module.AuditRunner(arguments())
+        resources = {
+            "logic://tracks": {"data": []},
+            "logic://transport/state": {
+                "data": {
+                    "state": json.dumps(
+                        {
+                            "position": "5.2.1.1",
+                            "isPlaying": True,
+                            "isCycleEnabled": False,
+                        }
+                    )
+                }
+            },
+        }
+
+        runner.capture_known_state(resources, [])
+
+        self.assertEqual(runner.transport_position, "5.2.1.1")
+        self.assertTrue(runner.transport_playing)
+        self.assertFalse(runner.cycle_enabled)
+
     def test_cli_does_not_silently_narrow_all_scope(self):
         parsed = runner_module.parser().parse_args(["--scope", "all", "--confirmed"])
         self.assertEqual(parsed.selector, "")

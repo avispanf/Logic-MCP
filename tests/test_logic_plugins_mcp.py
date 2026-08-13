@@ -179,9 +179,7 @@ class ArrangeTrackToggleTests(unittest.TestCase):
                 plugins, "find_selected_track_strip_path", return_value="7.1.4.1.1"
             ),
             mock.patch.object(plugins, "walk_window", side_effect=[children, inspector]),
-            mock.patch.object(plugins, "read_value", return_value="on"),
-            mock.patch.object(plugins, "osa") as osa,
-            mock.patch.object(plugins.time, "sleep"),
+            mock.patch.object(plugins, "osa", return_value="on") as osa,
         ):
             result = plugins.arrange_track_set_toggle(
                 0, "Cloudless #3 -", "solo", True, dry_run=False
@@ -191,6 +189,7 @@ class ArrangeTrackToggleTests(unittest.TestCase):
         self.assertEqual(result["control_path"], "7.1.4.1.1.3")
         self.assertEqual(result["row_path"], "8.2.1.2.1.1.1")
         self.assertIn("AXPress", osa.call_args.args[0])
+        self.assertIn("tracksWindow", osa.call_args.args[0])
 
     def test_toggle_refuses_stale_track_identity_before_press(self):
         children = [
@@ -227,6 +226,38 @@ class ArrangeTrackToggleTests(unittest.TestCase):
 
 
 class BounceSafetyTests(unittest.TestCase):
+    def test_bounce_element_lookup_ignores_front_sharing_overlay(self):
+        windows = {
+            "windows": [
+                {"index": 1, "title": "Window", "subrole": "AXDialog"},
+                {
+                    "index": 2,
+                    "title": "Bounce “Test”",
+                    "subrole": "AXDialog",
+                },
+            ]
+        }
+        rows = [
+            {
+                "path": "1.14",
+                "role": "AXButton",
+                "name": "Bounce",
+                "description": "button",
+                "value": "",
+            }
+        ]
+        with (
+            mock.patch.object(plugins, "ax_windows", return_value=windows),
+            mock.patch.object(plugins, "walk_window", return_value=rows) as walk,
+        ):
+            result = plugins.find_front_element(
+                "Logic Pro", "AXButton", name="Bounce", timeout=0.1
+            )
+
+        self.assertEqual(result["window_index"], 2)
+        self.assertEqual(result["path"], "1.14")
+        self.assertEqual(walk.call_args.args[1], 2)
+
     def test_accessible_bounce_opens_directly_with_command_b(self):
         with tempfile.TemporaryDirectory() as directory:
             staging = Path(directory)

@@ -615,6 +615,29 @@ def element_reference(path: str, window: int) -> str:
     return reference
 
 
+def rooted_element_reference(path: str, root: str) -> str:
+    reference = str(root)
+    for index in [int(x) for x in path.split(".") if x.strip()]:
+        reference = f"UI element {index} of {reference}"
+    return reference
+
+
+def tracks_window_preamble() -> str:
+    """Atomically bind the live Tracks window despite z-order overlay changes."""
+    return (
+        "set tracksMatches to {}\n"
+        "repeat with tracksCandidate in windows\n"
+        "try\n"
+        'if subrole of tracksCandidate is "AXStandardWindow" and '
+        '(name of tracksCandidate as string) ends with " - Tracks" then '
+        "set end of tracksMatches to tracksCandidate\n"
+        "end try\n"
+        "end repeat\n"
+        'if (count of tracksMatches) is not 1 then error "Tracks window identity is not unique"\n'
+        "set tracksWindow to item 1 of tracksMatches\n"
+    )
+
+
 def plugin_window_preamble(expected_plugin: str, expected_channel: str) -> str:
     """Build an atomic AppleScript selector for one exact plugin editor.
 
@@ -3911,15 +3934,19 @@ def arrange_track_set_toggle(
             "after": before,
             **preview,
         }
-    reference = element_reference(target["path"], window)
+    reference = rooted_element_reference(target["path"], "tracksWindow")
     try:
-        osa(
-            f'tell application "System Events" to tell process "{process}" to '
-            f'perform action "AXPress" of {reference}',
+        after_raw = osa(
+            'tell application "System Events"\n'
+            f'tell process "{process}"\n'
+            f"{tracks_window_preamble()}"
+            f'perform action "AXPress" of {reference}\n'
+            "delay 0.4\n"
+            f"return value of {reference} as string\n"
+            "end tell\n"
+            "end tell",
             timeout=20,
         )
-        time.sleep(0.4)
-        after_raw = read_value(process, reference)
     except ProbeError as exc:
         return {
             "ok": False,
@@ -4772,35 +4799,57 @@ def find_front_element(
     exclude_names: tuple[str, ...] = (),
     timeout: float = 20.0,
 ) -> dict:
-    """Resolve one element in the front Logic window, retrying while sheets animate."""
+    """Resolve one element in Logic's Bounce dialog, ignoring sharing overlays.
+
+    Window indices follow z-order. macOS screen-sharing overlays are AXDialog windows
+    named ``Window`` and can occupy index 1 while the real Bounce/save sheet is index 2
+    or later, so every retry resolves the dialog again by title and returns its index.
+    """
     deadline = time.monotonic() + timeout
     last_matches: list[dict] = []
     while time.monotonic() < deadline:
-        try:
-            elements = walk_window(process, 1, 5, budget=500, seconds=12)
-        except ProbeError:
-            time.sleep(0.4)
-            continue
-        matches = [entry for entry in elements if entry["role"] == role]
-        if name:
-            matches = [entry for entry in matches if entry["name"] == name]
-        if value:
-            matches = [entry for entry in matches if entry["value"] == value]
-        if exclude_names:
-            excluded = {item.casefold() for item in exclude_names}
-            matches = [
-                entry
-                for entry in matches
-                if not any(
-                    excluded_name in f'{entry["name"]} {entry["description"]}'.casefold()
-                    for excluded_name in excluded
+        matches = []
+        windows = [
+            window
+            for window in ax_windows().get("windows", [])
+            if window.get("subrole") == "AXDialog"
+            and str(window.get("title") or "").casefold().startswith("bounce")
+        ]
+        for window in windows:
+            try:
+                elements = walk_window(
+                    process, int(window["index"]), 7, budget=1000, seconds=12
                 )
-            ]
+            except ProbeError:
+                continue
+            window_matches = [entry for entry in elements if entry["role"] == role]
+            if name:
+                window_matches = [entry for entry in window_matches if entry["name"] == name]
+            if value:
+                window_matches = [entry for entry in window_matches if entry["value"] == value]
+            if exclude_names:
+                excluded = {item.casefold() for item in exclude_names}
+                window_matches = [
+                    entry
+                    for entry in window_matches
+                    if not any(
+                        excluded_name
+                        in f'{entry["name"]} {entry["description"]}'.casefold()
+                        for excluded_name in excluded
+                    )
+                ]
+            matches.extend(
+                {**entry, "window_index": int(window["index"])}
+                for entry in window_matches
+            )
         last_matches = matches
         if len(matches) == 1:
             return matches[0]
         time.sleep(0.4)
-    detail = [entry["path"] for entry in last_matches[:8]]
+    detail = [
+        f'{entry.get("window_index")}:{entry["path"]}'
+        for entry in last_matches[:8]
+    ]
     raise ProbeError(
         f"expected one front-window {role} name={name!r} value={value!r}; "
         f"found {len(last_matches)} at {detail}"
@@ -4809,7 +4858,7 @@ def find_front_element(
 
 def press_front_button(process: str, name: str, timeout: float = 20.0) -> dict:
     target = find_front_element(process, "AXButton", name=name, timeout=timeout)
-    reference = element_reference(target["path"], 1)
+    reference = element_reference(target["path"], int(target["window_index"]))
     osa(
         f'tell application "System Events" to tell process "{process}" to '
         f'perform action "AXPress" of {reference}',
@@ -4959,7 +5008,7 @@ def run_accessible_bounce(target: Path, timeout_seconds: int, staging: Path | No
         # Logic 12.3 exposes the standard save panel's filename AXTextField. The Search
         # field is excluded explicitly, then the exact value is read back before Bounce.
         filename = find_front_element(process, "AXTextField", name="Save As:", timeout=25)
-        filename_ref = element_reference(filename["path"], 1)
+        filename_ref = element_reference(filename["path"], int(filename["window_index"]))
         send_value(process, filename_ref, staged_name, numeric=False)
         if read_value(process, filename_ref) != staged_name:
             raise ProbeError("save panel filename readback did not match")
@@ -4976,7 +5025,7 @@ def run_accessible_bounce(target: Path, timeout_seconds: int, staging: Path | No
             exclude_names=("Search", "Save As"),
             timeout=12,
         )
-        folder_ref = element_reference(folder["path"], 1)
+        folder_ref = element_reference(folder["path"], int(folder["window_index"]))
         send_value(process, folder_ref, str(staging.resolve()), numeric=False)
         if read_value(process, folder_ref) != str(staging.resolve()):
             raise ProbeError("Go to Folder path readback did not match")

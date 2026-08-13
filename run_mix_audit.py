@@ -130,6 +130,40 @@ def core_process_environment(
     return env
 
 
+def extract_transport_state(payload: Any) -> dict[str, Any] | None:
+    """Return a validated transport-state object from supported resource envelopes."""
+    decoded = normalise_resource_value(payload)
+    candidates: list[Any] = []
+    if isinstance(decoded, dict):
+        data = decoded.get("data")
+        if isinstance(data, dict):
+            candidates.extend((data.get("state"), data))
+        candidates.extend((decoded.get("state"), decoded))
+    else:
+        candidates.append(decoded)
+    known = {
+        "position",
+        "isPlaying",
+        "playing",
+        "isRecording",
+        "recording",
+        "isCycleEnabled",
+        "cycle",
+    }
+    for candidate in candidates:
+        candidate = normalise_resource_value(candidate)
+        if isinstance(candidate, list) and len(candidate) == 1:
+            candidate = normalise_resource_value(candidate[0])
+        if isinstance(candidate, dict) and known.intersection(candidate):
+            return candidate
+    return None
+
+
+def audit_requires_mixer_survey(scope: str) -> bool:
+    """Project-track audits bind inserts through the selected-track Inspector."""
+    return str(scope).strip().casefold() != "track"
+
+
 class AuditRunner:
     def __init__(self, args: argparse.Namespace):
         self.args = args
@@ -257,6 +291,20 @@ class AuditRunner:
             f"{last.get('reason') or last.get('error') or len(last.get('data', []))} rows"
         )
 
+    async def wait_for_transport_state(self, attempts: int = 5) -> dict:
+        """Wait through the short non-state envelopes emitted during an AX refresh."""
+        last: dict = {}
+        for attempt in range(max(1, int(attempts))):
+            last = await self.resource("logic://transport/state")
+            if extract_transport_state(last) is not None:
+                return last
+            if attempt + 1 < attempts:
+                await asyncio.sleep(1.5)
+        raise RuntimeError(
+            "logic://transport/state did not settle to a readable state object: "
+            f"{str(last)[:500]}"
+        )
+
     def emit(self, event: str, **payload: Any) -> None:
         row = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -309,9 +357,8 @@ class AuditRunner:
         }
         self.initial_track_state = copy.deepcopy(self.track_state)
         transport = resources.get("logic://transport/state", {})
-        state = transport.get("data", {}).get("state", transport.get("state", transport))
-        state = normalise_resource_value(state)
-        if not isinstance(state, dict):
+        state = extract_transport_state(transport)
+        if state is None:
             raise RuntimeError(
                 "logic://transport/state did not contain a readable state object"
             )
@@ -341,7 +388,7 @@ class AuditRunner:
         resources = {
             "logic://tracks": tracks,
             "logic://mixer": await self.resource("logic://mixer"),
-            "logic://transport/state": await self.resource("logic://transport/state"),
+            "logic://transport/state": await self.wait_for_transport_state(),
             "logic://project/info": await self.resource("logic://project/info"),
         }
         self.initial_resources = resources
@@ -523,10 +570,9 @@ class AuditRunner:
         return {"ok": False, "error": f"unsupported child {server}/{operation}"}
 
     async def refresh_transport_observation(self) -> dict:
-        payload = await self.resource("logic://transport/state")
-        state = payload.get("data", {}).get("state", payload.get("state", payload))
-        state = normalise_resource_value(state)
-        if isinstance(state, dict):
+        payload = await self.wait_for_transport_state()
+        state = extract_transport_state(payload)
+        if state is not None:
             self.transport_position = state.get("position", self.transport_position)
             self.transport_playing = bool(
                 state.get("isPlaying", state.get("playing", self.transport_playing))
@@ -848,16 +894,29 @@ class AuditRunner:
                         "no project tracks remain in requested index range "
                         f"{self.args.start_index}..{self.args.end_index}"
                     )
-            survey = await self.tool(
-                "plugins",
-                "mixer_survey",
-                {
-                    "offset": 0,
-                    "strip_limit": self.args.strip_limit,
-                    "per_strip_seconds": self.args.per_strip_seconds,
-                    "total_seconds": self.args.survey_seconds,
-                },
-            )
+            if audit_requires_mixer_survey(self.args.scope):
+                survey = await self.tool(
+                    "plugins",
+                    "mixer_survey",
+                    {
+                        "offset": 0,
+                        "strip_limit": self.args.strip_limit,
+                        "per_strip_seconds": self.args.per_strip_seconds,
+                        "total_seconds": self.args.survey_seconds,
+                    },
+                )
+            else:
+                # Every project-track target is explicitly selected and then read from
+                # the always-visible Inspector. A full Mixer survey adds minutes and
+                # supplies no binding used by this scope; mixer-only targets still take
+                # the complete survey path above.
+                survey = {
+                    "channels": [],
+                    "scope": "track",
+                    "skipped": True,
+                    "reason": "selected-track Inspector supplies the verified strip",
+                }
+                self.emit("mixer_survey_skipped", scope=self.args.scope)
             if self.args.start_index or self.args.end_index is not None:
                 remaining_names = {
                     str(row.get("name") or "").strip().casefold()

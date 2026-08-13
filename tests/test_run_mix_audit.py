@@ -14,6 +14,11 @@ def arguments() -> argparse.Namespace:
 
 
 class AuditRunnerTests(unittest.IsolatedAsyncioTestCase):
+    def test_only_project_track_scope_skips_full_mixer_survey(self):
+        self.assertFalse(runner_module.audit_requires_mixer_survey("track"))
+        for scope in ("group", "aux", "bus", "master", "all"):
+            self.assertTrue(runner_module.audit_requires_mixer_survey(scope))
+
     def test_standalone_core_uses_ax_first_track_selection(self):
         env = runner_module.core_process_environment(
             "audit-test",
@@ -42,6 +47,41 @@ class AuditRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["data"]["state"]["position"], "1.1.1.1")
         self.assertFalse(result["data"]["state"]["isPlaying"])
         self.assertEqual(result["data"]["name"], "LEAD VOICE")
+
+    def test_transport_state_extractor_accepts_singleton_resource_array(self):
+        payload = {
+            "data": {
+                "state": [
+                    {
+                        "position": "9.1.1.1",
+                        "isPlaying": False,
+                    }
+                ]
+            }
+        }
+
+        state = runner_module.extract_transport_state(payload)
+
+        self.assertEqual(state["position"], "9.1.1.1")
+
+    async def test_transport_state_wait_retries_non_state_envelope(self):
+        runner = runner_module.AuditRunner(arguments())
+        good = {
+            "data": {
+                "state": {
+                    "position": "2.1.1.1",
+                    "isPlaying": False,
+                }
+            }
+        }
+        runner.resource = mock.AsyncMock(
+            side_effect=[{"data": {"state": "refreshing"}}, good]
+        )
+        with mock.patch.object(runner_module.asyncio, "sleep", new=mock.AsyncMock()):
+            result = await runner.wait_for_transport_state()
+
+        self.assertEqual(result, good)
+        self.assertEqual(runner.resource.await_count, 2)
 
     def test_capture_known_state_accepts_serialized_transport_state(self):
         runner = runner_module.AuditRunner(arguments())

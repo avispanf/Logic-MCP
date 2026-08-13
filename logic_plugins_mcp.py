@@ -1565,15 +1565,32 @@ def plugin_set_view(
             if e["role"] == "AXMenuItem" and (e["name"] or "").strip()
         ]
 
+    last_menu_read_error = None
     try:
         try:
             perform_plugin_action("AXShowMenu", reference)
         except ProbeError:
             perform_plugin_action("AXPress", reference)
         time.sleep(0.6)
-        menu_items = read_view_items()
-        for _ in range(3):
+        menu_items = []
+        for attempt in range(4):
+            try:
+                menu_items = read_view_items()
+                if menu_items:
+                    last_menu_read_error = None
+            except ProbeError as exc:
+                # Controls view can temporarily make a large third-party AU tree
+                # unresponsive even though its popup did open.  Re-read that same
+                # popup first; dismissing it here would turn the timeout into a
+                # deterministic empty-menu failure on every following attempt.
+                last_menu_read_error = exc
+                menu_items = []
+                if attempt < 3:
+                    time.sleep(0.4)
+                    continue
             if menu_items:
+                break
+            if attempt == 3:
                 break
             # AXShowMenu can report success without opening this control, and a
             # window-sharing overlay can steal the first transient popup. Dismiss it,
@@ -1588,6 +1605,11 @@ def plugin_set_view(
             menu_items = read_view_items()
     except ProbeError as exc:
         return {"ok": False, "error": f"could not open the view menu: {exc}"}
+    if not menu_items and last_menu_read_error is not None:
+        return {
+            "ok": False,
+            "error": f"could not read the view menu after bounded retries: {last_menu_read_error}",
+        }
     target = next((e for e in menu_items if (e["name"] or "").strip() == view), None)
     # Third-party Audio Units commonly label their native editor with the plugin
     # name (for example "Pro-DS") rather than the generic word "Editor".  When
@@ -4874,6 +4896,29 @@ def front_window_titles() -> list[str]:
         return []
 
 
+def press_bounce_and_verify_started(process: str, attempts: int = 3) -> dict:
+    """Press the save-panel Bounce button and prove the panel actually closed.
+
+    AXPress can return success while Logic leaves the save panel open.  Treat the
+    disappearing Bounce dialog as the acknowledgement and retry against a freshly
+    resolved button when it remains visible.
+    """
+    last_target = None
+    for attempt in range(max(1, min(int(attempts), 5))):
+        last_target = press_front_button(process, "Bounce", timeout=15)
+        time.sleep(0.8)
+        bounce_dialog_open = any(
+            title.casefold().startswith("bounce") for title in front_window_titles()
+        )
+        if not bounce_dialog_open:
+            return {
+                "verified": True,
+                "attempts": attempt + 1,
+                "button": last_target,
+            }
+    raise ProbeError("Bounce button was pressed but the save panel did not close")
+
+
 def cancel_bounce_ui(process: str, bounce_fired: bool) -> None:
     """Best-effort cleanup. Cmd-period cancels rendering; Cancel closes preflight sheets."""
     if bounce_fired:
@@ -5040,8 +5085,9 @@ def run_accessible_bounce(target: Path, timeout_seconds: int, staging: Path | No
             )
 
         started_at = time.time()
-        press_front_button(process, "Bounce", timeout=15)
+        start_readback = press_bounce_and_verify_started(process)
         result["bounce_fired"] = True
+        result["start_readback"] = start_readback
         deadline = time.monotonic() + max(60, min(int(timeout_seconds), 3600))
         stable_path: Path | None = None
         stable_size = -1

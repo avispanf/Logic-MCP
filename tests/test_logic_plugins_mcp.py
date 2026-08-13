@@ -226,6 +226,37 @@ class ArrangeTrackToggleTests(unittest.TestCase):
 
 
 class BounceSafetyTests(unittest.TestCase):
+    def test_bounce_press_retries_until_save_panel_closes(self):
+        targets = [{"path": "1.14", "window_index": 2}] * 2
+        with (
+            mock.patch.object(plugins, "press_front_button", side_effect=targets) as press,
+            mock.patch.object(
+                plugins,
+                "front_window_titles",
+                side_effect=[["Bounce “Test”"], ["Logic Pro"]],
+            ),
+            mock.patch.object(plugins.time, "sleep"),
+        ):
+            result = plugins.press_bounce_and_verify_started("Logic Pro")
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["attempts"], 2)
+        self.assertEqual(press.call_count, 2)
+
+    def test_bounce_press_fails_when_save_panel_never_closes(self):
+        with (
+            mock.patch.object(
+                plugins,
+                "press_front_button",
+                return_value={"path": "1.14", "window_index": 2},
+            ),
+            mock.patch.object(
+                plugins, "front_window_titles", return_value=["Bounce “Test”"]
+            ),
+            mock.patch.object(plugins.time, "sleep"),
+        ):
+            with self.assertRaises(plugins.ProbeError):
+                plugins.press_bounce_and_verify_started("Logic Pro", attempts=2)
+
     def test_bounce_element_lookup_ignores_front_sharing_overlay(self):
         windows = {
             "windows": [
@@ -962,7 +993,7 @@ class PluginOpenTests(unittest.TestCase):
             mock.patch.object(
                 plugins,
                 "walk_window",
-                side_effect=[shallow, [], [], controls],
+                side_effect=itertools.chain([shallow, [], []], itertools.repeat(controls)),
             ),
             mock.patch.object(plugins, "osa") as osa,
             mock.patch.object(plugins.time, "sleep"),
@@ -973,6 +1004,37 @@ class PluginOpenTests(unittest.TestCase):
         self.assertTrue(result["verified"])
         self.assertTrue(any("key code 53" in call.args[0] for call in osa.call_args_list))
         self.assertTrue(any('AXPress' in call.args[0] for call in osa.call_args_list))
+
+    def test_set_view_retries_after_transient_menu_walk_timeout(self):
+        before = {"plugin": "Pro-Q 3", "channel": "Back", "view_selector": "Controls"}
+        after = {"plugin": "Pro-Q 3", "channel": "Back", "view_selector": "Editor"}
+        identities = itertools.chain([before], itertools.repeat(after))
+        shallow = [
+            {"path": "4", "role": "AXMenuButton", "name": "Controls", "value": "", "description": "view"}
+        ]
+        editor = [
+            {"path": "4.1.1", "role": "AXMenuItem", "name": "Controls", "value": "", "description": ""},
+            {"path": "4.1.2", "role": "AXMenuItem", "name": "Pro-Q 3", "value": "", "description": ""},
+        ]
+        with (
+            mock.patch.object(plugins, "require_logic", return_value="Logic Pro"),
+            mock.patch.object(plugins, "read_plugin_identity", side_effect=lambda *_: next(identities)),
+            mock.patch.object(
+                plugins,
+                "walk_window",
+                side_effect=itertools.chain(
+                    [shallow, plugins.ProbeError("transient timeout")],
+                    itertools.repeat(editor),
+                ),
+            ),
+            mock.patch.object(plugins, "osa") as osa,
+            mock.patch.object(plugins.time, "sleep"),
+        ):
+            result = plugins.plugin_set_view(
+                1, "Editor", expected_plugin="Pro-Q 3", expected_channel="Back"
+            )
+        self.assertTrue(result["verified"])
+        self.assertFalse(any("key code 53" in call.args[0] for call in osa.call_args_list))
 
     def test_insert_open_reuses_unique_verified_editor_without_toggling_it_closed(self):
         strip = {

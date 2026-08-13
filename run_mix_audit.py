@@ -799,6 +799,14 @@ class AuditRunner:
             self.emit("emergency_playback_restore", result=result)
         self.emit("emergency_restore_finished")
 
+    async def restore_mixer_filters(self, enabled: list[str]) -> None:
+        result = await self.tool(
+            "plugins",
+            "mixer_set_filters",
+            {"enabled": enabled, "dry_run": False},
+        )
+        self.emit("mixer_filters_restored", enabled=enabled, result=result)
+
     async def run_plan(self) -> dict:
         started = await self.tool(
             "plugins", "mix_audit_start", {"plan_id": self.plan["plan_id"], "confirm": True}
@@ -908,6 +916,32 @@ class AuditRunner:
                         "no project tracks remain in requested index range "
                         f"{self.args.start_index}..{self.args.end_index}"
                     )
+            if self.args.scope == "master":
+                filter_snapshot = await self.tool("plugins", "mixer_filters", {})
+                if not verified(filter_snapshot):
+                    raise RuntimeError(
+                        f"could not capture Mixer filters: {filter_snapshot}"
+                    )
+                original_filters = list(filter_snapshot.get("enabled", []))
+                focused = await self.tool(
+                    "plugins",
+                    "mixer_set_filters",
+                    {"enabled": ["Output"], "dry_run": False},
+                )
+                if not verified(focused):
+                    raise RuntimeError(
+                        f"could not focus Mixer on Output: {focused}"
+                    )
+                stack.push_async_callback(
+                    self.restore_mixer_filters,
+                    original_filters,
+                )
+                self.emit(
+                    "mixer_filters_focused",
+                    scope="master",
+                    original=original_filters,
+                    enabled=["Output"],
+                )
             if audit_requires_mixer_survey(self.args.scope):
                 survey = await self.tool(
                     "plugins",

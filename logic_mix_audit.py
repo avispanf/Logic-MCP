@@ -10,6 +10,7 @@ SCHEMA = "logic_mix_audit_plan.v1"
 VALID_SCOPES = {"track", "group", "aux", "bus", "master", "all"}
 VALID_MEASUREMENTS = {"bounce_bs1770", "existing_meter", "both"}
 MASTER_NAMES = {"master", "stereo out", "output 1-2", "main out", "main output"}
+MASTER_OUTPUT_NAMES = {"stereo out", "output 1-2", "main out", "main output"}
 GENERIC_NAMES = {"", "audio plug-in", "midi plug-in", "channel strip", "track"}
 
 
@@ -107,6 +108,24 @@ def _integer(value):
 def _slug(value: str) -> str:
     text = re.sub(r"[^A-Za-z0-9._-]+", "-", str(value).strip()).strip("-.")
     return text[:80] or "target"
+
+
+def _master_surface_rank(record: dict) -> int:
+    """Prefer Logic's processed output strip over its insert-less Master fader.
+
+    Both surfaces classify as ``master`` and the project track resource exposes only
+    the latter name.  The output's ``bounce`` control and output aliases are stable
+    discriminators even when a user renames one of the strips.
+    """
+    name = str(_first(record, "name", "title", "label", default="")).strip().casefold()
+    output = str(_first(record, "output", default="")).strip().casefold()
+    inserts = _first(record, "inserts", "plugins", default=[])
+    has_inserts = isinstance(inserts, list) and bool(inserts)
+    if name in MASTER_OUTPUT_NAMES or name.endswith(" stereo out") or output == "bounce":
+        return 30 + int(has_inserts)
+    if name == "master" or output == "dim":
+        return 10 + int(has_inserts)
+    return 20 + int(has_inserts)
 
 
 def classify_channel(record: dict) -> str:
@@ -253,6 +272,7 @@ def normalise_inventory(tracks=None, mixer=None, ax_channels=None) -> dict:
     ]
     merged: list[dict] = []
     binding_warnings: list[dict] = []
+    suppressed_master_controls: list[dict] = []
 
     track_indices = {
         item
@@ -353,6 +373,27 @@ def normalise_inventory(tracks=None, mixer=None, ax_channels=None) -> dict:
                 if position is None:
                     position = unique_master_position(item)
 
+                # A full Logic Mixer contains both Stereo Out (the processed master
+                # chain) and Master (the global control fader).  They both match the
+                # single project Master track.  Once the higher-ranked output strip
+                # is bound, do not let the later insert-less Master fader overwrite
+                # its path and chain.
+                if position is not None and item.get("kind") == "master":
+                    previous = merged[position].get("raw", {}).get(source)
+                    if (
+                        isinstance(previous, dict)
+                        and _master_surface_rank(previous) > _master_surface_rank(raw)
+                    ):
+                        suppressed_master_controls.append(
+                            {
+                                "source": source,
+                                "surface_index": item.get("surface_index"),
+                                "name": item.get("name") or None,
+                                "reason": "lower-ranked Master control fader",
+                            }
+                        )
+                        continue
+
                 if position is None and source == "ax" and item.get("index") is not None:
                     # Generic labels are useful only when AX and the track list
                     # are demonstrably the same complete positional set.
@@ -416,6 +457,7 @@ def normalise_inventory(tracks=None, mixer=None, ax_channels=None) -> dict:
         "channels": merged,
         "source_counts": {source: len(records) for source, records in sources},
         "binding_warnings": binding_warnings,
+        "suppressed_master_controls": suppressed_master_controls,
         "unbound_surface_records": len(binding_warnings),
         "complete": bool(merged)
         and not binding_warnings

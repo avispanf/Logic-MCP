@@ -605,6 +605,37 @@ class ParameterTableTests(unittest.TestCase):
         self.assertEqual(result["next_offset"], 2)
         self.assertEqual(result["parameters"][0]["label"], "Threshold High")
 
+    def test_radio_row_exposes_each_exact_option_path(self):
+        rows = (
+            "1#"
+            "1~Start/Pause~1~AXRadioButton~"
+            "2^Pause^1^AXRadioButton;3^Start^0^AXRadioButton;|:|"
+        )
+        with (
+            mock.patch.object(plugins, "require_logic", return_value="Logic Pro"),
+            mock.patch.object(plugins, "find_parameter_table", return_value="7.1"),
+            mock.patch.object(plugins, "osa", return_value=rows),
+        ):
+            result = plugins.plugin_parameters(window_index=1)
+        parameter = result["parameters"][0]
+        self.assertEqual(
+            parameter["controls"],
+            [
+                {
+                    "name": "Pause",
+                    "display": "1",
+                    "role": "AXRadioButton",
+                    "path": "7.1.1.1.2",
+                },
+                {
+                    "name": "Start",
+                    "display": "0",
+                    "role": "AXRadioButton",
+                    "path": "7.1.1.1.3",
+                },
+            ],
+        )
+
 
 class MixerParsingTests(unittest.TestCase):
     def test_reveal_skips_unsupported_scroll_when_strip_is_already_visible(self):
@@ -788,6 +819,57 @@ class PluginWriteSafetyTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["resolved_path"], "2.4.1.7.1.2")
         self.assertEqual(write.call_args.kwargs["expected_plugin"], "Ozone 9 Elements")
+
+    def test_verified_label_write_selects_exact_radio_option(self):
+        table = {
+            "parameters": [
+                {
+                    "label": "Start/Pause",
+                    "display": "1",
+                    "role": "AXRadioButton",
+                    "path": "7.1.1.1.2",
+                    "controls": [
+                        {
+                            "name": "Pause",
+                            "display": "1",
+                            "role": "AXRadioButton",
+                            "path": "7.1.1.1.2",
+                        },
+                        {
+                            "name": "Start",
+                            "display": "0",
+                            "role": "AXRadioButton",
+                            "path": "7.1.1.1.3",
+                        },
+                    ],
+                }
+            ]
+        }
+        outcome = {"ok": True, "verified": True, "path": "7.1.1.1.3", "after": "1"}
+        with (
+            mock.patch.object(plugins, "plugin_parameters", return_value=table),
+            mock.patch.object(plugins, "plugin_write_path", return_value=outcome) as write,
+        ):
+            result = plugins.plugin_write_label_verified(
+                "Start/Pause",
+                "1",
+                expected_plugin="Loudness Meter",
+                expected_channel="Stereo Out",
+                expected_before="Pause",
+                option="Start",
+                dry_run=False,
+            )
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["resolved_before"], "Pause")
+        self.assertEqual(result["resolved_path"], "7.1.1.1.3")
+        write.assert_called_once_with(
+            "7.1.1.1.3",
+            "1",
+            window_index=1,
+            dry_run=False,
+            expected_plugin="Loudness Meter",
+            expected_channel="Stereo Out",
+        )
 
     def test_wrapped_slider_steps_by_display_not_encoded_raw_value(self):
         displays = iter(["-0.10", "199", "-1.10", "189", "-1.00", "190"])
@@ -1499,6 +1581,44 @@ class AuditStateMachineTests(unittest.TestCase):
             index for index, step in enumerate(steps) if step["operation"] == "mix_isolation_dispatch"
         )
         self.assertTrue(all(steps.index(step) > isolate_index for step in meter_reads))
+
+    def test_empty_fresh_strip_replaces_meter_placeholder_with_limitation(self):
+        plan = plugins.mix_audit_plan(
+            tracks={"data": [{"index": 0, "name": "Master", "type": "Output"}]},
+            mixer={},
+            ax_channels={"strips": [{"index": 0, "name": "Master", "path": "8.1"}]},
+            scope="master",
+            selector="Master",
+            project_path="/tmp/Test.logicx",
+            output_root="/tmp/logic-audits",
+            measurement="existing_meter",
+        )
+        run = plugins.AUDIT_PLANS[plan["plan_id"]]
+        run["confirmed"] = True
+        read_index = next(
+            index
+            for index, step in enumerate(run["plan"]["steps"])
+            if step["operation"] == "mixer_read_strip"
+        )
+        for step in run["plan"]["steps"][:read_index]:
+            step["status"] = "completed"
+        run["current"] = read_index
+        read_step = run["plan"]["steps"][read_index]
+        plugins.mix_audit_advance(
+            plan["plan_id"],
+            read_step["step_id"],
+            {
+                "ok": True,
+                "verified": True,
+                "name": "Master",
+                "path": "8.1",
+                "inserts": [],
+            },
+        )
+        steps = run["plan"]["steps"]
+        self.assertFalse(any(step["operation"] == "mix_expand_meter_steps" for step in steps))
+        limitation = next(step for step in steps if step["operation"] == "record_limitation")
+        self.assertIn("no existing analyzer insert", limitation["arguments"]["reason"])
 
 
 if __name__ == "__main__":

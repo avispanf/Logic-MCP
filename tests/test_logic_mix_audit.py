@@ -303,6 +303,49 @@ class InventoryTests(unittest.TestCase):
         self.assertEqual(master["kind"], "master")
         self.assertTrue(inventory["complete"])
 
+    def test_processed_stereo_out_is_not_overwritten_by_master_control_fader(self):
+        inventory = audit.normalise_inventory(
+            {
+                "data": [
+                    {
+                        "id": 51,
+                        "name": "Master",
+                        "type": "aux",
+                        "track_ref": "trk_master",
+                    }
+                ]
+            },
+            None,
+            {
+                "channels": [
+                    {
+                        "index": 83,
+                        "name": "Stereo Out",
+                        "path": "9.2.84",
+                        "output": "bounce",
+                        "inserts": ["Ozone 9 Elements", "Loudness Meter"],
+                        "detail": "full",
+                    },
+                    {
+                        "index": 84,
+                        "name": "Master",
+                        "path": "9.2.85",
+                        "output": "dim",
+                        "inserts": [],
+                        "detail": "full",
+                    },
+                ]
+            },
+        )
+        self.assertEqual(inventory["count"], 1)
+        master = inventory["channels"][0]
+        self.assertEqual(master["name"], "Master")
+        self.assertEqual(master["surface_index"], 83)
+        self.assertEqual(master["strip_path"], "9.2.84")
+        self.assertEqual(master["inserts"], ["Ozone 9 Elements", "Loudness Meter"])
+        self.assertEqual(len(inventory["suppressed_master_controls"]), 1)
+        self.assertEqual(inventory["suppressed_master_controls"][0]["name"], "Master")
+
 
 class PlanTests(unittest.TestCase):
     def test_project_master_without_surface_records_limitation(self):

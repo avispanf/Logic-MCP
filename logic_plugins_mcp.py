@@ -1262,6 +1262,7 @@ def plugin_parameters(
         'set lbl to ""\n'
         'set disp to ""\n'
         'set rol to ""\n'
+        'set opts to ""\n'
         "if bulkOK then\n"
         "try\n"
         "set lbl to (item i of labels) as string\n"
@@ -1286,7 +1287,30 @@ def plugin_parameters(
         "end try\n"
         "end try\n"
         "end if\n"
-        'set out to out & (i as string) & "~" & lbl & "~" & disp & "~" & rol & "|:|"\n'
+        'if rol is "AXRadioButton" then\n'
+        "try\n"
+        "set c to UI element 1 of row i of t\n"
+        "set childCount to count of UI elements of c\n"
+        "repeat with j from 2 to childCount\n"
+        'set optRole to ""\n'
+        'set optName to ""\n'
+        'set optValue to ""\n'
+        "try\n"
+        "set optRole to (role of UI element j of c) as string\n"
+        "end try\n"
+        'if optRole is "AXRadioButton" then\n'
+        "try\n"
+        "set optName to (name of UI element j of c) as string\n"
+        "end try\n"
+        "try\n"
+        "set optValue to (value of UI element j of c) as string\n"
+        "end try\n"
+        'set opts to opts & (j as string) & "^" & optName & "^" & optValue & "^" & optRole & ";"\n'
+        "end if\n"
+        "end repeat\n"
+        "end try\n"
+        "end if\n"
+        'set out to out & (i as string) & "~" & lbl & "~" & disp & "~" & rol & "~" & opts & "|:|"\n'
         "end repeat\n"
         'return (n as string) & "#" & out\n'
         "end tell",
@@ -1299,20 +1323,37 @@ def plugin_parameters(
         row_count = 0
     parameters = []
     for record in split_records(body):
-        parts = (record.split("~") + ["", "", "", ""])[:4]
+        parts = (record.split("~") + ["", "", "", "", ""])[:5]
         label = clean(parts[1]).rstrip(":").strip()
         display = clean(parts[2])
         if needle and needle not in label.lower():
             continue
-        parameters.append(
-            {
-                "row": int(parts[0]) if parts[0].isdigit() else None,
-                "label": label,
-                "display": display,
-                "role": parts[3],
-                "path": f"{table}.{parts[0]}.1.2" if parts[0].isdigit() else "",
-            }
-        )
+        parameter = {
+            "row": int(parts[0]) if parts[0].isdigit() else None,
+            "label": label,
+            "display": display,
+            "role": parts[3],
+            "path": f"{table}.{parts[0]}.1.2" if parts[0].isdigit() else "",
+        }
+        controls = []
+        if parts[0].isdigit():
+            for option in parts[4].split(";"):
+                if not option:
+                    continue
+                fields = (option.split("^") + ["", "", "", ""])[:4]
+                if not fields[0].isdigit():
+                    continue
+                controls.append(
+                    {
+                        "name": clean(fields[1]),
+                        "display": clean(fields[2]),
+                        "role": fields[3],
+                        "path": f"{table}.{parts[0]}.1.{fields[0]}",
+                    }
+                )
+        if controls:
+            parameter["controls"] = controls
+        parameters.append(parameter)
     matched_total = len(parameters) if needle else row_count
     if needle:
         parameters = parameters[page_offset : page_offset + page_limit]
@@ -2244,6 +2285,7 @@ def plugin_write_label_verified(
     expected_channel: str = "",
     expected_before: str = "",
     dry_run: bool = True,
+    option: str = "",
 ) -> dict:
     """Resolve an exact Controls-table label immediately before a verified write. This is
     the audit fix path: it does not reuse an earlier AX path, refuses ambiguous labels,
@@ -2281,7 +2323,18 @@ def plugin_write_label_verified(
             "paths": [entry.get("path") for entry in matches],
         }
     resolved = matches[0]
-    before = resolved.get("display", "")
+    controls = resolved.get("controls") if isinstance(resolved.get("controls"), list) else []
+    selected_controls = [
+        control
+        for control in controls
+        if str(control.get("display", "")).strip().casefold() in {"1", "true", "on"}
+    ]
+    selected_name = (
+        str(selected_controls[0].get("name") or "")
+        if len(selected_controls) == 1
+        else ""
+    )
+    before = selected_name or resolved.get("display", "")
     if expected_before and not values_match(expected_before, before):
         return {
             "ok": False,
@@ -2290,6 +2343,37 @@ def plugin_write_label_verified(
             "expected_before": expected_before,
             "observed_before": before,
             "path": resolved.get("path"),
+        }
+    if option:
+        option_matches = [
+            control
+            for control in controls
+            if str(control.get("name") or "").strip().casefold()
+            == option.strip().casefold()
+        ]
+        if len(option_matches) != 1:
+            return {
+                "ok": False,
+                "write_attempted": False,
+                "error": f"expected one radio option {option!r}, found {len(option_matches)}",
+                "options": [control.get("name") for control in controls],
+                "parameter": parameter,
+            }
+        chosen = option_matches[0]
+        outcome = plugin_write_path(
+            chosen["path"],
+            "1",
+            window_index=window_index,
+            dry_run=dry_run,
+            expected_plugin=expected_plugin,
+            expected_channel=expected_channel,
+        )
+        return {
+            **outcome,
+            "parameter": parameter,
+            "option": option,
+            "resolved_path": chosen.get("path"),
+            "resolved_before": before,
         }
     outcome = plugin_write_path(
         resolved["path"],
@@ -4065,6 +4149,162 @@ def locate_mixer(process: str, hint: str = "") -> dict:
     }
 
 
+MIXER_FILTER_NAMES = (
+    "Audio",
+    "Inst",
+    "Aux",
+    "Bus",
+    "Input",
+    "Output",
+    "Master/VCA",
+    "MIDI",
+)
+
+
+def read_mixer_filter_controls(process: str) -> tuple[int, dict[str, dict]]:
+    located = locate_mixer(process)
+    if not located.get("found"):
+        raise ProbeError(located.get("reason") or "Mixer is unavailable")
+    mixer_path = str(located["path"])
+    parent_path = mixer_path.rsplit(".", 1)[0]
+    toolbar_path = f"{parent_path}.1"
+    elements = walk_window(
+        process,
+        int(located["window_index"]),
+        3,
+        budget=180,
+        seconds=20,
+        root=toolbar_path,
+    )
+    controls = {
+        entry["description"]: entry
+        for entry in elements
+        if entry.get("role") == "AXCheckBox"
+        and entry.get("description") in MIXER_FILTER_NAMES
+    }
+    if set(controls) != set(MIXER_FILTER_NAMES):
+        raise ProbeError(
+            "Mixer category filters were incomplete: "
+            + ", ".join(sorted(controls))
+        )
+    return int(located["window_index"]), controls
+
+
+@tool
+def mixer_filters() -> dict:
+    """Read the eight Mixer category filters. Master audits use this snapshot before
+    temporarily showing only Output, because Logic exposes real insert names only for
+    visible strips and AXScrollToVisible is unsupported on output channel strips."""
+    process = require_logic()
+    try:
+        window_index, controls = read_mixer_filter_controls(process)
+    except ProbeError as exc:
+        return {"ok": False, "verified": False, "error": str(exc)}
+    values = {
+        name: str(entry.get("value") or "").strip().casefold()
+        in {"1", "true", "on"}
+        for name, entry in controls.items()
+    }
+    return {
+        "ok": True,
+        "verified": True,
+        "window_index": window_index,
+        "values": values,
+        "enabled": [name for name in MIXER_FILTER_NAMES if values[name]],
+        "paths": {name: controls[name]["path"] for name in MIXER_FILTER_NAMES},
+    }
+
+
+@tool
+def mixer_set_filters(enabled: list, dry_run: bool = True) -> dict:
+    """Set the Mixer category filter set with per-checkbox read-back. At least one
+    category must remain enabled. The caller should save mixer_filters first and restore
+    that exact set after any focused survey."""
+    requested = [str(name) for name in enabled]
+    unknown = sorted(set(requested) - set(MIXER_FILTER_NAMES))
+    if unknown:
+        return {"ok": False, "verified": False, "error": f"unknown filters: {unknown}"}
+    if not requested:
+        return {
+            "ok": False,
+            "verified": False,
+            "error": "at least one Mixer category must remain enabled",
+        }
+    process = require_logic()
+    try:
+        window_index, controls = read_mixer_filter_controls(process)
+    except ProbeError as exc:
+        return {"ok": False, "verified": False, "error": str(exc)}
+    wanted = set(requested)
+    before = {
+        name: str(entry.get("value") or "").strip().casefold()
+        in {"1", "true", "on"}
+        for name, entry in controls.items()
+    }
+    preview = {
+        "window_index": window_index,
+        "requested_enabled": [name for name in MIXER_FILTER_NAMES if name in wanted],
+        "before": before,
+    }
+    if dry_run:
+        return {
+            "ok": True,
+            "verified": False,
+            "dry_run": True,
+            "write_attempted": False,
+            **preview,
+        }
+    changed = []
+    for name in MIXER_FILTER_NAMES:
+        desired = name in wanted
+        if before[name] == desired:
+            continue
+        reference = element_reference(controls[name]["path"], window_index)
+        try:
+            osa(
+                f'tell application "System Events" to tell process "{process}" to '
+                f'perform action "AXPress" of {reference}',
+                timeout=20,
+            )
+        except ProbeError as exc:
+            return {
+                "ok": False,
+                "verified": False,
+                "write_attempted": True,
+                "changed": changed,
+                "error": f"{name} filter press failed: {exc}",
+                **preview,
+            }
+        time.sleep(0.15)
+        changed.append(name)
+    try:
+        _, after_controls = read_mixer_filter_controls(process)
+    except ProbeError as exc:
+        return {
+            "ok": False,
+            "verified": False,
+            "write_attempted": True,
+            "changed": changed,
+            "error": f"filter read-back failed: {exc}",
+            **preview,
+        }
+    after = {
+        name: str(entry.get("value") or "").strip().casefold()
+        in {"1", "true", "on"}
+        for name, entry in after_controls.items()
+    }
+    matches = all(after[name] == (name in wanted) for name in MIXER_FILTER_NAMES)
+    return {
+        "ok": matches,
+        "verified": matches,
+        "write_attempted": bool(changed),
+        "changed": changed,
+        "after": after,
+        **preview,
+        **({} if matches else {"error": "Mixer filter read-back did not match"}),
+    }
+
+
 @tool
 def mixer_locate(hint: str = "") -> dict:
     """Find where the Mixer pane currently sits in the main window's accessibility tree.
@@ -5379,13 +5619,14 @@ def mix_audit_advance(plan_id: str, step_id: str, result: dict) -> dict:
             None,
         )
         inserts = result.get("inserts") if isinstance(result.get("inserts"), list) else []
-        if target is not None and inserts:
+        if target is not None:
             target["inserts"] = inserts
             target["strip_path"] = result.get("path") or target.get("strip_path")
-            expanded = mix_audit.build_plugin_inspection_steps(
-                step.get("plugin_prefix") or step["step_id"], target, inserts
-            )
-            run["plan"]["steps"][run["current"] : run["current"]] = expanded
+            if inserts:
+                expanded = mix_audit.build_plugin_inspection_steps(
+                    step.get("plugin_prefix") or step["step_id"], target, inserts
+                )
+                run["plan"]["steps"][run["current"] : run["current"]] = expanded
             meter_placeholder = next(
                 (
                     pending

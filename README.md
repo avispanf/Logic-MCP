@@ -36,7 +36,11 @@ changed. `meter_watch` polls meter values during playback.
 **Application.** `menu_list` and `menu_click` navigate Logic's menus, with destructive items
 refused unless explicitly allowed. `surfaces_bypass` reads and sets Bypass All Control
 Surfaces, which silences an attached control surface without disturbing its port
-assignment. `ax_show_menu` exposes context-menu capabilities without clicking them, and
+assignment. `surfaces_doctor` is the read-only preflight for phantom fader or automation
+jumps: it checks the expected MCU source/destination pair directly through CoreMIDI,
+separates harmless duplicate general-MIDI ports from competing MCU namespaces, reports
+duplicate server processes, and flags stale `[audit]`/`[test]` port references retained in
+Logic's control-surface preferences. `ax_show_menu` exposes context-menu capabilities without clicking them, and
 `close_plugin_windows` clears editor dialogs without closing the project window.
 
 **Mix audit orchestration.** `mix_inventory` merges the mature server's `logic://tracks`
@@ -120,7 +124,7 @@ code update so its long-running stdio process registers the current tool set.
 
 The companion MCU server used for the verified three-server setup is the patched
 [avispanf/logic-pro-mcp](https://github.com/avispanf/logic-pro-mcp) fork at commit
-`14f6828`. It coalesces overlapping background/explicit AX refreshes, gives the measured
+`6e340bd`. It coalesces overlapping background/explicit AX refreshes, gives the measured
 full-cache operation a bounded 90-second deadline, and returns schema-valid structured
 content even for legacy prose responses. Give each concurrently running MCP client
 its own stable MIDI namespace:
@@ -196,6 +200,10 @@ non-overwriting WAV, measured with BS.1770, and restored before the next target.
 evidence is stored in `runner.jsonl`; `summary.json` and bounded stdout contain compact
 progress and results. Off-screen tracks whose insert names Logic does not expose are
 still measured, but their plugin chains are recorded as unreadable rather than guessed.
+Do not leave the standalone runner alive during ordinary mouse/trackpad editing while the
+`[codex]` surface is also active: two live MCU namespaces can address the same channel
+strip. Run `surfaces_doctor` first; after an audit, its stale-reference warning is expected
+until the temporary surface is removed from Logic's Control Surface Setup.
 
 macOS permissions: Accessibility must be granted to the process that launches the
 server, not to the script. Automation for Logic Pro and System Events is also required.

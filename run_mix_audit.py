@@ -57,6 +57,22 @@ def verified(result: dict) -> bool:
     )
 
 
+def state_boolean(value: Any, default: bool | None = None) -> bool | None:
+    """Decode Logic/MCP boolean state without treating the string ``false`` as true."""
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    if isinstance(value, (int, float)):
+        return value != 0
+    folded = str(value).strip().casefold()
+    if folded in {"1", "true", "on", "yes", "enabled", "selected"}:
+        return True
+    if folded in {"0", "false", "off", "no", "disabled", "not selected"}:
+        return False
+    return default
+
+
 def track_name_in_snapshot(observed: str, snapshot_names: set[str]) -> bool:
     """Match exact project names plus Logic's one measured output alias."""
     folded = str(observed or "").strip().casefold()
@@ -348,9 +364,15 @@ class AuditRunner:
         self.track_state = {
             int(row.get("index", row.get("id"))): {
                 "name": row.get("name"),
-                "solo": bool(row.get("isSoloed", row.get("solo", False))),
-                "mute": bool(row.get("isMuted", row.get("mute", False))),
-                "selected": bool(row.get("isSelected", row.get("selected", False))),
+                "solo": state_boolean(
+                    row.get("isSoloed", row.get("solo")), False
+                ),
+                "mute": state_boolean(
+                    row.get("isMuted", row.get("mute")), False
+                ),
+                "selected": state_boolean(
+                    row.get("isSelected", row.get("selected")), False
+                ),
             }
             for row in tracks
             if row.get("index", row.get("id")) is not None
@@ -364,9 +386,13 @@ class AuditRunner:
             )
         self.transport_position = state.get("position")
         self.initial_transport_position = self.transport_position
-        self.transport_playing = bool(state.get("isPlaying", state.get("playing", False)))
+        self.transport_playing = state_boolean(
+            state.get("isPlaying", state.get("playing")), False
+        )
         self.initial_transport_playing = self.transport_playing
-        self.cycle_enabled = bool(state.get("isCycleEnabled", state.get("cycle", False)))
+        self.cycle_enabled = state_boolean(
+            state.get("isCycleEnabled", state.get("cycle")), False
+        )
         self.initial_cycle_enabled = self.cycle_enabled
         for row in ax_state:
             path = row.get("strip_path")
@@ -407,8 +433,99 @@ class AuditRunner:
                 continue
             for key in keys:
                 if key in row:
-                    return bool(row[key])
+                    return state_boolean(row[key])
         return None
+
+    async def survey_mixer(self) -> dict:
+        """Read the whole Mixer in bounded pages.
+
+        ``mixer_survey.strip_limit`` is a page size, not a total inventory cap.  A
+        single call silently omitted later Aux/Bus strips when the project was wider
+        than that page, which made exact selectors fail as if the target did not
+        exist.  Keep paging from ``next_offset`` and de-duplicate retry pages by the
+        stable AX strip path.
+        """
+        offset = 0
+        pages = []
+        channels: dict[str, dict] = {}
+        incomplete: dict[str, dict] = {}
+        last: dict = {}
+        for page_number in range(1, 1001):
+            page = await self.tool(
+                "plugins",
+                "mixer_survey",
+                {
+                    "offset": offset,
+                    "strip_limit": self.args.strip_limit,
+                    "per_strip_seconds": self.args.per_strip_seconds,
+                    "total_seconds": self.args.survey_seconds,
+                },
+            )
+            if page.get("error"):
+                raise RuntimeError(f"Mixer survey failed at offset {offset}: {page}")
+            last = page
+            for row in page.get("channels", []):
+                key = str(row.get("path") or f"index:{row.get('index')}")
+                channels[key] = row
+                incomplete.pop(key, None)
+            for row in page.get("strips_incomplete", []):
+                key = str(row.get("path") or f"index:{row.get('index')}")
+                if key not in channels:
+                    incomplete[key] = row
+            next_offset = page.get("next_offset")
+            total = int(page.get("strips_total") or 0)
+            pages.append(
+                {
+                    "page": page_number,
+                    "offset": offset,
+                    "returned": len(page.get("channels", [])),
+                    "next_offset": next_offset,
+                    "strips_total": total,
+                }
+            )
+            self.emit("mixer_survey_page", **pages[-1])
+            if next_offset is None or int(next_offset) >= total:
+                break
+            next_offset = int(next_offset)
+            if next_offset <= offset:
+                raise RuntimeError(
+                    f"Mixer survey did not advance: offset={offset}, next={next_offset}"
+                )
+            offset = next_offset
+        else:  # pragma: no cover - defensive runaway guard
+            raise RuntimeError("Mixer survey exceeded 1000 pages")
+
+        ordered = sorted(
+            channels.values(),
+            key=lambda row: (
+                row.get("index") is None,
+                row.get("index") if row.get("index") is not None else 10**9,
+                str(row.get("path") or ""),
+            ),
+        )
+        pending = sorted(
+            incomplete.values(),
+            key=lambda row: (
+                row.get("index") is None,
+                row.get("index") if row.get("index") is not None else 10**9,
+            ),
+        )
+        result = copy.deepcopy(last)
+        result.update(
+            {
+                "offset": 0,
+                "channels": ordered,
+                "strips_parsed": len(ordered),
+                "strips_incomplete": pending,
+                "retry_offsets": [row.get("index") for row in pending],
+                "pages": pages,
+                "pages_completed": len(pages),
+                "complete": bool(result.get("strips_total"))
+                and len(ordered) == int(result["strips_total"])
+                and not pending,
+            }
+        )
+        return result
 
     async def execute_track_child(self, arguments: dict) -> dict:
         command = arguments.get("command")
@@ -589,11 +706,11 @@ class AuditRunner:
         state = extract_transport_state(payload)
         if state is not None:
             self.transport_position = state.get("position", self.transport_position)
-            self.transport_playing = bool(
-                state.get("isPlaying", state.get("playing", self.transport_playing))
+            self.transport_playing = state_boolean(
+                state.get("isPlaying", state.get("playing")), self.transport_playing
             )
-            self.cycle_enabled = bool(
-                state.get("isCycleEnabled", state.get("cycle", self.cycle_enabled))
+            self.cycle_enabled = state_boolean(
+                state.get("isCycleEnabled", state.get("cycle")), self.cycle_enabled
             )
             return state
         return {}
@@ -943,16 +1060,7 @@ class AuditRunner:
                     enabled=["Output"],
                 )
             if audit_requires_mixer_survey(self.args.scope):
-                survey = await self.tool(
-                    "plugins",
-                    "mixer_survey",
-                    {
-                        "offset": 0,
-                        "strip_limit": self.args.strip_limit,
-                        "per_strip_seconds": self.args.per_strip_seconds,
-                        "total_seconds": self.args.survey_seconds,
-                    },
-                )
+                survey = await self.survey_mixer()
             else:
                 # Every project-track target is explicitly selected and then read from
                 # the always-visible Inspector. A full Mixer survey adds minutes and

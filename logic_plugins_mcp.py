@@ -4783,12 +4783,126 @@ def mixer_set_toggle(
     except ProbeError as exc:
         return {"ok": False, "verified": False, **preview, "error": str(exc)}
     after = toggle_value(after_raw)
+    verification_source = "direct_control_readback"
+    refresh = None
+    if after != bool(enabled):
+        # Logic 12.3 can keep the AXValue of an off-screen Aux/Bus strip stale even
+        # after AXPress has changed the real channel.  Re-render a focused Mixer
+        # surface, bind the strip again by its exact name, and verify there.  The
+        # caller's filter set is restored in all cases; a failed restoration makes
+        # the whole operation fail closed even if the channel write itself verified.
+        try:
+            snapshot = mixer_filters()
+        except Exception as exc:  # pragma: no cover - defensive MCP boundary
+            snapshot = {"ok": False, "error": str(exc)}
+        if snapshot.get("ok") and snapshot.get("verified"):
+            original_enabled = list(snapshot.get("enabled") or [])
+            refresh = {
+                "attempted": True,
+                "original_filters": original_enabled,
+                "categories_tried": [],
+            }
+            focused_result = None
+            restore_result = None
+            try:
+                for category in ("Aux", "Bus"):
+                    refresh["categories_tried"].append(category)
+                    focused = mixer_set_filters([category], dry_run=False)
+                    if not focused.get("ok") or not focused.get("verified"):
+                        continue
+                    index = mixer_strips()
+                    matches = [
+                        item
+                        for item in index.get("strips", [])
+                        if str(item.get("name") or "").casefold()
+                        == expected_strip.casefold()
+                    ]
+                    if len(matches) != 1:
+                        continue
+                    fresh_path = str(matches[0]["path"])
+                    try:
+                        fresh_kids = walk_window(
+                            process,
+                            int(index["window_index"]),
+                            0,
+                            budget=350,
+                            seconds=20,
+                            root=fresh_path,
+                        )
+                    except ProbeError:
+                        continue
+                    fresh_strip = parse_strip("", fresh_path, fresh_kids)
+                    fresh_name = fresh_strip.get("name") or ""
+                    if fresh_name.casefold() != expected_strip.casefold():
+                        continue
+                    fresh_raw = fresh_strip.get(control)
+                    fresh_value = toggle_value(fresh_raw)
+                    fresh_control_path = fresh_strip.get("control_paths", {}).get(control)
+                    if fresh_value != bool(enabled) and fresh_control_path:
+                        fresh_reference = element_reference(
+                            fresh_control_path, int(index["window_index"])
+                        )
+                        try:
+                            osa(
+                                f'tell application "System Events" to tell process "{process}" to '
+                                f'perform action "AXPress" of {fresh_reference}',
+                                timeout=20,
+                            )
+                            time.sleep(0.35)
+                            fresh_kids = walk_window(
+                                process,
+                                int(index["window_index"]),
+                                0,
+                                budget=350,
+                                seconds=20,
+                                root=fresh_path,
+                            )
+                            fresh_strip = parse_strip("", fresh_path, fresh_kids)
+                            fresh_raw = fresh_strip.get(control)
+                            fresh_value = toggle_value(fresh_raw)
+                        except ProbeError:
+                            fresh_value = None
+                    focused_result = {
+                        "category": category,
+                        "strip_path": fresh_path,
+                        "control_path": fresh_control_path,
+                        "after": fresh_value,
+                    }
+                    after = fresh_value
+                    if after == bool(enabled):
+                        verification_source = "focused_mixer_readback"
+                    break
+            finally:
+                if original_enabled:
+                    restore_result = mixer_set_filters(original_enabled, dry_run=False)
+                else:
+                    restore_result = {
+                        "ok": False,
+                        "verified": False,
+                        "error": "original Mixer filter set was empty",
+                    }
+            refresh["focused_result"] = focused_result
+            refresh["restore"] = restore_result
+            if not restore_result.get("ok") or not restore_result.get("verified"):
+                return {
+                    "ok": False,
+                    "verified": False,
+                    "changed": after != before,
+                    "after": after,
+                    "write_verified": after == bool(enabled),
+                    "verification_source": verification_source,
+                    "refresh": refresh,
+                    **preview,
+                    "error": "Mixer filter restoration failed",
+                }
     verified = after == bool(enabled)
     return {
         "ok": verified,
         "verified": verified,
         "changed": after != before,
         "after": after,
+        "verification_source": verification_source,
+        **({"refresh": refresh} if refresh is not None else {}),
         **preview,
         "note": "state read-back did not match" if not verified else "",
     }

@@ -538,15 +538,25 @@ def resolve_targets(channels: list[dict], scope: str, selector: str = "") -> dic
         if primary:
             refs.append(primary)
         if target["kind"] == "group":
+            # Missing relationship metadata must not become a relationship.  The
+            # exact-name fallback used for mixer-only Aux/group strips has no
+            # target_ref; retaining its empty string made it intersect every track
+            # whose group/parent_ref was also absent, effectively treating the whole
+            # project as one group and soloing every track.
             group_tokens = {
-                str(channel.get("name") or "").casefold(),
-                str(channel.get("audit_id") or "").casefold(),
-                str(channel.get("target_ref") or "").casefold(),
+                token
+                for value in (
+                    channel.get("name"),
+                    channel.get("audit_id"),
+                    channel.get("target_ref"),
+                )
+                if (token := str(value or "").strip().casefold())
             }
             for member in channels:
                 parent_tokens = {
-                    str(member.get("group") or "").casefold(),
-                    str(member.get("parent_ref") or "").casefold(),
+                    token
+                    for value in (member.get("group"), member.get("parent_ref"))
+                    if (token := str(value or "").strip().casefold())
                 }
                 if group_tokens & parent_tokens:
                     ref = member.get("track_ref") or (

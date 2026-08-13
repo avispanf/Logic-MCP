@@ -106,6 +106,40 @@ class AuditRunnerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(runner.transport_playing)
         self.assertFalse(runner.cycle_enabled)
 
+    def test_capture_known_state_decodes_serialized_false_values(self):
+        runner = runner_module.AuditRunner(arguments())
+        resources = {
+            "logic://tracks": {
+                "data": [
+                    {
+                        "id": 7,
+                        "name": "Lead",
+                        "isSoloed": "false",
+                        "isMuted": "off",
+                        "isSelected": "0",
+                    }
+                ]
+            },
+            "logic://transport/state": {
+                "data": {
+                    "state": {
+                        "position": "1.1.1.1",
+                        "isPlaying": "false",
+                        "isCycleEnabled": "0",
+                    }
+                }
+            },
+        }
+
+        runner.capture_known_state(resources, [])
+
+        self.assertEqual(
+            runner.track_state[7],
+            {"name": "Lead", "solo": False, "mute": False, "selected": False},
+        )
+        self.assertFalse(runner.transport_playing)
+        self.assertFalse(runner.cycle_enabled)
+
     def test_cli_does_not_silently_narrow_all_scope(self):
         parsed = runner_module.parser().parse_args(["--scope", "all", "--confirmed"])
         self.assertEqual(parsed.selector, "")
@@ -182,6 +216,49 @@ class AuditRunnerTests(unittest.IsolatedAsyncioTestCase):
         runner.tool.assert_awaited_once_with(
             "core", "logic_system", {"command": "refresh_cache", "params": {}}
         )
+
+    async def test_mixer_survey_pages_until_late_named_aux_is_included(self):
+        args = arguments()
+        args.strip_limit = 2
+        args.per_strip_seconds = 4
+        args.survey_seconds = 30
+        runner = runner_module.AuditRunner(args)
+        runner.tool = mock.AsyncMock(
+            side_effect=[
+                {
+                    "strips_total": 4,
+                    "offset": 0,
+                    "next_offset": 2,
+                    "channels": [
+                        {"index": 0, "path": "9.2.1", "name": "Kick"},
+                        {"index": 1, "path": "9.2.2", "name": "Bass"},
+                    ],
+                    "strips_incomplete": [],
+                },
+                {
+                    "strips_total": 4,
+                    "offset": 2,
+                    "next_offset": 4,
+                    "channels": [
+                        {"index": 2, "path": "9.2.3", "name": "VOCALS MASTER"},
+                        {"index": 3, "path": "9.2.4", "name": "Stereo Out"},
+                    ],
+                    "strips_incomplete": [],
+                },
+            ]
+        )
+        runner.emit = mock.Mock()
+
+        result = await runner.survey_mixer()
+
+        self.assertTrue(result["complete"])
+        self.assertEqual(result["pages_completed"], 2)
+        self.assertEqual(
+            [row["name"] for row in result["channels"]],
+            ["Kick", "Bass", "VOCALS MASTER", "Stereo Out"],
+        )
+        self.assertEqual(runner.tool.await_args_list[0].args[2]["offset"], 0)
+        self.assertEqual(runner.tool.await_args_list[1].args[2]["offset"], 2)
 
     def test_emit_keeps_full_journal_but_compacts_progress(self):
         runner = runner_module.AuditRunner(arguments())

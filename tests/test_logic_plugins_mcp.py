@@ -683,6 +683,116 @@ class MixerParsingTests(unittest.TestCase):
         self.assertNotIn("already_visible", result)
         self.assertEqual(osa.call_count, 2)
 
+    def test_mixer_toggle_refreshes_stale_offscreen_readback_and_restores_filters(self):
+        stale = {
+            "name": "VOCALS MASTER",
+            "mute": "on",
+            "solo": "off",
+            "control_paths": {"mute": "9.2.64.2", "solo": "9.2.64.3"},
+        }
+        refreshed = {
+            "name": "VOCALS MASTER",
+            "mute": "off",
+            "solo": "off",
+            "control_paths": {"mute": "9.2.5.2", "solo": "9.2.5.3"},
+        }
+        filters = {
+            "ok": True,
+            "verified": True,
+            "enabled": ["Audio", "Inst", "Aux", "Bus", "Output"],
+        }
+        applied = {"ok": True, "verified": True}
+        with (
+            mock.patch.object(plugins, "require_logic", return_value="Logic Pro"),
+            mock.patch.object(plugins, "main_window_index", return_value=1),
+            mock.patch.object(plugins, "walk_window", return_value=[]),
+            mock.patch.object(plugins, "parse_strip", side_effect=[stale, refreshed]),
+            mock.patch.object(plugins, "read_value", return_value="on"),
+            mock.patch.object(plugins, "mixer_filters", return_value=filters),
+            mock.patch.object(
+                plugins, "mixer_set_filters", side_effect=[applied, applied]
+            ) as set_filters,
+            mock.patch.object(
+                plugins,
+                "mixer_strips",
+                return_value={
+                    "count": 1,
+                    "window_index": 1,
+                    "strips": [
+                        {"index": 0, "path": "9.2.5", "name": "VOCALS MASTER"}
+                    ],
+                },
+            ),
+            mock.patch.object(plugins, "osa"),
+            mock.patch.object(plugins.time, "sleep"),
+        ):
+            result = plugins.mixer_set_toggle(
+                "9.2.64", "mute", False, "VOCALS MASTER", dry_run=False
+            )
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["after"], False)
+        self.assertEqual(result["verification_source"], "focused_mixer_readback")
+        self.assertEqual(set_filters.call_args_list[0].args[0], ["Aux"])
+        self.assertEqual(set_filters.call_args_list[1].args[0], filters["enabled"])
+        self.assertTrue(result["refresh"]["restore"]["verified"])
+
+    def test_mixer_toggle_fails_closed_when_filter_restore_fails(self):
+        stale = {
+            "name": "VOCALS MASTER",
+            "mute": "on",
+            "solo": "off",
+            "control_paths": {"mute": "9.2.64.2", "solo": "9.2.64.3"},
+        }
+        refreshed = {
+            "name": "VOCALS MASTER",
+            "mute": "off",
+            "solo": "off",
+            "control_paths": {"mute": "9.2.5.2", "solo": "9.2.5.3"},
+        }
+        with (
+            mock.patch.object(plugins, "require_logic", return_value="Logic Pro"),
+            mock.patch.object(plugins, "main_window_index", return_value=1),
+            mock.patch.object(plugins, "walk_window", return_value=[]),
+            mock.patch.object(plugins, "parse_strip", side_effect=[stale, refreshed]),
+            mock.patch.object(plugins, "read_value", return_value="on"),
+            mock.patch.object(
+                plugins,
+                "mixer_filters",
+                return_value={"ok": True, "verified": True, "enabled": ["Aux"]},
+            ),
+            mock.patch.object(
+                plugins,
+                "mixer_set_filters",
+                side_effect=[
+                    {"ok": True, "verified": True},
+                    {"ok": False, "verified": False, "error": "restore failed"},
+                ],
+            ),
+            mock.patch.object(
+                plugins,
+                "mixer_strips",
+                return_value={
+                    "count": 1,
+                    "window_index": 1,
+                    "strips": [
+                        {"index": 0, "path": "9.2.5", "name": "VOCALS MASTER"}
+                    ],
+                },
+            ),
+            mock.patch.object(plugins, "osa"),
+            mock.patch.object(plugins.time, "sleep"),
+        ):
+            result = plugins.mixer_set_toggle(
+                "9.2.64", "mute", False, "VOCALS MASTER", dry_run=False
+            )
+
+        self.assertFalse(result["ok"])
+        self.assertFalse(result["verified"])
+        self.assertTrue(result["write_verified"])
+        self.assertIn("restoration failed", result["error"])
+
     def test_ax_order_is_reversed_into_signal_flow(self):
         kids = [
             {"role": "AXSlider", "description": "send knob", "value": "-20"},

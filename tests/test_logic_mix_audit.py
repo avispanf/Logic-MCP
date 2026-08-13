@@ -149,6 +149,58 @@ class InventoryTests(unittest.TestCase):
         self.assertFalse(target["membership_complete"])
         self.assertEqual(target["isolation_refs"], ["trk_drums"])
 
+    def test_mixer_only_group_fallback_does_not_match_missing_parent_metadata(self):
+        tracks = {
+            "data": [
+                {
+                    "id": index,
+                    "name": name,
+                    "type": "audio",
+                    "track_ref": f"trk_{index}",
+                    "isSoloed": False,
+                }
+                for index, name in enumerate(("Lead", "Synth", "Kick"))
+            ]
+        }
+        ax = {
+            "channels": [
+                {
+                    "index": 63,
+                    "name": "VOCALS MASTER",
+                    "path": "9.2.64",
+                    "solo": "off",
+                }
+            ]
+        }
+        channels = audit.normalise_inventory(tracks, None, ax)["channels"]
+
+        resolved = audit.resolve_targets(channels, "group", "VOCALS MASTER")
+
+        self.assertTrue(resolved["group_selector_fallback"])
+        target = resolved["targets"][0]
+        self.assertEqual(target["sources"], ["ax"])
+        self.assertEqual(target["isolation_refs"], [])
+        dispatch = audit.build_isolation_dispatch(
+            {"logic://tracks": tracks},
+            target,
+            [
+                {
+                    "name": "VOCALS MASTER",
+                    "strip_path": "9.2.64",
+                    "solo": "off",
+                }
+            ],
+        )
+        enabled_tracks = [
+            item
+            for item in dispatch["dispatches"]
+            if item["operation"] == "arrange_track_set_toggle"
+            and item["arguments"]["enabled"]
+        ]
+        self.assertEqual(enabled_tracks, [])
+        self.assertEqual(dispatch["dispatches"][-1]["operation"], "mixer_set_toggle")
+        self.assertTrue(dispatch["dispatches"][-1]["arguments"]["enabled"])
+
     def test_real_v313_track_and_mixer_resource_keys_merge(self):
         inventory = audit.normalise_inventory(
             {

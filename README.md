@@ -43,6 +43,87 @@ duplicate server processes, and flags stale `[audit]`/`[test]` port references r
 Logic's control-surface preferences. `ax_show_menu` exposes context-menu capabilities without clicking them, and
 `close_plugin_windows` clears editor dialogs without closing the project window.
 
+### Shared LogicProMCP transport
+
+Desktop MCP clients can open one STDIO server process per task or connection. Since each
+`LogicProMCP` process publishes its own CoreMIDI endpoints, that setup makes Logic report
+changing input/output counts and can leave several MCU namespaces competing for the same
+control surface. The local bridge owns one persistent `LogicProMCP` process and shares it
+between clients over loopback-only Streamable HTTP. Requests are serialized so two clients
+cannot drive Logic or MCU at the same time.
+
+Install or update the per-user LaunchAgent:
+
+```bash
+./scripts/install_logic_http_bridge.sh
+curl --fail http://127.0.0.1:8765/health
+```
+
+Point every local MCP client at the same URL instead of launching the binary directly:
+
+```toml
+[mcp_servers.logic-pro]
+url = "http://127.0.0.1:8765/mcp"
+startup_timeout_sec = 20
+tool_timeout_sec = 180
+```
+
+```json
+{
+  "mcpServers": {
+    "logic-pro": {
+      "url": "http://127.0.0.1:8765/mcp"
+    }
+  }
+}
+```
+
+Restart each desktop MCP client after changing its configuration. The bridge remains alive
+across client restarts and exposes only one stable `LogicProMCP-MCU-Internal [bridge]`
+endpoint pair. Logs are written to `~/Library/Logs/LogicProMCPBridge.log` and
+`~/Library/Logs/LogicProMCPBridge.error.log`. When present, the bridge prefers the patched
+`~/.local/bin/LogicProMCP-codex` binary that supports deterministic instance names; its
+`/health` response reports the exact backend path in use.
+
+### One-click MCP/MCU switch
+
+The companion app adds a macOS menu-bar switch and a floating button near the upper-right
+corner of Logic's display. Click **MCP ON** to enter **MANUAL · MCP OFF**. Manual mode
+suspends the shared bridge, LogicProMCP/MCU backend, custom plugin/audio servers, audit
+runner and their child processes. This stops background AX polling and in-flight
+AppleScript workers as well as MIDI commands. The switch itself never reads Logic menus,
+sends Apple Events or changes project settings. It does not require Accessibility access.
+
+The controller verifies OS process stop states, records process identity before suspending,
+and resumes only the processes it stopped. Existing MIDI endpoints stay allocated while
+their owner is paused. New Python MCP sessions wait before opening Logic/MIDI channels;
+the menu-bar app also checks for newly launched workers every two seconds. Manual mode
+persists in `~/Library/Application Support/LogicMCP/manual-mode.json` across app restarts.
+External hardware control surfaces are unaffected.
+
+Click again to resume automation, including any paused jobs. MCP clients may show timeouts
+while manual mode is active; that is expected. Use **MCP CHECK** as an unverified state,
+not confirmation that manual mode is active. Run the explicit recovery command below if
+the menu-bar app is unavailable. Logic itself does not need restarting.
+
+Install or update it with:
+
+```bash
+./scripts/install_menubar_toggle.sh
+```
+
+The installer builds the native AppKit app under `~/Applications`, registers a per-user
+LaunchAgent, and starts it at login. The floating button hides when another app is in
+front. The executable accepts `--status`, `--toggle`, `--manual` and `--automatic`.
+The helper can also be used directly (its `status` command enforces an existing manual
+pause and reports verification):
+
+```bash
+~/dev/venv/bin/python logic_manual_mode.py pause
+~/dev/venv/bin/python logic_manual_mode.py status
+~/dev/venv/bin/python logic_manual_mode.py resume
+```
+
 **Mix audit orchestration.** `mix_inventory` merges the mature server's `logic://tracks`
 and `logic://mixer` resources with `mixer_survey`, preserving stable track references and
 AX-only Aux/Bus paths. Project-track indices and visible-mixer positions are separate
@@ -124,22 +205,18 @@ code update so its long-running stdio process registers the current tool set.
 
 The companion MCU server used for the verified three-server setup is the patched
 [avispanf/logic-pro-mcp](https://github.com/avispanf/logic-pro-mcp) fork at commit
-`6e340bd`. It coalesces overlapping background/explicit AX refreshes, gives the measured
+`2cb0dfa`. It coalesces overlapping background/explicit AX refreshes, gives the measured
 full-cache operation a bounded 90-second deadline, and returns schema-valid structured
-content even for legacy prose responses. Give each concurrently running MCP client
-its own stable MIDI namespace:
+content even for legacy prose responses. Run it through the shared HTTP bridge described
+above so all desktop clients use one stable MIDI namespace:
 
 ```toml
 [mcp_servers.logic-pro]
-command = "/absolute/path/to/LogicProMCP"
-
-[mcp_servers.logic-pro.env]
-LOGIC_PRO_MCP_MIDI_INSTANCE_ID = "codex"
-LOGIC_PRO_MCP_SHARE_DIR = "/opt/homebrew/opt/logic-pro-mcp/share/logic-pro-mcp"
+url = "http://127.0.0.1:8765/mcp"
 ```
 
 In Logic Pro > Control Surfaces > Setup, assign both input and output to
-`LogicProMCP-MCU-Internal [codex]` once. The endpoint keeps a deterministic CoreMIDI
+`LogicProMCP-MCU-Internal [bridge]` once. The endpoint keeps a deterministic CoreMIDI
 identity, so Logic reconnects after the MCP process restarts without rebuilding the
 control surface. The patched `set_master_volume` also verifies through the Control Bar
 AX slider when Logic does not echo the master-fader move over MCU; it does not report a

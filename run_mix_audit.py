@@ -9,6 +9,10 @@ It never creates a parameter-write plan; fixes remain a separate workflow.
 
 from __future__ import annotations
 
+if __name__ == "__main__":
+    from logic_manual_mode import wait_for_automatic_mode
+    wait_for_automatic_mode()
+
 import argparse
 import asyncio
 import copy

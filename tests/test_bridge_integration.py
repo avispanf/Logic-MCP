@@ -31,7 +31,7 @@ class HTTPIntegrationTests(unittest.IsolatedAsyncioTestCase):
             log = (root / 'service.log').open('w+')
             process = subprocess.Popen(cmd, env=env, stdout=log, stderr=log)
             def health():
-                with urlopen(f'http://127.0.0.1:{port}/health', timeout=1) as response:
+                with urlopen(f'http://127.0.0.1:{port}/health', timeout=5) as response:
                     return json.load(response)
             async def wait_backend():
                 for _ in range(100):

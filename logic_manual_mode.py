@@ -5,6 +5,7 @@ import ctypes
 import fcntl
 import json
 import os
+import plistlib
 from pathlib import Path
 import shlex
 import signal
@@ -156,11 +157,24 @@ def signal_verified(record, signum):
 
 
 def supervisors(rows):
+    result = set()
+    # The installed LaunchAgent identifies the bundled supervisor before Python/SDK
+    # imports finish. Otherwise the menu could stop its own service during cold start.
+    path = Path.home() / "Library/LaunchAgents/com.avispanf.logic-pro-mcp-bridge.plist"
+    try:
+        agent = plistlib.loads(path.read_bytes())
+        arguments = agent.get("ProgramArguments", [])
+        if agent.get("Label") == "com.avispanf.logic-pro-mcp-bridge" and len(arguments) == 2 and arguments[1] == "--service" and Path(arguments[0]).name == "logic-mcp":
+            result.update(pid for pid, row in rows.items() if row.get("argv") == arguments)
+    except (OSError, ValueError, TypeError):
+        pass
     try:
         record = json.loads((STATE_DIR / "supervisor.json").read_text())
-        return {record["pid"]} if same_process(record, rows.get(record["pid"])) else set()
+        if same_process(record, rows.get(record["pid"])):
+            result.add(record["pid"])
     except (OSError, ValueError, KeyError, TypeError):
-        return set()
+        pass
+    return result
 
 
 def idle_workers(rows):

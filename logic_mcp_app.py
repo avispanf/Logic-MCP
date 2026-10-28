@@ -127,8 +127,10 @@ def main():
         print('MCP STDIO server: connect a client; --check runs diagnostics. Manual mode rejects tool calls.')
         return 0
     if args.service:
-        import logic_pro_http_bridge
-        logic_pro_http_bridge.main()
+        import logic_manual_mode as manual
+        with manual.register_supervisor():
+            import logic_pro_http_bridge
+            logic_pro_http_bridge.main()
     elif args.plugins:
         import logic_plugins_mcp
         logic_plugins_mcp.main()

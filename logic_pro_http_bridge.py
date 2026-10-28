@@ -220,8 +220,11 @@ async def serve(args):
 
         async def health(_):
             paused = manual.STATE_FILE.exists()
-            running = subprocess.run(["/usr/bin/pgrep", "-x", "Logic Pro"], capture_output=True).returncode == 0
             backend_ready = state.session is not None and (state.lock.locked() or time.monotonic() - state.last_ping < 30)
+            running = False
+            if not paused and backend_ready:
+                running = await anyio.to_thread.run_sync(lambda: subprocess.run(
+                    ["/usr/bin/pgrep", "-x", "Logic Pro"], capture_output=True, timeout=3).returncode == 0)
             status = "manual" if paused else "offline" if not backend_ready else "logic-closed" if not running else "ready"
             if status == "ready" and any(tool.name == "logic_system" for tool in state.tools.tools):
                 permissions = state.capabilities.get("permissions", {})

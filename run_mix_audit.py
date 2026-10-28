@@ -9,10 +9,6 @@ It never creates a parameter-write plan; fixes remain a separate workflow.
 
 from __future__ import annotations
 
-if __name__ == "__main__":
-    from logic_manual_mode import wait_for_automatic_mode
-    wait_for_automatic_mode()
-
 import argparse
 import asyncio
 import copy
@@ -28,11 +24,14 @@ from typing import Any
 
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
+from mcp.client.streamable_http import streamable_http_client
+from mcp_types import RequestParamsMeta
+import logic_control as control
+import logic_manual_mode as manual
 
 
 ROOT = Path(__file__).resolve().parent
-DEFAULT_PYTHON = Path("/Users/avispanf/dev/venv/bin/python")
-DEFAULT_CORE = Path("/Users/avispanf/.local/bin/LogicProMCP-codex")
+DEFAULT_PYTHON = Path(sys.executable)
 
 
 def json_text(result: Any) -> dict:
@@ -252,8 +251,10 @@ class AuditRunner:
     ) -> None:
         params = StdioServerParameters(
             command=str(command),
-            args=[str(script)] if script else [],
-            env=env,
+            args=(["--plugins" if script.name == "logic_plugins_mcp.py" else "--audio"]
+                  if getattr(sys, "frozen", False) and script else [str(script)] if script else []),
+            env={**(env or {}), "LOGIC_MCP_OWNER_TOKEN": self.owner,
+                 "LOGIC_MCP_STATE_DIR": str(manual.STATE_DIR)},
         )
         reader, writer = await stack.enter_async_context(stdio_client(params))
         session = await stack.enter_async_context(ClientSession(reader, writer))
@@ -261,11 +262,13 @@ class AuditRunner:
         self.sessions[name] = session
 
     async def tool(self, server: str, name: str, arguments: dict | None = None) -> dict:
-        result = await self.sessions[server].call_tool(name, arguments or {})
+        meta = RequestParamsMeta.model_validate({"logic-mcp-owner": self.owner}) if getattr(self, "owner", None) else None
+        result = await self.sessions[server].call_tool(name, arguments or {}, meta=meta)
         return json_text(result)
 
     async def resource(self, uri: str) -> dict:
-        result = await self.sessions["core"].read_resource(uri)
+        meta = RequestParamsMeta.model_validate({"logic-mcp-owner": self.owner}) if getattr(self, "owner", None) else None
+        result = await self.sessions["core"].read_resource(uri, meta=meta)
         if not result.contents:
             return {"error": f"empty resource {uri}"}
         decoded = normalise_resource_value(json.loads(result.contents[0].text))
@@ -1006,11 +1009,18 @@ class AuditRunner:
         }
 
     async def run(self) -> dict:
-        env = core_process_environment(self.args.midi_instance)
+        with control.transaction() as owner:
+            self.owner = owner
+            return await self._run_owned()
+
+    async def _run_owned(self) -> dict:
         async with AsyncExitStack() as stack:
             await self.connect(stack, "plugins", self.args.python, ROOT / "logic_plugins_mcp.py")
             await self.connect(stack, "audio", self.args.python, ROOT / "logic_audio_mcp.py")
-            await self.connect(stack, "core", self.args.core, env=env)
+            streams = await stack.enter_async_context(streamable_http_client(self.args.core_url))
+            session = await stack.enter_async_context(ClientSession(streams[0], streams[1]))
+            await session.initialize()
+            self.sessions["core"] = session
             project = await self.tool("plugins", "mix_project_identity", {})
             if not project.get("verified"):
                 raise RuntimeError(f"open project could not be verified: {project}")
@@ -1154,8 +1164,7 @@ def parser() -> argparse.ArgumentParser:
     )
     result.add_argument("--output-root", type=Path, default=Path.home() / "Desktop" / "Logic-MCP-Audits")
     result.add_argument("--python", type=Path, default=DEFAULT_PYTHON)
-    result.add_argument("--core", type=Path, default=DEFAULT_CORE)
-    result.add_argument("--midi-instance", default="standalone-audit")
+    result.add_argument("--core-url", default="http://127.0.0.1:8765/mcp")
     result.add_argument("--strip-limit", type=int, default=128)
     result.add_argument("--per-strip-seconds", type=int, default=12)
     result.add_argument("--survey-seconds", type=int, default=180)

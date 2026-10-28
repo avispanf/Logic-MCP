@@ -1,0 +1,2 @@
+# Runtime protocol contract verified by the integration suite.
+mcp==2.0.0

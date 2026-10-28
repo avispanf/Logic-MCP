@@ -1,0 +1,36 @@
+name: Build downloadable app
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  app:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python -m pip install -r requirements-lock.txt
+      - name: Build the pinned, namespaced core
+        run: |
+          git clone https://github.com/avispanf/logic-pro-mcp.git "$RUNNER_TEMP/core"
+          git -C "$RUNNER_TEMP/core" checkout --detach 2cb0dfa8b77ac57b64271ffe59558d6023d0bef7
+          cd "$RUNNER_TEMP/core"
+          swift build -c release --product LogicProMCP
+      - name: Package development app
+        env:
+          LOGIC_MCP_BACKEND: ${{ runner.temp }}/core/.build/release/LogicProMCP
+          LOGIC_MCP_SHARE_DIR: ${{ runner.temp }}/core/Scripts
+        run: scripts/build_app.sh
+      - name: Smoke-test the self-contained runtime
+        run: python scripts/smoke_app.py "dist/Logic MCP.app"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Logic-MCP-macos-arm64-development
+          path: |
+            dist/*.zip
+            dist/*.dmg
+            dist/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 30

@@ -1,0 +1,20 @@
+<!doctype html><html lang="en"><meta charset="utf-8"><title>Logic MCP setup</title>
+<style>body{font:17px system-ui;max-width:780px;margin:50px auto;padding:0 24px;line-height:1.6}pre{padding:18px;background:#eee;overflow:auto}h1{font-size:28px}</style>
+<h1>Logic MCP</h1>
+<p>Move Logic MCP.app into Applications, open it, then choose <b>Install / repair service</b> from its menu. The service runs at login and diagnostics remain available in manual mode.</p>
+<p>Left-click the menu-bar button to switch modes. Right-click for setup and diagnostics. <b>MANUAL · MCP OFF</b> means known workers are stopped and unknown candidates were not detected. Enabling automation cancels paused jobs; start a new task afterwards. Interrupted audits can leave solo/transport settings in their last state: inspect the project before starting another audit.</p>
+<h2>Connect your MCP client</h2>
+<p>Use a client with Streamable HTTP support. Configure the core server:</p>
+<pre>[mcp_servers.logic-pro]
+url = "http://127.0.0.1:8765/mcp"
+tool_timeout_sec = 180</pre>
+<p>For plugin inspection and audio analysis, add two STDIO connections. Executable:</p>
+<pre>/Applications/Logic MCP.app/Contents/Resources/runtime/logic-mcp</pre>
+<p>Arguments are <code>["--plugins"]</code> and <code>["--audio"]</code>, respectively. If installed in ~/Applications use that path instead. Restart the client after saving its configuration.</p>
+<h2>Logic and permissions</h2>
+<p>Open Logic. In Control Surfaces → Setup, assign Logic Control input and output to <code>LogicProMCP-MCU-Internal [bridge]</code>. The backend and the client running plugin tools need Accessibility and Automation access to Logic Pro / System Events. Grant these only in macOS System Settings when requested. The mode button itself needs no Accessibility permission.</p>
+<p>Use <b>Diagnostics</b> to check the mode and backend. No open project is changed by the mode button. Start with a copy of a project when testing mixing tools. Numeric meters must actually be readable; unavailable measurements are reported as unavailable.</p>
+<h2>Recovery and removal</h2>
+<p><b>Repair manual state</b> keeps automation blocked and backs up damaged state. <b>Remove service</b> cancels old workers and removes its login service. Remove MCP client entries afterwards, quit this app, then move it to the Trash. Keep project journals for manual recovery of interrupted audits.</p>
+<p>Initial supported distribution: Apple Silicon, macOS 14+, with Logic integration measured on Logic Pro 12.3. Other combinations require validation. Unsigned development builds are for local testing; public stable downloads must be signed and notarized.</p>
+</html>

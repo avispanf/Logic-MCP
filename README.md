@@ -1,5 +1,30 @@
 # Logic-MCP
 
+Logic Pro automation with a verified manual-work switch and one shared MIDI backend.
+
+**Status: 0.2.0 beta.** Apple Silicon; build target macOS 14+. Logic integration was measured
+on Logic Pro 12.3 / macOS 26. Earlier supported OS builds require device validation.
+Development packages use ad hoc signing. A stable public download must be Developer ID
+signed and notarized.
+
+## Use the application
+
+1. Download the app ZIP or DMG from [Releases](https://github.com/avispanf/Logic-MCP/releases)
+   when a verified package is available. Development builds are also produced by the
+   **Build downloadable app** GitHub Actions workflow.
+2. Put **Logic MCP.app** in Applications and open it.
+3. Right-click its menu-bar button, choose **Install / repair service**, then **Setup instructions**.
+4. Connect your MCP client and assign Logic Control ports to
+   `LogicProMCP-MCU-Internal [bridge]` in Logic.
+5. Left-click the button to switch between manual work and automation.
+
+The package includes Python and the patched backend. End users do not need a compiler,
+a venv, a source checkout, or Homebrew for the mode switch and plugin control. Audio-file
+analysis additionally needs ffmpeg/ffprobe; the audio diagnostics report missing helpers.
+The bundled setup page explains Accessibility/Automation permissions required for Logic
+control (the mode button itself needs none).
+
+
 Two MCP servers for Logic Pro on macOS, built to sit alongside
 [logic-pro-mcp](https://github.com/MongLong0214/logic-pro-mcp) rather than replace it.
 
@@ -43,86 +68,60 @@ duplicate server processes, and flags stale `[audit]`/`[test]` port references r
 Logic's control-surface preferences. `ax_show_menu` exposes context-menu capabilities without clicking them, and
 `close_plugin_windows` clears editor dialogs without closing the project window.
 
-### Shared LogicProMCP transport
+### Shared transport and manual mode
 
-Desktop MCP clients can open one STDIO server process per task or connection. Since each
-`LogicProMCP` process publishes its own CoreMIDI endpoints, that setup makes Logic report
-changing input/output counts and can leave several MCU namespaces competing for the same
-control surface. The local bridge owns one persistent `LogicProMCP` process and shares it
-between clients over loopback-only Streamable HTTP. Requests are serialized so two clients
-cannot drive Logic or MCU at the same time.
+A persistent loopback-only HTTP supervisor owns one restartable backend at
+`http://127.0.0.1:8765/mcp`. All plugin/audio MCP tools use a cross-process operation
+lock. The audit runner holds exclusive ownership for its entire run and connects to that
+same HTTP backend; it never creates another MCU namespace.
 
-Install or update the per-user LaunchAgent:
-
-```bash
-./scripts/install_logic_http_bridge.sh
-curl --fail http://127.0.0.1:8765/health
-```
-
-Point every local MCP client at the same URL instead of launching the binary directly:
+For an HTTP-capable MCP client:
 
 ```toml
 [mcp_servers.logic-pro]
 url = "http://127.0.0.1:8765/mcp"
-startup_timeout_sec = 20
 tool_timeout_sec = 180
+
+[mcp_servers.logic-plugins]
+command = "/Applications/Logic MCP.app/Contents/Resources/runtime/logic-mcp"
+args = ["--plugins"]
+
+[mcp_servers.logic-audio]
+command = "/Applications/Logic MCP.app/Contents/Resources/runtime/logic-mcp"
+args = ["--audio"]
 ```
 
-```json
-{
-  "mcpServers": {
-    "logic-pro": {
-      "url": "http://127.0.0.1:8765/mcp"
-    }
-  }
-}
-```
+Use `~/Applications` instead if installed there. Other clients must support Streamable
+HTTP for the core connection; use their supported configuration surface rather than
+assuming every client accepts the same JSON format.
 
-Restart each desktop MCP client after changing its configuration. The bridge remains alive
-across client restarts and exposes only one stable `LogicProMCP-MCU-Internal [bridge]`
-endpoint pair. Logs are written to `~/Library/Logs/LogicProMCPBridge.log` and
-`~/Library/Logs/LogicProMCPBridge.error.log`. When present, the bridge prefers the patched
-`~/.local/bin/LogicProMCP-codex` binary that supports deterministic instance names; its
-`/health` response reports the exact backend path in use.
+**MANUAL · MCP OFF** confirms that identifiable workers are stopped and no uncertain
+candidate is present. Discovery uses actual argv, including paths with spaces and
+alternate checkouts. Unidentified candidates prevent a green confirmation. Hosts and
+Logic are never intentionally suspended.
 
-### One-click MCP/MCU switch
+Enabling cancels old paused workers before opening the gate. **Old jobs are not resumed.**
+Start a new request. The supervisor stays available during manual mode and restarts the
+backend after enabling; MIDI endpoints may be recreated once per transition, using stable
+MCU identities. The switch checks OS processes, never Logic's menus.
 
-The companion app adds a macOS menu-bar switch and a floating button near the upper-right
-corner of Logic's display. Click **MCP ON** to enter **MANUAL · MCP OFF**. Manual mode
-suspends the shared bridge, LogicProMCP/MCU backend, custom plugin/audio servers, audit
-runner and their child processes. This stops background AX polling and in-flight
-AppleScript workers as well as MIDI commands. The switch itself never reads Logic menus,
-sends Apple Events or changes project settings. It does not require Accessibility access.
+Emergency pausing can interrupt an audit before its restoration steps. Inspect solo,
+transport and plugin state and consult the audit journal before starting again.
+Automatic recovery must not apply an old project's state to a new project.
 
-The controller verifies OS process stop states, records process identity before suspending,
-and resumes only the processes it stopped. Existing MIDI endpoints stay allocated while
-their owner is paused. New Python MCP sessions wait before opening Logic/MIDI channels;
-the menu-bar app also checks for newly launched workers every two seconds. Manual mode
-persists in `~/Library/Application Support/LogicMCP/manual-mode.json` across app restarts.
-External hardware control surfaces are unaffected.
-
-Click again to resume automation, including any paused jobs. MCP clients may show timeouts
-while manual mode is active; that is expected. Use **MCP CHECK** as an unverified state,
-not confirmation that manual mode is active. Run the explicit recovery command below if
-the menu-bar app is unavailable. Logic itself does not need restarting.
-
-Install or update it with:
+Right-click offers diagnostics, repair, service removal and an overlay preference.
+`MCP · offline` / `MCP · logic-closed` means automation is allowed but not ready.
+`MCP CHECK` is unverified. The service's `/health` remains reachable in manual mode and
+reports `state=manual`, `ready=false`.
 
 ```bash
-./scripts/install_menubar_toggle.sh
+"/Applications/Logic MCP.app/Contents/Resources/runtime/logic-mcp" --control status
+"/Applications/Logic MCP.app/Contents/Resources/runtime/logic-mcp" --control repair
 ```
 
-The installer builds the native AppKit app under `~/Applications`, registers a per-user
-LaunchAgent, and starts it at login. The floating button hides when another app is in
-front. The executable accepts `--status`, `--toggle`, `--manual` and `--automatic`.
-The helper can also be used directly (its `status` command enforces an existing manual
-pause and reports verification):
-
-```bash
-~/dev/venv/bin/python logic_manual_mode.py pause
-~/dev/venv/bin/python logic_manual_mode.py status
-~/dev/venv/bin/python logic_manual_mode.py resume
-```
+Repair backs up invalid state and keeps manual mode enabled. Remove service from the menu,
+remove MCP client entries, quit the app, then move it to Trash. The manual barrier is
+retained deliberately; installing again preserves it. No project files are deleted.
 
 **Mix audit orchestration.** `mix_inventory` merges the mature server's `logic://tracks`
 and `logic://mixer` resources with `mixer_survey`, preserving stable track references and
@@ -172,8 +171,8 @@ The revealed strip name must match the mature track inventory; otherwise that ta
 Isolation is exclusive: captured pre-existing solos are cleared, only the selected track or
 group members are enabled, and a master run clears every solo so it measures the full mix.
 
-Both are single files with one dependency: `mcp`. `python-rtmidi` is optional and
-affects one tool only.
+Development uses the pinned dependency set in `requirements-lock.txt`. `python-rtmidi`
+is optional and affects one MIDI-trigger tool.
 
 ## Why these exist
 
@@ -192,7 +191,7 @@ parsing and naming validation have no equivalent there.
 
 ```bash
 python3 -m venv ~/dev/venv
-~/dev/venv/bin/pip install mcp
+~/dev/venv/bin/pip install -r requirements-lock.txt
 ~/dev/venv/bin/python logic_plugins_mcp.py --check
 ~/dev/venv/bin/python -m unittest discover -s tests -v
 ```
@@ -224,9 +223,9 @@ successful write without that independent read-back.
 
 ### Unattended mix-audit runner
 
-`run_mix_audit.py` is a local client for long audits. It starts fresh instances of all
-three servers, keeps their stdio sessions alive for the complete run, journals every
-full response, and always schedules state restoration. This lets edited server code be
+`run_mix_audit.py` is a local client for long audits. It starts custom plugin/audio
+sessions and connects to the already-running HTTP backend, journals every full response,
+holds exclusive ownership, and schedules state restoration. This lets edited server code be
 tested without restarting the desktop MCP host. Live isolation and bounce still require
 the explicit `--confirmed` flag:
 
@@ -265,8 +264,7 @@ heterogeneous table that rejects the grouped request, the tool automatically fal
 to verified 40-row pages. The runner requests a 500-row page by default so the fast path
 does not repeat the same whole-table query.
 
-Give the runner its own persistent Logic Control surface by assigning both ports to
-`LogicProMCP-MCU-Internal [standalone-audit]`. The runner rejects the generic `Track 1…8`
+The runner uses the shared `LogicProMCP-MCU-Internal [bridge]` control surface. The runner rejects the generic `Track 1…8`
 bank that appears during MCU startup and asks the patched core for a full AX refresh
 before planning. The runner uses MCU only to select an indexed track, then requires the
 Inspector name to match the exact Arrange-row name before it presses anything. Solo/Mute
@@ -277,10 +275,7 @@ non-overwriting WAV, measured with BS.1770, and restored before the next target.
 evidence is stored in `runner.jsonl`; `summary.json` and bounded stdout contain compact
 progress and results. Off-screen tracks whose insert names Logic does not expose are
 still measured, but their plugin chains are recorded as unreadable rather than guessed.
-Do not leave the standalone runner alive during ordinary mouse/trackpad editing while the
-`[codex]` surface is also active: two live MCU namespaces can address the same channel
-strip. Run `surfaces_doctor` first; after an audit, its stale-reference warning is expected
-until the temporary surface is removed from Logic's Control Surface Setup.
+The shared operation lease rejects other clients' tool operations during a runner audit.
 
 macOS permissions: Accessibility must be granted to the process that launches the
 server, not to the script. Automation for Logic Pro and System Events is also required.
@@ -403,3 +398,37 @@ outside the visible Mixer viewport expose generic insert labels instead of plugi
 ## Licence
 
 MIT.
+
+## Build and release
+
+Install the locked build requirements, then provide the supported backend:
+
+```bash
+python3 -m venv .venv
+.venv/bin/pip install -r requirements-lock.txt
+LOGIC_MCP_PYTHON="$PWD/.venv/bin/python" \\
+LOGIC_MCP_BACKEND="/path/to/patched/LogicProMCP" \\
+LOGIC_MCP_SHARE_DIR="/path/to/core/Scripts" scripts/build_app.sh
+```
+
+Build provenance: backend source commit `2cb0dfa8b77ac57b64271ffe59558d6023d0bef7`
+from the linked fork. The build workflow compiles this pinned source rather than using an
+unversioned Homebrew binary. The package rejects backends lacking namespace support.
+`scripts/install.sh` builds and installs a development app with a versioned backup.
+Legacy installer script names delegate to the new installer.
+
+Outputs: standalone app, ZIP and DMG under `dist/`. Build scripts refuse to overwrite an
+existing app output. `LOGIC_MCP_OUTPUT` selects a new destination.
+
+For Developer ID signing, set `LOGIC_MCP_SIGN_IDENTITY`. For notarization also set
+`LOGIC_MCP_NOTARY_PROFILE` to a configured notarytool keychain profile. Nested executables
+are signed before the bundle, the notary result is awaited, and the ticket is stapled.
+These credentials are intentionally not in the repository. Unsigned workflow artifacts
+are development builds, not notarized stable releases.
+
+Before publishing: run the tests, smoke-test frozen MCP connections, test installation
+from a path with spaces, verify app signatures and deployment targets, validate on the
+claimed minimum OS, and test a downloaded quarantined signed build on a clean Mac.
+Use a versioned release with checksums and third-party notices. The current CI checks
+Python 3.12/3.14 and the native build; the manual build workflow provides downloadable
+development artifacts. Intel and universal builds are not claimed.

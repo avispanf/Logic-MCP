@@ -1,9 +1,5 @@
 from __future__ import annotations
 
-if __name__ == "__main__":
-    from logic_manual_mode import wait_for_automatic_mode
-    wait_for_automatic_mode()
-
 from dataclasses import dataclass, field
 from pathlib import Path
 import json
@@ -1043,9 +1039,10 @@ def health() -> dict:
 
 
 def build() -> object:
+    from logic_control import guard_tool
     server = build_server("logic-audio")
     for fn in TOOLS:
-        server.tool()(fn)
+        server.tool()(guard_tool(fn))
     return server
 
 
@@ -1106,9 +1103,15 @@ def selfcheck() -> int:
 def main() -> None:
     import sys
 
+    if "--help" in sys.argv or "-h" in sys.argv:
+        print("Logic audio MCP STDIO server. Use --check for diagnostics.")
+        return
+
     if "--check" in sys.argv:
         raise SystemExit(selfcheck())
-    build().run()
+    from logic_manual_mode import register_worker
+    with register_worker():
+        build().run()
 
 
 if __name__ == "__main__":

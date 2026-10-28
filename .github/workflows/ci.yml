@@ -1,0 +1,21 @@
+name: Tests and build checks
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: macos-26
+    strategy:
+      matrix:
+        python: ['3.12', '3.14']
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install -r requirements-lock.txt
+      - run: python -B -m unittest discover -s tests -v
+      - name: Compile native UI for the declared minimum OS
+        run: xcrun swiftc -parse-as-library -target arm64-apple-macos14.0 -framework AppKit -framework Foundation menubar/LogicMCPMenuBar.swift -o /tmp/LogicMCPMenuBar
+      - run: zsh -n scripts/build_app.sh && zsh -n scripts/install.sh
+      - run: plutil -lint menubar/Info.plist

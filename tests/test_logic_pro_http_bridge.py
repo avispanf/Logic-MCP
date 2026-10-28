@@ -1,5 +1,9 @@
 import types
 import unittest
+from unittest.mock import patch
+from pathlib import Path
+import tempfile
+import logic_manual_mode as manual
 
 import anyio
 from mcp_types import (
@@ -37,6 +41,12 @@ class FakeSession:
 
 class BridgeTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        for key, value in (("STATE_DIR", Path(directory.name)), ("STATE_FILE", Path(directory.name) / "manual.json")):
+            patched = patch.object(manual, key, value)
+            patched.start()
+            self.addCleanup(patched.stop)
         self.session = FakeSession()
         self.state = bridge.BridgeState(
             session=self.session,

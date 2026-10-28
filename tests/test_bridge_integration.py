@@ -68,7 +68,14 @@ class HTTPIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 with patch.object(mode, 'STATE_DIR', root), patch.object(mode, 'STATE_FILE', root / 'manual-mode.json'), \
                         patch.object(mode, 'processes', side_effect=test_processes_only):
                     self.assertEqual(len([r for r in test_processes_only().values() if str(backend) in (r.get('argv') or [])]), 1)
-                    self.assertTrue(mode.operate('pause')['verified'])
+                    paused = mode.operate('pause')
+                    self.assertTrue(paused['verified'], paused)
+                    snapshot = test_processes_only()
+                    if 'T' in snapshot[process.pid]['status']:
+                        log.seek(0)
+                        self.fail('Supervisor was suspended: ' + json.dumps({
+                            'rows': snapshot, 'registration': (root / 'supervisor.json').read_text(),
+                            'journal': mode.read_state(), 'log': log.read()}))
                     self.assertEqual(health()['state'], 'manual')
                     self.assertIsNone(process.poll())
                     self.assertTrue(mode.operate('resume')['verified'])

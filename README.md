@@ -14,15 +14,20 @@ signed and notarized.
    **Build downloadable app** GitHub Actions workflow.
 2. Put **Logic MCP.app** in Applications and open it.
 3. Right-click its menu-bar button, choose **Install / repair service**, then **Setup instructions**.
-4. Connect your MCP client and assign Logic Control ports to
+4. Enable automation once, approve the requested macOS permissions and let Diagnostics
+   confirm the backend is online before connecting your MCP client. On a fresh install
+   the tool cache is empty until this first connection to the backend.
+5. Connect your MCP client and assign Logic Control ports to
    `LogicProMCP-MCU-Internal [bridge]` in Logic.
-5. Left-click the button to switch between manual work and automation.
+6. Left-click the button to switch between manual work and automation.
 
 The package includes Python and the patched backend. End users do not need a compiler,
 a venv, a source checkout, or Homebrew for the mode switch and plugin control. Audio-file
 analysis additionally needs ffmpeg/ffprobe; the audio diagnostics report missing helpers.
 The bundled setup page explains Accessibility/Automation permissions required for Logic
 control (the mode button itself needs none).
+If the bundled runtime is missing, the app reports a reinstall error; it never falls
+back to running scripts from a developer checkout.
 
 
 Two MCP servers for Logic Pro on macOS, built to sit alongside
@@ -427,6 +432,10 @@ Python distribution whose bundled libraries support the declared minimum.
 For Developer ID signing, set `LOGIC_MCP_SIGN_IDENTITY`. For notarization also set
 `LOGIC_MCP_NOTARY_PROFILE` to a configured notarytool keychain profile. Nested executables
 are signed before the bundle, the notary result is awaited, and the ticket is stapled.
+The app declares why it uses Apple Events. Its menu executable, bundled runtime and
+backend are signed with the Apple Events automation entitlement; build verification
+checks all three signatures. This allows a permission request, not silent permission
+granting. Users still approve Accessibility and Automation in macOS System Settings.
 These credentials are intentionally not in the repository. Unsigned workflow artifacts
 are development builds, not notarized stable releases.
 

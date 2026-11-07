@@ -27,22 +27,15 @@ private enum SurfaceState: Equatable {
 
 private final class LogicSurfaceController: @unchecked Sendable {
     func run(_ command: String) -> SurfaceState {
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let python = Bundle.main.object(forInfoDictionaryKey: "MCPPythonPath") as? String
-            ?? home + "/dev/venv/bin/python"
-        let helper = Bundle.main.object(forInfoDictionaryKey: "MCPHelperPath") as? String
-            ?? home + "/dev/Logic-MCP/logic_manual_mode.py"
         let process = Process()
         let pipe = Pipe()
         let runtime = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/runtime/logic-mcp")
         let action = command == "diagnose" ? "status" : command
-        if FileManager.default.isExecutableFile(atPath: runtime.path) {
-            process.executableURL = runtime
-            process.arguments = ["--control", action]
-        } else {
-            process.executableURL = URL(fileURLWithPath: python)
-            process.arguments = [helper, action]
+        guard FileManager.default.isExecutableFile(atPath: runtime.path) else {
+            return .unavailable("Bundled runtime is missing. Reinstall Logic MCP.")
         }
+        process.executableURL = runtime
+        process.arguments = ["--control", action]
         process.standardOutput = pipe
         process.standardError = FileHandle.standardError
         let finished = DispatchSemaphore(value: 0)

@@ -36,13 +36,21 @@ fi
 identity=${LOGIC_MCP_SIGN_IDENTITY:--}
 sign_args=(--force --sign "$identity")
 if [[ "$identity" != "-" ]]; then sign_args+=(--timestamp --options runtime); fi
+executable_sign_args=("${sign_args[@]}" --entitlements "$repo_dir/menubar/Automation.entitlements")
 while IFS= read -r -d '' binary; do
-  if /usr/bin/file -b "$binary" | /usr/bin/grep -q 'Mach-O'; then codesign "${sign_args[@]}" "$binary"; fi
+  if /usr/bin/file -b "$binary" | /usr/bin/grep -q 'Mach-O'; then
+    if [[ "$binary" == "$app_dir/Contents/Resources/runtime/logic-mcp" || "$binary" == "$app_dir/Contents/Resources/bin/LogicProMCP" ]]; then
+      codesign "${executable_sign_args[@]}" "$binary"
+    else
+      codesign "${sign_args[@]}" "$binary"
+    fi
+  fi
 done < <(find "$app_dir/Contents/Resources" -type f -print0)
-codesign "${sign_args[@]}" "$app_dir/Contents/MacOS/LogicMCPMenuBar"
+codesign "${executable_sign_args[@]}" "$app_dir/Contents/MacOS/LogicMCPMenuBar"
 "$python_path" "$repo_dir/scripts/package_metadata.py" "$app_dir" "$app_dir/Contents/Resources/bin/LogicProMCP"
-codesign "${sign_args[@]}" "$app_dir"
+codesign "${executable_sign_args[@]}" "$app_dir"
 codesign --verify --deep --strict "$app_dir"
+"$python_path" "$repo_dir/scripts/verify_bundle.py" "$app_dir" --signatures
 if [[ -n ${LOGIC_MCP_NOTARY_PROFILE:-} ]]; then
   [[ "$identity" != "-" ]] || { print -u2 'Notarization requires Developer ID'; exit 1; }
   ditto -c -k --keepParent "$app_dir" "$build_dir/notarize.zip"

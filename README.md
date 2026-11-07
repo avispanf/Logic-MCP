@@ -2,6 +2,10 @@
 
 Logic Pro automation with a verified manual-work switch and one shared MIDI backend.
 
+[Download the Apple Silicon developer preview](https://github.com/avispanf/Logic-MCP/releases/tag/v0.2.0-beta.1)
+— open the app and choose **Install & connect**. See [installation](docs/INSTALL.md)
+for the macOS approvals that cannot be automated.
+
 **Status: 0.2.0 beta.** Apple Silicon; build target macOS 14+. Logic integration was measured
 on Logic Pro 12.3 / macOS 26. Earlier supported OS builds require device validation.
 Logic 13.0 validation on macOS 26.6 covers transport discovery, stable MCU ports,

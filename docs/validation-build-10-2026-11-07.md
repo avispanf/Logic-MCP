@@ -4,6 +4,11 @@ Packaged code: `41cfb1af6540a80f086cbfec100ff6d7b85b4726`, version 0.2.0 beta,
 build 10. Local package: Apple Silicon, Python 3.14.6, macOS 26.6.
 This is an explicitly unsigned/not-notarized developer preview, not a stable release.
 
+Published as [v0.2.0-beta.1](https://github.com/avispanf/Logic-MCP/releases/tag/v0.2.0-beta.1).
+The release is a public prerelease, not latest stable; its tag points to the packaged
+code commit above. ZIP, DMG and SHA256SUMS were downloaded back from GitHub and their
+hashes matched the locally verified candidate before publication.
+
 ## Verified
 
 - 213 tests passed locally. The Foundation status/installer fixture performed 64 checks.

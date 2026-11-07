@@ -32,4 +32,5 @@ starlette==1.10.0
 truststore==0.10.5
 typing-inspection==0.4.4
 typing_extensions==4.16.0
+tomlkit==0.15.2
 uvicorn==0.54.0

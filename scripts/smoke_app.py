@@ -8,6 +8,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import tomllib
 from urllib.request import urlopen
 from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
@@ -30,6 +31,13 @@ async def main():
         assert (resources / relative).is_file(), name
     for args in (['--help'], ['--plugins', '--help'], ['--service', '--help']):
         subprocess.run([str(runtime), *args], check=True, stdout=subprocess.DEVNULL, timeout=10)
+    for client in ('codex', 'claude'):
+        output = subprocess.check_output([str(runtime), '--client-config', client], text=True, timeout=10)
+        data = tomllib.loads(output) if client == 'codex' else json.loads(output)
+        servers = data['mcp_servers' if client == 'codex' else 'mcpServers']
+        assert set(servers) == {'logic-pro', 'logic-plugins', 'logic-audio'}
+        if client == 'claude':
+            assert servers['logic-pro']['args'] == ['--core']
     with tempfile.TemporaryDirectory(prefix='Logic MCP Smoke ') as directory:
         env = {'LOGIC_MCP_STATE_DIR': directory}
         # Verify actual frozen tool registration while manual mode is active.
@@ -60,6 +68,18 @@ async def main():
             else:
                 log.seek(0)
                 raise RuntimeError(log.read())
+            async with stdio_client(StdioServerParameters(command=str(runtime),
+                    args=['--core', '--url', f'http://127.0.0.1:{port}/mcp'], env=env)) as streams:
+                async with ClientSession(*streams) as session:
+                    await session.initialize()
+                    assert (await session.list_tools()).tools == []
+                    from mcp.shared.exceptions import MCPError
+                    try:
+                        await session.call_tool('logic_tracks', {'command': 'select', 'params': {'index': 0}})
+                    except MCPError as exc:
+                        assert 'manual mode' in str(exc).lower()
+                    else:
+                        raise RuntimeError('The frozen core relay did not reject a manual-mode write')
         finally:
             service.terminate()
             try:
@@ -68,7 +88,7 @@ async def main():
                 service.kill()
                 service.wait(timeout=3)
             log.close()
-    print('Packaged app: native notices, help, 77 tools, manual request rejection and HTTP health verified')
+    print('Packaged app: notices, help, 77 tools, both client configurations, frozen core relay, manual rejection and HTTP health verified')
 
 
 if __name__ == '__main__':

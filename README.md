@@ -8,8 +8,9 @@ Logic 13.0 validation on macOS 26.6 covers transport discovery, stable MCU ports
 Inspector-verified selection and a restored Limiter gain edit; it is not a complete
 plugin or mix/mastering qualification. Native plugin insertion on Logic 13 remains
 unverified when Logic exposes only a generic slot label, and is rolled back.
-Development packages use ad hoc signing. A stable public download must be Developer ID
-signed and notarized.
+GitHub developer-preview packages use ad hoc signing. An Apple account is not required
+to publish them; macOS may block first launch. Developer ID/notarization is an optional
+distribution route for smoother Gatekeeper handling, not a requirement to share code on GitHub.
 See the [Logic 13 runtime validation](docs/validation-2026-11-07.md) and
 [installed build 8 polish checks](docs/validation-build-8-2026-11-07.md) for tested
 behaviour and the remaining release gates.
@@ -17,7 +18,7 @@ behaviour and the remaining release gates.
 ## Use the application
 
 See the [end-user installation guide](docs/INSTALL.md). Maintainers preparing the first
-signed public beta should follow the [release runbook](docs/RELEASING.md).
+public beta should follow the [release runbook](docs/RELEASING.md).
 The [release readiness record](docs/release-readiness-2026-11-07.md) separates completed
 development checks from signing and signed-candidate runtime checks still outstanding.
 Security/privacy and safe reporting are described in [SECURITY.md](SECURITY.md).
@@ -25,13 +26,15 @@ Security/privacy and safe reporting are described in [SECURITY.md](SECURITY.md).
 1. Download the app ZIP or DMG from [Releases](https://github.com/avispanf/Logic-MCP/releases)
    when a verified package is available. Development builds are also produced by the
    **Build downloadable app** GitHub Actions workflow.
-2. Put **Logic MCP.app** in Applications and open it.
-3. Right-click its menu-bar button, choose **Install / repair service**, then **Setup instructions**.
-4. Enable automation once, approve the requested macOS permissions and let Diagnostics
-   confirm the backend is online before connecting your MCP client. On a fresh install
-   the tool cache is empty until this first connection to the backend.
-5. Connect your MCP client and assign Logic Control ports to
-   `LogicProMCP-MCU-Internal [bridge]` in Logic.
+2. Open **Logic MCP.app**, then click **Install & connect**. On a fresh installation it
+   copies itself to your user Applications folder, installs the shared service and
+   configures both Codex and Claude Desktop, with backups. Existing apps are not overwritten.
+3. Approve Accessibility/Automation yourself using **Reveal permission helper** and
+   **Accessibility settings**. Unsigned downloads may also require Apple's **Open Anyway** approval.
+4. Enable new automation and check Diagnostics. If Logic does not already detect the MCU,
+   assign both Logic Control ports to `LogicProMCP-MCU-Internal [bridge]`.
+5. Restart Codex/Claude Desktop when convenient. On a fresh install the core tool cache
+   is empty until the backend has been enabled once; reload the client after that.
 6. Left-click the button to switch between manual work and automation.
 
 The right-click menu also has explicit **Manual mode — MCP OFF** and **Enable NEW
@@ -41,6 +44,11 @@ the copied example is TOML, so adapt it if your client uses another format.
 **Accessibility settings** opens the matching macOS pane. Permissions still require
 your approval. Diagnostics show an explanation; **Copy diagnostics** copies the full
 helper response only when you choose it.
+
+**Install & connect Codex + Claude** reruns the client setup. Only the three Logic MCP
+entries are changed; unrelated settings, servers and tool restrictions are retained.
+Claude's STDIO core connection forwards to the same HTTP backend, never a second MCU engine.
+Setup leaves MCP OFF and does not edit Logic projects or silently restart either client.
 
 The package includes Python and the patched backend. End users do not need a compiler,
 a venv, a source checkout, or Homebrew for the mode switch and plugin control. Audio-file

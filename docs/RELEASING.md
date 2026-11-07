@@ -3,7 +3,37 @@
 No public app release has been made yet. The first intended release is
 `v0.2.0-beta.1`, not a stable/all-plugins-supported release.
 
-## One-time owner setup
+## Distribution choices
+
+This section is optional and applies only to Developer-ID-signed/notarized distribution.
+It is not a prerequisite for a GitHub developer-preview release.
+
+## GitHub route without an Apple account
+
+Build with the pinned backend and locked Python requirements described below, but leave
+`LOGIC_MCP_RELEASE=0`, `LOGIC_MCP_SIGN_IDENTITY=-` and `LOGIC_MCP_NOTARY_PROFILE` empty.
+Use a new output directory. Then run:
+
+```sh
+python scripts/smoke_app.py "$LOGIC_MCP_OUTPUT/Logic MCP.app"
+python scripts/verify_distribution.py "$LOGIC_MCP_OUTPUT" --unsigned-beta
+python scripts/release_draft.py "$LOGIC_MCP_OUTPUT" --tag v0.2.0-beta.1 --unsigned-beta
+python scripts/release_draft.py "$LOGIC_MCP_OUTPUT" --tag v0.2.0-beta.1 --unsigned-beta --create-draft
+```
+
+The explicit unsigned-beta path still verifies clean source provenance, all Mach-O
+deployment targets, app signatures, matching ZIP/DMG contents and checksums. It does
+not require or claim Developer ID, notarization, tickets or Gatekeeper approval. It
+adds a visible unsigned-preview warning to the release notes. The default verification
+path remains strict for notarized distribution. Draft creation does not publish.
+
+Before publishing a developer preview, verify the installer/cancel paths, both client
+configurations and their preservation/backups, shared-core relay and manual barrier.
+Clearly disclose unrun clean-Mac, quarantine, minimum-OS and real Logic scenarios.
+These are compatibility limits, not evidence of a signed release. Use the signed route
+later if desired; do not ask preview users to enroll in Apple's developer program.
+
+## Optional Apple signing credentials
 
 1. Use an active [Apple Developer Program](https://developer.apple.com/programs/) account.
 2. In Xcode → Settings → Accounts → your team → Manage Certificates, create a

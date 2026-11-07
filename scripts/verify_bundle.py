@@ -136,7 +136,7 @@ def verify_release(bundle):
     return team
 
 
-def verify_provenance(bundle):
+def verify_provenance(bundle, development=False):
     resources = bundle / 'Contents/Resources'
     manifest = json.loads((resources / 'build-manifest.json').read_text())
     info = plistlib.loads((bundle / 'Contents/Info.plist').read_bytes())
@@ -145,8 +145,9 @@ def verify_provenance(bundle):
         raise RuntimeError('Release provenance requires a clean source commit')
     if manifest.get('backend_source_dirty') is not False or manifest.get('backend_commit') != '7979bc7623c36d2cb911b3baa5c1c0ff98e06ff4':
         raise RuntimeError('Release provenance requires the clean pinned backend source')
-    if manifest.get('signing_mode') != 'developer-id' or manifest.get('release_channel') != 'beta':
-        raise RuntimeError('Only Developer ID public beta candidates are currently supported')
+    expected = 'ad-hoc' if development else 'developer-id'
+    if manifest.get('signing_mode') != expected or manifest.get('release_channel') != 'beta':
+        raise RuntimeError(f'Expected {expected} beta provenance')
     if manifest.get('version') != info['CFBundleShortVersionString'] + '-beta' or manifest.get('build') != info['CFBundleVersion']:
         raise RuntimeError('Manifest version/build does not match the application')
     for field, path in [('backend_sha256', resources / 'bin/LogicProMCP'),

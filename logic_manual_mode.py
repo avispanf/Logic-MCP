@@ -18,7 +18,7 @@ from contextlib import contextmanager
 ROOT = Path(__file__).resolve().parent
 STATE_DIR = Path(os.environ.get("LOGIC_MCP_STATE_DIR", Path.home() / "Library/Application Support/LogicMCP"))
 STATE_FILE = STATE_DIR / "manual-mode.json"
-SCRIPT_NAMES = {"logic_plugins_mcp.py", "logic_audio_mcp.py", "logic_pro_http_bridge.py", "run_mix_audit.py"}
+SCRIPT_NAMES = {"logic_plugins_mcp.py", "logic_audio_mcp.py", "logic_pro_http_bridge.py", "run_mix_audit.py", "logic_core_stdio.py"}
 CANDIDATE_NAMES = tuple(SCRIPT_NAMES | {Path(name).stem for name in SCRIPT_NAMES} | {"LogicProMCP", "logic-mcp"})
 SCRIPTS = tuple(str(ROOT / name) for name in sorted(SCRIPT_NAMES))
 BACKENDS = (str(Path.home() / ".local/bin/LogicProMCP-codex"), "/opt/homebrew/bin/LogicProMCP")
@@ -102,7 +102,7 @@ def managed_argv(argv):
         return False
     executable = Path(argv[0]).name
     if executable == "logic-mcp":
-        return any(arg in ("--service", "--plugins", "--audio", "--audit") for arg in argv[1:])
+        return any(arg in ("--service", "--plugins", "--audio", "--audit", "--core") for arg in argv[1:])
     if executable in ("LogicProMCP", "LogicProMCP-codex"):
         return True
     if executable != "Python" and not executable.lower().startswith("python"):

@@ -8,13 +8,16 @@ automatic mixing/mastering.
 - Menu-bar and optional floating manual-work switch, explicit OFF/ON actions and diagnostics.
 - One shared loopback MIDI/MCU backend across MCP clients; OFF rejects new automation.
 - Bundled runtime, actual-path client configuration and permission-helper discovery.
+- First-run Install &amp; connect: user-folder installation, shared service and automatic
+  Codex/Claude Desktop configuration with backups; existing apps are not overwritten.
+- Claude STDIO core relay uses the same shared backend without creating another MCU engine.
 - Controls-view plugin inspection and identity-bound, independently verified supported edits.
 - Track/mixer audit tools and separate audio-file loudness analysis.
 - Retained Python/native dependency notices and source/build provenance.
 
 ## Install
 
-Download the Apple Silicon DMG or ZIP and move Logic MCP.app to Applications.
+Download the Apple Silicon DMG or ZIP, open Logic MCP.app and choose Install &amp; connect.
 See [installation](https://github.com/avispanf/Logic-MCP/blob/main/docs/INSTALL.md)
 for required Accessibility/Automation approvals, MCU setup and client configuration.
 End users do not need Python or Homebrew for plugin control. File analysis needs

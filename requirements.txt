@@ -1,2 +1,3 @@
 # Runtime protocol contract verified by the integration suite.
 mcp==2.0.0
+tomlkit==0.15.2

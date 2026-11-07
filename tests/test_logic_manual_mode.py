@@ -23,6 +23,7 @@ class ManualModeTests(unittest.TestCase):
         self.assertFalse(mode.managed('/some/Python ' + script + '.backup'))
         self.assertFalse(mode.managed('/Applications/Logic Pro.app/Contents/MacOS/Logic Pro'))
         self.assertFalse(mode.managed('/Applications/Claude.app/Contents/Helpers/disclaimer -- ' + script))
+        self.assertTrue(mode.managed_argv(['/Applications/Logic MCP.app/Contents/Resources/runtime/logic-mcp', '--core']))
 
     def test_reused_pid_is_never_signalled(self):
         record = {'pid': 123, 'birth': 'old', 'command': mode.BACKENDS[0]}

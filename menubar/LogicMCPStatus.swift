@@ -123,7 +123,7 @@ enum SurfaceState: Equatable {
             }
             return .message(SurfaceNotice(message: "Mode: \(mode)\n\n\(state.guidance)\n\nCopy diagnostics includes the detailed helper response.", details: details, state: state))
         }
-        if ["setup", "uninstall", "repair"].contains(command), flag(result, "verified") == true, exitStatus == 0 {
+        if ["setup", "quick-setup", "uninstall", "repair"].contains(command), flag(result, "verified") == true, exitStatus == 0 {
             return .message(SurfaceNotice(message: result["message"] as? String ?? state.guidance, details: details, state: nil))
         }
         return state

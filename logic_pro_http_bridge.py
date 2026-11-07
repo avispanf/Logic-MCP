@@ -60,7 +60,7 @@ def _owner(meta):
     return meta.get("logic-mcp-owner") if meta else None
 
 
-def build_server(state):
+def build_server(state, local_ownership=True):
     @asynccontextmanager
     async def lifespan(_):
         yield state
@@ -71,10 +71,18 @@ def build_server(state):
         async with state.lock:
             if state.session is None:
                 raise RuntimeError("Logic backend is offline or starting. Check /health and retry a new request.")
+            if not local_ownership:
+                control.require_automatic()
+                if initial != control.epoch():
+                    raise RuntimeError("Request cancelled by mode transition. Submit a new request.")
+                with manual.worker_activity():
+                    return await getattr(state.session, method)(*args, **kwargs)
             with control.operation(owner=owner, expected_epoch=initial):
                 return await getattr(state.session, method)(*args, **kwargs)
 
     async def list_tools(ctx: ServerRequestContext, params: PaginatedRequestParams | None) -> ListToolsResult:
+        if not local_ownership:
+            return await state.session.list_tools(params=params)
         if manual.STATE_FILE.exists() or state.session is None or not params or not params.cursor:
             return state.tools
         return await dispatch("list_tools", params=params, owner=_owner(params.meta))

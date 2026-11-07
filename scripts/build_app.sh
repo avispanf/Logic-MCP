@@ -18,7 +18,7 @@ trap 'rm -rf "$build_dir"' EXIT
 app_dir="$build_dir/Logic MCP.app"
 mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources/bin" "$output_dir"
 xcrun swiftc -parse-as-library -O -target arm64-apple-macos14.0 \
-  -framework AppKit -framework Foundation "$repo_dir/menubar/LogicMCPMenuBar.swift" "$repo_dir/menubar/LogicMCPStatus.swift" \
+  -framework AppKit -framework Foundation "$repo_dir/menubar/LogicMCPMenuBar.swift" "$repo_dir/menubar/LogicMCPStatus.swift" "$repo_dir/menubar/LogicMCPInstall.swift" \
   -o "$app_dir/Contents/MacOS/LogicMCPMenuBar"
 "$python_path" -m PyInstaller --noconfirm --clean --onedir --name logic-mcp \
   --distpath "$build_dir/frozen" --workpath "$build_dir/work" --specpath "$build_dir" \
@@ -27,6 +27,7 @@ xcrun swiftc -parse-as-library -O -target arm64-apple-macos14.0 \
   --add-data "$repo_dir/logic_plugins_mcp.py:." \
   --hidden-import logic_plugins_mcp --hidden-import logic_audio_mcp \
   --hidden-import logic_pro_http_bridge --hidden-import run_mix_audit \
+  --hidden-import logic_client_setup --hidden-import logic_core_stdio \
   "$repo_dir/logic_mcp_app.py"
 ditto "$build_dir/frozen/logic-mcp" "$app_dir/Contents/Resources/runtime"
 install -m 755 "$backend_path" "$app_dir/Contents/Resources/bin/LogicProMCP"

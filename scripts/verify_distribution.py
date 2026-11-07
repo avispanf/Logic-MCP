@@ -6,9 +6,9 @@ import subprocess
 import tempfile
 
 try:
-    from .verify_bundle import verify_release, developer_team
+    from .verify_bundle import verify_release, developer_team, verify, verify_signatures, verify_provenance
 except ImportError:
-    from verify_bundle import verify_release, developer_team
+    from verify_bundle import verify_release, developer_team, verify, verify_signatures, verify_provenance
 
 
 ASSETS = ('Logic-MCP-macos-arm64.zip', 'Logic-MCP-macos-arm64.dmg')
@@ -30,21 +30,30 @@ def verify_checksums(directory):
     return expected
 
 
-def verify_distribution(directory):
+def verify_distribution(directory, development=False):
     hashes = verify_checksums(directory)
     dmg = directory / ASSETS[1]
-    subprocess.run(['/usr/bin/codesign', '--verify', '--strict', str(dmg)], check=True, capture_output=True)
-    result = subprocess.run(['/usr/bin/codesign', '-dvvv', str(dmg)], check=True, capture_output=True, text=True)
-    team = developer_team(result.stderr, require_runtime=False)
-    subprocess.run(['xcrun', 'stapler', 'validate', str(dmg)], check=True, capture_output=True)
-    subprocess.run(['/usr/sbin/spctl', '--assess', '--type', 'open', '--context', 'context:primary-signature', str(dmg)],
-                   check=True, capture_output=True)
+    team = None
+    def check_app(bundle):
+        if development:
+            verify_provenance(bundle, development=True)
+            verify(bundle)
+            verify_signatures(bundle)
+            return None
+        return verify_release(bundle)
+    if not development:
+        subprocess.run(['/usr/bin/codesign', '--verify', '--strict', str(dmg)], check=True, capture_output=True)
+        result = subprocess.run(['/usr/bin/codesign', '-dvvv', str(dmg)], check=True, capture_output=True, text=True)
+        team = developer_team(result.stderr, require_runtime=False)
+        subprocess.run(['xcrun', 'stapler', 'validate', str(dmg)], check=True, capture_output=True)
+        subprocess.run(['/usr/sbin/spctl', '--assess', '--type', 'open', '--context', 'context:primary-signature', str(dmg)],
+                       check=True, capture_output=True)
     with tempfile.TemporaryDirectory(prefix='Logic MCP Distribution ') as temporary:
         folder = Path(temporary)
         extracted = folder / 'zip'
         subprocess.run(['/usr/bin/ditto', '-x', '-k', str(directory / ASSETS[0]), str(extracted)], check=True)
         zip_app = extracted / 'Logic MCP.app'
-        if verify_release(zip_app) != team:
+        if check_app(zip_app) != team:
             raise RuntimeError('ZIP and DMG have different Developer ID teams')
         manifest = json.loads((zip_app / 'Contents/Resources/build-manifest.json').read_text())
         mount = folder / 'dmg'
@@ -53,7 +62,7 @@ def verify_distribution(directory):
                        check=True, capture_output=True)
         try:
             dmg_app = mount / 'Logic MCP.app'
-            if verify_release(dmg_app) != team:
+            if check_app(dmg_app) != team:
                 raise RuntimeError('DMG and contained app have different Developer ID teams')
             for relative in ('Contents/Resources/build-manifest.json', 'Contents/_CodeSignature/CodeResources',
                              'Contents/MacOS/LogicMCPMenuBar'):
@@ -61,12 +70,14 @@ def verify_distribution(directory):
                     raise RuntimeError(f'ZIP and DMG contain different applications: {relative}')
         finally:
             subprocess.run(['hdiutil', 'detach', str(mount)], check=True, capture_output=True)
-    print('Final ZIP and DMG verified: checksums, Developer ID, matching apps, stapled tickets and Gatekeeper')
-    return {'assets': hashes, 'manifest': manifest, 'team': team}
+    print('Unsigned beta ZIP/DMG verified; no Developer ID, notarization or Gatekeeper approval claimed' if development else
+          'Final ZIP and DMG verified: checksums, Developer ID, matching apps, stapled tickets and Gatekeeper')
+    return {'assets': hashes, 'manifest': manifest, 'team': team, 'unsigned_beta': development}
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Verify the final signed, notarized ZIP/DMG without installing or launching Logic.')
     parser.add_argument('directory', type=Path)
+    parser.add_argument('--unsigned-beta', action='store_true')
     args = parser.parse_args()
-    verify_distribution(args.directory.resolve())
+    verify_distribution(args.directory.resolve(), development=args.unsigned_beta)

@@ -3,6 +3,11 @@ import Foundation
 @main
 enum StatusPresentationTests {
     static func main() throws {
+        if CommandLine.arguments.count == 5, CommandLine.arguments[1] == "--copy-source", CommandLine.arguments[3] == "--test-home" {
+            let installed = try LogicMCPInstall.installCopy(URL(fileURLWithPath: CommandLine.arguments[2]), home: URL(fileURLWithPath: CommandLine.arguments[4]))
+            print(installed.path)
+            return
+        }
         if CommandLine.arguments.count == 3, CommandLine.arguments[1] == "--configuration" {
             print(try MCPClientConfiguration.text(runtimePath: CommandLine.arguments[2]))
             return
@@ -81,7 +86,38 @@ enum StatusPresentationTests {
         check(config.contains("args = [\"--audio\"]"), "Audio connection included")
         let command = try requireCommand(config)
         check(command == path, "Installation paths with spaces and quotes are escaped losslessly")
-        print("Status presentation: \(count) checks passed")
+        let files = FileManager.default
+        let temporary = files.temporaryDirectory.appendingPathComponent("LogicMCP-Install-Tests-" + UUID().uuidString)
+        try files.createDirectory(at: temporary, withIntermediateDirectories: false)
+        defer { try? files.removeItem(at: temporary) }
+        let home = temporary.appendingPathComponent("home")
+        let source = temporary.appendingPathComponent("download/Logic MCP.app")
+        check(!LogicMCPInstall.installedLocation(source, home: home), "Download requires installation")
+        check(LogicMCPInstall.installedLocation(home.appendingPathComponent("Applications/Logic MCP.app"), home: home), "User installation recognized")
+        check(!LogicMCPInstall.installedLocation(home.appendingPathComponent("Applications-other/Logic MCP.app"), home: home), "Lookalike folder is not installed")
+        let roles = ["Contents/MacOS/LogicMCPMenuBar", "Contents/Resources/runtime/logic-mcp", "Contents/Resources/bin/LogicProMCP"]
+        for role in roles {
+            let path = source.appendingPathComponent(role)
+            try files.createDirectory(at: path.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("test-only".utf8).write(to: path)
+            try files.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path.path)
+        }
+        let info = try PropertyListSerialization.data(fromPropertyList: ["CFBundleIdentifier": LogicMCPInstall.identifier], format: .xml, options: 0)
+        try info.write(to: source.appendingPathComponent("Contents/Info.plist"))
+        var verified: [URL] = []
+        let installed = try LogicMCPInstall.installCopy(source, home: home, verify: { verified.append($0) })
+        check(verified.count == 2, "Source and staged copy both verified")
+        check(files.fileExists(atPath: installed.appendingPathComponent(roles[0]).path), "Installed complete application")
+        do {
+            _ = try LogicMCPInstall.installCopy(source, home: home, verify: { _ in preconditionFailure("Existing install must not be touched") })
+            preconditionFailure("Existing install was overwritten")
+        } catch { check(files.fileExists(atPath: installed.path), "Existing installation preserved") }
+        let otherHome = temporary.appendingPathComponent("other-home")
+        do {
+            _ = try LogicMCPInstall.installCopy(source, home: otherHome, verify: { _ in throw CocoaError(.fileReadCorruptFile) })
+            preconditionFailure("Unverified source installed")
+        } catch { check(!files.fileExists(atPath: otherHome.path), "Failed verification creates no installation") }
+        print("Status presentation and installation: \(count) checks passed")
     }
 
     static func requireCommand(_ config: String) throws -> String {

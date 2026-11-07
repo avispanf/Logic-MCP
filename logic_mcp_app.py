@@ -14,7 +14,7 @@ def app_bundle():
     return next((p for p in executable.parents if p.suffix == '.app'), None)
 
 
-def setup():
+def setup(start_menu=True):
     bundle = app_bundle()
     if bundle is None:
         raise RuntimeError('Setup must be run from the installed application bundle')
@@ -38,7 +38,7 @@ def setup():
         subprocess.run(['launchctl', 'bootout', menu_target], capture_output=True)
         menu_path.write_bytes(plistlib.dumps(menu_desired))
     subprocess.run(['launchctl', 'enable', menu_target], check=True)
-    if subprocess.run(['launchctl', 'print', menu_target], capture_output=True).returncode != 0:
+    if start_menu and subprocess.run(['launchctl', 'print', menu_target], capture_output=True).returncode != 0:
         subprocess.run(['launchctl', 'bootstrap', f'gui/{os.getuid()}', str(menu_path)], check=True)
     label = 'com.avispanf.logic-pro-mcp-bridge'
     target = f'gui/{os.getuid()}/{label}'
@@ -100,19 +100,50 @@ def uninstall():
     return {'mode': 'uninstalled', 'verified': True, 'message': 'Service removed; manual barrier retained'}
 
 
+def quick_setup():
+    bundle = app_bundle()
+    if bundle is None:
+        raise RuntimeError('Quick setup requires the installed application')
+    import logic_manual_mode as mode
+    paused = mode.operate('pause')
+    if not paused.get('verified'):
+        raise RuntimeError('Cannot verify manual mode; client configuration was not changed')
+    from logic_client_setup import configure_clients
+    clients = configure_clients(Path(sys.executable).resolve(), codex_directory=os.environ.get('CODEX_HOME'))
+    installed = setup(start_menu=False)
+    if not installed.get('verified'):
+        raise RuntimeError('Service installation could not be verified')
+    target = f'gui/{os.getuid()}/com.avispanf.logic-pro-mcp-bridge'
+    if subprocess.run(['launchctl', 'print', target], capture_output=True, timeout=10).returncode:
+        raise RuntimeError('The service was configured but launchctl could not verify it is loaded')
+    status = mode.operate('status')
+    if not status.get('verified') or status.get('mode') != 'manual':
+        raise RuntimeError('Setup finished but manual mode could not be independently verified')
+    return {'mode': 'setup', 'verified': True, **clients,
+            'message': 'Codex and Claude Desktop are configured. Restart those clients when convenient. MCP stays OFF; approve macOS permissions and enable NEW automation when ready. Logic MCU assignment is checked after enabling; if Logic does not detect it, follow Setup instructions.'}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument('--service', action='store_true')
     group.add_argument('--plugins', action='store_true')
     group.add_argument('--audio', action='store_true')
+    group.add_argument('--core', action='store_true')
+    group.add_argument('--client-config', choices=('codex', 'claude'))
     group.add_argument('--audit', action='store_true')
-    group.add_argument('--control', choices=('status', 'pause', 'resume', 'toggle', 'repair', 'setup', 'uninstall'))
+    group.add_argument('--control', choices=('status', 'pause', 'resume', 'toggle', 'repair', 'setup', 'quick-setup', 'uninstall'))
     args, rest = parser.parse_known_args()
+    if args.client_config:
+        from logic_client_setup import merge_config
+        print(merge_config(b'', Path(sys.executable).resolve(), args.client_config).decode('utf-8'))
+        return 0
     if args.control:
         try:
             if args.control == 'setup':
                 result = setup()
+            elif args.control == 'quick-setup':
+                result = quick_setup()
             elif args.control == 'uninstall':
                 result = uninstall()
             else:
@@ -137,6 +168,9 @@ def main():
     elif args.audio:
         import logic_audio_mcp
         logic_audio_mcp.main()
+    elif args.core:
+        import logic_core_stdio
+        logic_core_stdio.main()
     elif args.audit:
         import asyncio
         import run_mix_audit

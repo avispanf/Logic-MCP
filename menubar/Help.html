@@ -12,16 +12,16 @@ body{max-width:780px;margin:40px auto;padding:0 22px 50px}h1{font-size:30px;line
 <p>One shared backend for Logic Pro, with a manual-work switch. Start with a copy of a project.</p>
 <h2>First installation</h2>
 <ol>
-<li>Move <b>Logic MCP.app</b> into Applications or your user Applications folder and open it.</li>
-<li>Right-click the menu-bar button and choose <b>Install / repair service</b>.</li>
+<li>Open <b>Logic MCP.app</b> and click <b>Install &amp; connect</b>. On a fresh install it copies itself to your Applications folder, installs the shared service and configures Codex and Claude Desktop with backups. Existing apps are not overwritten.</li>
+<li>If macOS blocks this unsigned developer preview, follow <a href="https://support.apple.com/en-us/102445">Apple's Open Anyway instructions</a> only if you trust the download. Never disable Gatekeeper globally. Right-click the top button → <b>Install &amp; connect Codex + Claude</b> to retry setup.</li>
 <li>Choose <b>Reveal permission helper</b>. Finder selects the exact installed <code>logic-mcp</code> executable. Choose <b>Accessibility settings</b> and use <b>+</b> to add that executable. Only you can approve Touch ID or your Mac password.</li>
 <li>Choose <b>Enable NEW automation</b>. Open Logic and approve Automation access to Logic Pro and System Events when macOS requests it.</li>
 <li>In Logic → Control Surfaces → Setup, use one Logic Control / MCU-compatible surface and assign <b>both</b> input and output to <code>LogicProMCP-MCU-Internal [bridge]</code>. Keep unrelated hardware controllers unchanged.</li>
-<li>Open <b>Diagnostics</b>, then connect your MCP client. The first backend connection populates the tool cache. Diagnostics can copy detailed status for troubleshooting.</li>
+<li>Open <b>Diagnostics</b>, then restart Codex/Claude Desktop when convenient. Their configuration is already installed. The first backend connection populates the tool cache, so enable once before reloading clients. Diagnostics can copy detailed status for troubleshooting.</li>
 </ol>
 <p class="note">For the shared service, Accessibility belongs to <code>Logic MCP.app/Contents/Resources/runtime/logic-mcp</code>. Granting only the menu app or <code>bin/LogicProMCP</code> is not sufficient. The mode button itself needs no Accessibility permission.</p>
 <h2>Connect your MCP client</h2>
-<p>Choose <b>Copy MCP client configuration</b> from the menu. It copies the actual installation path, including a user Applications folder or spaces in the path. The copied example is TOML; use the equivalent fields if your client uses JSON or another format. The core connection requires Streamable HTTP support.</p>
+<p>The installer configures both Codex and Claude Desktop. Only the three Logic MCP entries are updated; unrelated settings and tool restrictions are preserved. Claude's STDIO relay connects to the same shared backend instead of creating new MIDI ports. For other clients, <b>Copy MCP client configuration</b> copies a TOML example using the actual installed path.</p>
 <p>Example for an app installed in the system Applications folder:</p>
 <pre>[mcp_servers.logic-pro]
 url = "http://127.0.0.1:8765/mcp"
@@ -51,5 +51,5 @@ args = ["--audio"]</pre>
 <p><b>Repair manual state</b> backs up damaged state and keeps automation blocked. <b>Remove service</b> cancels old workers and removes the login service; the manual barrier is deliberately retained. Remove MCP client entries, quit the app and move it to the Trash. Keep audit journals for manual recovery.</p>
 <h2>Scope of the beta</h2>
 <p>Tested on Apple Silicon with macOS 26.6 and Logic Pro 13.0; earlier work used Logic 12.3. The build targets macOS 14+, but runtime validation on that minimum OS is outstanding. No guarantee covers every plugin parameter, instrument, group or analyzer meter. Unreadable states are not guessed.</p>
-<p>Development packages are ad hoc signed. A stable public release still requires Developer ID signing, notarization and a downloaded-build test on a clean Mac.</p>
+<p>GitHub developer previews are ad hoc signed and not notarized; an Apple developer account is not required to share them. Developer ID signing/notarization can be added later for smoother startup. Clean-Mac and minimum-OS runtime tests remain separate from packaging checks.</p>
 </html>

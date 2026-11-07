@@ -12,10 +12,10 @@ private func bundledRuntimeURL() -> URL {
 }
 
 private final class LogicSurfaceController: @unchecked Sendable {
-    func run(_ command: String) -> SurfaceState {
+    func run(_ command: String, runtimeURL: URL? = nil) -> SurfaceState {
         let process = Process()
         let pipe = Pipe()
-        let runtime = bundledRuntimeURL()
+        let runtime = runtimeURL ?? bundledRuntimeURL()
         let action = command == "diagnose" ? "status" : command
         guard FileManager.default.isExecutableFile(atPath: runtime.path) else {
             return .unavailable("Bundled runtime is missing. Reinstall Logic MCP.")
@@ -49,6 +49,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private var timer: Timer?
     private var busy = false
     private var pendingCommand: String?
+    private var firstRunPending = false
     private var currentState: SurfaceState = .unavailable("Waiting for the first status check.")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -62,6 +63,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         refresh()
         timer = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) { [weak self] _ in
             Task { @MainActor in self?.refresh() }
+        }
+        if !UserDefaults.standard.bool(forKey: "setupOffered"), !LogicMCPInstall.serviceConfigured(Bundle.main.bundleURL) {
+            firstRunPending = true
         }
     }
 
@@ -98,6 +102,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         if NSApp.currentEvent?.type == .rightMouseUp {
             let menu = NSMenu()
             for (title, action) in [("Setup instructions", #selector(showHelp)),
+                                    ("Install & connect Codex + Claude", #selector(quickSetup)),
                                     ("Manual mode — MCP OFF", #selector(pauseAutomation)),
                                     ("Enable NEW automation", #selector(resumeAutomation)),
                                     ("Copy MCP client configuration", #selector(copyClientConfiguration)),
@@ -129,6 +134,59 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func pauseAutomation() { request("pause") }
     @objc private func resumeAutomation() { request("resume") }
     @objc private func setupService() { request("setup") }
+    @objc private func quickSetup() {
+        guard !busy else { return }
+        let alert = NSAlert()
+        alert.messageText = "Set up Logic MCP"
+        alert.informativeText = "Installs in your Applications folder if needed, sets up the shared service and adds or updates only logic-pro, logic-plugins and logic-audio in Codex and Claude Desktop. Existing configuration is backed up. MCP stays OFF. macOS permission approvals remain yours; clients may need a restart. No Logic project settings are changed."
+        alert.addButton(withTitle: "Install & connect")
+        alert.addButton(withTitle: "Cancel")
+        UserDefaults.standard.set(true, forKey: "setupOffered")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        if LogicMCPInstall.installedLocation(Bundle.main.bundleURL) {
+            request("quick-setup")
+            return
+        }
+        busy = true
+        statusItem.button?.isEnabled = false
+        overlayButton?.isEnabled = false
+        let source = Bundle.main.bundleURL
+        let controller = controller
+        DispatchQueue.global(qos: .utility).async {
+            do {
+                let installed = try LogicMCPInstall.installCopy(source)
+                let state = controller.run("quick-setup", runtimeURL: installed.appendingPathComponent("Contents/Resources/runtime/logic-mcp"))
+                DispatchQueue.main.async {
+                    self.busy = false
+                    self.statusItem.button?.isEnabled = true
+                    self.overlayButton?.isEnabled = true
+                    let result = NSAlert()
+                    result.messageText = "Logic MCP setup"
+                    result.informativeText = state.guidance
+                    result.runModal()
+                    if case .message = state {
+                        let configuration = NSWorkspace.OpenConfiguration()
+                        configuration.createsNewApplicationInstance = true
+                        NSWorkspace.shared.openApplication(at: installed, configuration: configuration) { _, error in
+                            if error == nil { DispatchQueue.main.async { NSApp.terminate(nil) } }
+                        }
+                    }
+                }
+            } catch {
+                let message = error.localizedDescription
+                DispatchQueue.main.async {
+                    self.busy = false
+                    self.statusItem.button?.isEnabled = true
+                    self.overlayButton?.isEnabled = true
+                    let result = NSAlert()
+                    result.messageText = "Installation stopped"
+                    result.informativeText = message
+                    result.runModal()
+                }
+            }
+        }
+    }
     @objc private func diagnose() { request("diagnose") }
     @objc private func repair() { request("repair") }
     @objc private func revealPermissionHelper() {
@@ -226,6 +284,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                     self.perform(pending)
                 } else if case .message = state {
                     self.perform("status")
+                } else if self.firstRunPending {
+                    self.firstRunPending = false
+                    self.quickSetup()
                 }
             }
         }

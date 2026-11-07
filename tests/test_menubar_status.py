@@ -15,6 +15,7 @@ class MenuBarStatusTests(unittest.TestCase):
             compiled = subprocess.run([
                 "xcrun", "swiftc", "-parse-as-library", "-target", "arm64-apple-macos14.0",
                 str(root / "menubar/LogicMCPStatus.swift"),
+                str(root / "menubar/LogicMCPInstall.swift"),
                 str(root / "tests/fixtures/status_presentation.swift"), "-o", str(binary)
             ], capture_output=True, text=True, timeout=60)
             self.assertEqual(compiled.returncode, 0, compiled.stderr)

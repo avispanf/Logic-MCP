@@ -97,6 +97,9 @@ class ReleaseTests(unittest.TestCase):
         self.assertIn('--prerelease', command)
         self.assertEqual(command[command.index('--target') + 1], 'a' * 40)
         self.assertEqual(command[-3:], [str(directory / name) for name in (*ASSETS, 'SHA256SUMS')])
+        unsigned = draft_command(directory, 'v0.2.0-beta.1', {**verified, 'unsigned_beta': True})
+        self.assertIn('UNSIGNED DEVELOPER PREVIEW', unsigned[unsigned.index('--notes') + 1])
+        self.assertIn('--draft', unsigned)
         for tag in ['v0.2.0', 'v0.2.0-beta.0', 'v0.3.0-beta.1', 'v0.2.0-beta.1;anything']:
             with self.subTest(tag=tag), self.assertRaises(RuntimeError):
                 draft_command(directory, tag, verified)
@@ -214,6 +217,10 @@ class ReleaseTests(unittest.TestCase):
             manifest = resources / 'build-manifest.json'
             manifest.write_text(json.dumps(data))
             verify_provenance(bundle)
+            manifest.write_text(json.dumps({**data, 'signing_mode': 'ad-hoc'}))
+            verify_provenance(bundle, development=True)
+            with self.assertRaises(RuntimeError):
+                verify_provenance(bundle)
             for field, value in [('source_dirty', True), ('source_dirty', 0), ('source_commit', 'unknown'),
                                  ('backend_source_dirty', True), ('backend_commit', 'different'),
                                  ('python_third_party_notice', {}),

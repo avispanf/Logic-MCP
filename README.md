@@ -16,6 +16,10 @@ behaviour and the remaining release gates.
 
 ## Use the application
 
+See the [end-user installation guide](docs/INSTALL.md). Maintainers preparing the first
+signed public beta should follow the [release runbook](docs/RELEASING.md).
+Security/privacy and safe reporting are described in [SECURITY.md](SECURITY.md).
+
 1. Download the app ZIP or DMG from [Releases](https://github.com/avispanf/Logic-MCP/releases)
    when a verified package is available. Development builds are also produced by the
    **Build downloadable app** GitHub Actions workflow.

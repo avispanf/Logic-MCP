@@ -19,7 +19,7 @@
     <key>CFBundleShortVersionString</key>
     <string>0.2.0</string>
     <key>CFBundleVersion</key>
-    <string>8</string>
+    <string>9</string>
     <key>NSAppleEventsUsageDescription</key>
     <string>Logic MCP uses Apple Events to inspect and control Logic Pro and its plugin interfaces through System Events when you enable automation.</string>
     <key>LSMinimumSystemVersion</key>

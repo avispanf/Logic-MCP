@@ -5,6 +5,12 @@ repo_dir=${script_dir:h}
 python_path=${LOGIC_MCP_PYTHON:-python3}
 backend_path=${LOGIC_MCP_BACKEND:-$HOME/.local/bin/LogicProMCP-codex}
 output_dir=${LOGIC_MCP_OUTPUT:-$repo_dir/dist}
+identity=${LOGIC_MCP_SIGN_IDENTITY:--}
+release_mode=${LOGIC_MCP_RELEASE:-0}
+"$python_path" "$repo_dir/scripts/release_preflight.py"
+for name in 'Logic MCP.app' Logic-MCP-macos-arm64.zip Logic-MCP-macos-arm64.dmg SHA256SUMS notarize.zip notary-app-result.json notary-app-log.json notary-dmg-result.json notary-dmg-log.json; do
+  [[ ! -e "$output_dir/$name" ]] || { print -u2 "Output exists: $output_dir/$name. Choose a new LOGIC_MCP_OUTPUT directory"; exit 1; }
+done
 build_dir=$(mktemp -d "${TMPDIR:-/tmp}/logic-mcp-build.XXXXXX")
 trap 'rm -rf "$build_dir"' EXIT
 [[ -x "$backend_path" ]] || { print -u2 "Set LOGIC_MCP_BACKEND to the supported LogicProMCP binary"; exit 1; }
@@ -33,7 +39,6 @@ if [[ -n ${LOGIC_MCP_SHARE_DIR:-} ]]; then
 fi
 "$python_path" "$repo_dir/scripts/verify_bundle.py" "$app_dir"
 # Sign every nested Mach-O executable/library, then the outer bundle.
-identity=${LOGIC_MCP_SIGN_IDENTITY:--}
 sign_args=(--force --sign "$identity")
 if [[ "$identity" != "-" ]]; then sign_args+=(--timestamp --options runtime); fi
 executable_sign_args=("${sign_args[@]}" --entitlements "$repo_dir/menubar/Automation.entitlements")
@@ -46,16 +51,22 @@ while IFS= read -r -d '' binary; do
     fi
   fi
 done < <(find "$app_dir/Contents/Resources" -type f -print0)
+while IFS= read -r -d '' framework; do
+  codesign "${sign_args[@]}" "$framework"
+done < <(find "$app_dir/Contents/Resources" -depth -type d -name '*.framework' -print0)
 codesign "${executable_sign_args[@]}" "$app_dir/Contents/MacOS/LogicMCPMenuBar"
 "$python_path" "$repo_dir/scripts/package_metadata.py" "$app_dir" "$app_dir/Contents/Resources/bin/LogicProMCP" "$backend_path"
 codesign "${executable_sign_args[@]}" "$app_dir"
 codesign --verify --deep --strict "$app_dir"
 "$python_path" "$repo_dir/scripts/verify_bundle.py" "$app_dir" --signatures
+if [[ "$identity" != "-" ]]; then
+  "$python_path" "$repo_dir/scripts/verify_bundle.py" "$app_dir" --developer-id
+fi
 if [[ -n ${LOGIC_MCP_NOTARY_PROFILE:-} ]]; then
-  [[ "$identity" != "-" ]] || { print -u2 'Notarization requires Developer ID'; exit 1; }
-  ditto -c -k --keepParent "$app_dir" "$build_dir/notarize.zip"
-  xcrun notarytool submit "$build_dir/notarize.zip" --keychain-profile "$LOGIC_MCP_NOTARY_PROFILE" --wait
+  ditto -c -k --keepParent "$app_dir" "$output_dir/notarize.zip"
+  "$python_path" "$repo_dir/scripts/notarize.py" "$output_dir/notarize.zip" --profile "$LOGIC_MCP_NOTARY_PROFILE" --label app
   xcrun stapler staple "$app_dir"
+  "$python_path" "$repo_dir/scripts/verify_bundle.py" "$app_dir" --release
 fi
 target="$output_dir/Logic MCP.app"
 [[ ! -e "$target" ]] || { print -u2 "Output exists: $target. Choose a new LOGIC_MCP_OUTPUT directory"; exit 1; }
@@ -65,5 +76,13 @@ mkdir "$build_dir/dmg"
 ditto "$target" "$build_dir/dmg/Logic MCP.app"
 ln -s /Applications "$build_dir/dmg/Applications"
 hdiutil create -quiet -volname 'Logic MCP' -srcfolder "$build_dir/dmg" -ov -format UDZO "$output_dir/Logic-MCP-macos-arm64.dmg"
+if [[ -n ${LOGIC_MCP_NOTARY_PROFILE:-} ]]; then
+  codesign --force --sign "$identity" --timestamp "$output_dir/Logic-MCP-macos-arm64.dmg"
+  "$python_path" "$repo_dir/scripts/notarize.py" "$output_dir/Logic-MCP-macos-arm64.dmg" --profile "$LOGIC_MCP_NOTARY_PROFILE" --label dmg
+  xcrun stapler staple "$output_dir/Logic-MCP-macos-arm64.dmg"
+fi
 (cd "$output_dir" && shasum -a 256 Logic-MCP-macos-arm64.zip Logic-MCP-macos-arm64.dmg > SHA256SUMS)
+if [[ "$release_mode" == 1 ]]; then
+  "$python_path" "$repo_dir/scripts/verify_distribution.py" "$output_dir"
+fi
 print "$target"

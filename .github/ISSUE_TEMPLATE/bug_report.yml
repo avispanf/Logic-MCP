@@ -1,0 +1,39 @@
+name: Bug report
+description: Report a reproducible problem without sharing your project or secrets.
+body:
+  - type: input
+    id: versions
+    attributes:
+      label: Versions
+      description: macOS, Logic Pro, Apple Silicon model, Logic MCP version/build and MCP client.
+    validations:
+      required: true
+  - type: dropdown
+    id: mode
+    attributes:
+      label: Mode when the problem occurred
+      options:
+        - MANUAL · MCP OFF
+        - Automation allowed / MCP ON
+        - Checking / unverified
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction on a disposable project
+      description: Steps, expected result and actual result. Do not attach a real song.
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Optional. Remove names, paths and personal data. Never include passwords or keys.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Privacy
+      options:
+        - label: I reviewed this report for secrets and private project data.
+          required: true

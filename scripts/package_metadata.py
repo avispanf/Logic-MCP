@@ -3,6 +3,7 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import plistlib
 from pathlib import Path
 import shutil
 import subprocess
@@ -38,7 +39,15 @@ else:
     if 'PYTHON SOFTWARE FOUNDATION' not in license_text:
         raise RuntimeError('Unexpected CPython license response')
     target.write_text(license_text)
-manifest = {'version': '0.2.0-beta', 'backend_commit': '7979bc7623c36d2cb911b3baa5c1c0ff98e06ff4',
+repo = Path(__file__).resolve().parents[1]
+info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
+commit = subprocess.check_output(['git', '-C', str(repo), 'rev-parse', 'HEAD'], text=True).strip()
+dirty = bool(subprocess.check_output(['git', '-C', str(repo), 'status', '--porcelain'], text=True).strip())
+manifest = {'version': info['CFBundleShortVersionString'] + '-beta', 'build': info['CFBundleVersion'],
+    'source_commit': commit, 'source_dirty': dirty, 'release_channel': 'beta',
+    'signing_mode': 'developer-id' if os.environ.get('LOGIC_MCP_SIGN_IDENTITY', '-') != '-' else 'ad-hoc',
+    'runtime_sha256': hashlib.sha256((resources / 'runtime/logic-mcp').read_bytes()).hexdigest(),
+    'backend_commit': '7979bc7623c36d2cb911b3baa5c1c0ff98e06ff4',
     'backend_sha256': hashlib.sha256(backend.read_bytes()).hexdigest(),
     'python': sys.version, 'architecture': 'arm64', 'minimum_macos': '14.0',
     'packages': sorted(packages, key=lambda row: row['name'].lower())}
@@ -47,5 +56,9 @@ native_commit = subprocess.run(['git', '-C', str(native_source), 'rev-parse', 'H
                                capture_output=True, text=True, check=True, timeout=5).stdout.strip()
 if native_commit != manifest['backend_commit']:
     raise RuntimeError('Native notice checkout does not match the pinned backend commit')
+manifest['backend_source_dirty'] = bool(subprocess.check_output(
+    ['git', '-C', str(native_source), 'status', '--porcelain'], text=True).strip())
+if os.environ.get('LOGIC_MCP_NOTARY_PROFILE') and (dirty or manifest['backend_source_dirty']):
+    raise RuntimeError('Notarized builds require clean app and backend source checkouts')
 manifest['native_license_files'] = collect_native_licenses(native_source, resources)
 (resources / 'build-manifest.json').write_text(json.dumps(manifest, indent=2))

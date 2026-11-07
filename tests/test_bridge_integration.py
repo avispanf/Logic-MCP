@@ -15,6 +15,7 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
 from mcp.shared.exceptions import MCPError
 import logic_manual_mode as mode
+import logic_control as control
 
 
 class HTTPIntegrationTests(unittest.IsolatedAsyncioTestCase):
@@ -61,19 +62,24 @@ class HTTPIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         break
                     selected.update(children)
                 return {p: r for p,r in rows.items() if p in selected}
-            async def client(blocked=False):
+            async def client(blocked=False, owner=None):
                 async with streamable_http_client(f'http://127.0.0.1:{port}/mcp') as streams:
                     async with ClientSession(streams[0],streams[1]) as session:
                         await session.initialize()
-                        self.assertEqual(len((await session.list_tools()).tools), 1)
+                        if owner is None:
+                            self.assertEqual(len((await session.list_tools()).tools), 1)
                         if blocked:
                             with self.assertRaisesRegex(MCPError, 'manual mode'):
                                 await session.call_tool('echo', {'test': 1})
                         else:
-                            self.assertFalse((await session.call_tool('echo', {'test': 1})).is_error)
+                            meta = {'logic-mcp-owner': owner} if owner else None
+                            self.assertFalse((await session.call_tool('echo', {'test': 1}, meta=meta)).is_error)
             try:
                 await wait_backend()
                 await asyncio.gather(client(),client(),client())
+                with patch.object(mode, 'STATE_DIR', root), patch.object(mode, 'STATE_FILE', root / 'manual-mode.json'):
+                    with control.transaction() as owner:
+                        await client(owner=owner)
                 for _ in range(3):
                     with patch.object(mode, 'STATE_DIR', root), patch.object(mode, 'STATE_FILE', root / 'manual-mode.json'), \
                             patch.object(mode, 'processes', side_effect=test_processes_only):

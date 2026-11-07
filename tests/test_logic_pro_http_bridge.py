@@ -85,6 +85,22 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(arguments, {"command": "health", "params": {}})
         self.assertTrue(kwargs["allow_input_required"])
 
+    async def test_tool_call_reads_sdk_mapping_metadata(self):
+        entry = self.server.get_request_handler("tools/call")
+        params = CallToolRequestParams(name="logic_system", arguments={}, meta={"logic-mcp-owner": "audit-token"})
+        with patch.object(bridge.control, "operation") as operation:
+            await entry.handler(self.context, params)
+        self.assertEqual(operation.call_args.kwargs["owner"], "audit-token")
+        self.assertEqual(self.session.calls[0][3]["meta"], {"logic-mcp-owner": "audit-token"})
+
+    async def test_schema_cache_is_available_without_entering_audit_lease(self):
+        self.state.tools = ListToolsResult(tools=[Tool(name="cached", input_schema={"type": "object"})])
+        entry = self.server.get_request_handler("tools/list")
+        with patch.object(bridge.control, "operation", side_effect=AssertionError("Must not touch backend")):
+            result = await entry.handler(self.context, None)
+        self.assertEqual([tool.name for tool in result.tools], ["cached"])
+        self.assertEqual(self.session.calls, [])
+
     def test_defaults_are_loopback_only(self):
         args = bridge.parse_args([])
         self.assertEqual(args.host, "127.0.0.1")

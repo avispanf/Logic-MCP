@@ -14,6 +14,26 @@ def arguments() -> argparse.Namespace:
 
 
 class AuditRunnerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_owned_tool_uses_sdk_mapping_metadata(self):
+        runner = runner_module.AuditRunner(arguments())
+        runner.owner = "audit-token"
+        session = mock.Mock()
+        session.call_tool = mock.AsyncMock(return_value=argparse.Namespace(content=[
+            argparse.Namespace(type="text", text='{"ok":true}')]))
+        runner.sessions["core"] = session
+        self.assertEqual(await runner.tool("core", "logic_system", {"command": "health"}), {"ok": True})
+        session.call_tool.assert_awaited_once_with("logic_system", {"command": "health"}, meta={"logic-mcp-owner": "audit-token"})
+
+    async def test_owned_resource_uses_sdk_mapping_metadata(self):
+        runner = runner_module.AuditRunner(arguments())
+        runner.owner = "audit-token"
+        session = mock.Mock()
+        session.read_resource = mock.AsyncMock(return_value=argparse.Namespace(contents=[
+            argparse.Namespace(text='{"data":[]}')]))
+        runner.sessions["core"] = session
+        self.assertEqual(await runner.resource("logic://tracks"), {"data": []})
+        session.read_resource.assert_awaited_once_with("logic://tracks", meta={"logic-mcp-owner": "audit-token"})
+
     def test_only_project_track_scope_skips_full_mixer_survey(self):
         self.assertFalse(runner_module.audit_requires_mixer_survey("track"))
         for scope in ("group", "aux", "bus", "master", "all"):

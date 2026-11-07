@@ -57,7 +57,7 @@ class BridgeState:
 
 
 def _owner(meta):
-    return meta.model_dump().get("logic-mcp-owner") if meta else None
+    return meta.get("logic-mcp-owner") if meta else None
 
 
 def build_server(state):
@@ -75,9 +75,9 @@ def build_server(state):
                 return await getattr(state.session, method)(*args, **kwargs)
 
     async def list_tools(ctx: ServerRequestContext, params: PaginatedRequestParams | None) -> ListToolsResult:
-        if manual.STATE_FILE.exists() or state.session is None:
+        if manual.STATE_FILE.exists() or state.session is None or not params or not params.cursor:
             return state.tools
-        return await dispatch("list_tools", params=params)
+        return await dispatch("list_tools", params=params, owner=_owner(params.meta))
 
     async def call_tool(ctx: ServerRequestContext, params: CallToolRequestParams) -> CallToolResult | InputRequiredResult:
         return await dispatch("call_tool", params.name, params.arguments, owner=_owner(params.meta),

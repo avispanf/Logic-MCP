@@ -26,6 +26,12 @@ a venv, a source checkout, or Homebrew for the mode switch and plugin control. A
 analysis additionally needs ffmpeg/ffprobe; the audio diagnostics report missing helpers.
 The bundled setup page explains Accessibility/Automation permissions required for Logic
 control (the mode button itself needs none).
+For the installed shared service, macOS attributes Accessibility requests to
+`Logic MCP.app/Contents/Resources/runtime/logic-mcp`, which starts the backend.
+Grant that installed executable access; adding only `bin/LogicProMCP` is not sufficient.
+An ad hoc development update can invalidate the old grant even while its switch still
+looks enabled. Remove the old `logic-mcp` entry, add the current installed executable
+again, then restart the service and verify Diagnostics. Do not reset unrelated apps.
 If the bundled runtime is missing, the app reports a reinstall error; it never falls
 back to running scripts from a developer checkout.
 

@@ -262,12 +262,12 @@ class AuditRunner:
         self.sessions[name] = session
 
     async def tool(self, server: str, name: str, arguments: dict | None = None) -> dict:
-        meta = RequestParamsMeta.model_validate({"logic-mcp-owner": self.owner}) if getattr(self, "owner", None) else None
+        meta: RequestParamsMeta | None = {"logic-mcp-owner": self.owner} if getattr(self, "owner", None) else None
         result = await self.sessions[server].call_tool(name, arguments or {}, meta=meta)
         return json_text(result)
 
     async def resource(self, uri: str) -> dict:
-        meta = RequestParamsMeta.model_validate({"logic-mcp-owner": self.owner}) if getattr(self, "owner", None) else None
+        meta: RequestParamsMeta | None = {"logic-mcp-owner": self.owner} if getattr(self, "owner", None) else None
         result = await self.sessions["core"].read_resource(uri, meta=meta)
         if not result.contents:
             return {"error": f"empty resource {uri}"}

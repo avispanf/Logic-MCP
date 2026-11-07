@@ -10,6 +10,8 @@ plugin or mix/mastering qualification. Native plugin insertion on Logic 13 remai
 unverified when Logic exposes only a generic slot label, and is rolled back.
 Development packages use ad hoc signing. A stable public download must be Developer ID
 signed and notarized.
+See the [installed build 7 validation record](docs/validation-2026-11-07.md) for tested
+behaviour and the remaining release gates.
 
 ## Use the application
 

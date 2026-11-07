@@ -31,6 +31,7 @@ install -m 644 "$repo_dir/THIRD_PARTY_NOTICES.md" "$app_dir/Contents/Resources/T
 if [[ -n ${LOGIC_MCP_SHARE_DIR:-} ]]; then
   ditto "$LOGIC_MCP_SHARE_DIR" "$app_dir/Contents/Resources/share/logic-pro-mcp"
 fi
+"$python_path" "$repo_dir/scripts/verify_bundle.py" "$app_dir"
 # Sign every nested Mach-O executable/library, then the outer bundle.
 identity=${LOGIC_MCP_SIGN_IDENTITY:--}
 sign_args=(--force --sign "$identity")

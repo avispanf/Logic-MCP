@@ -419,6 +419,10 @@ Legacy installer script names delegate to the new installer.
 
 Outputs: standalone app, ZIP and DMG under `dist/`. Build scripts refuse to overwrite an
 existing app output. `LOGIC_MCP_OUTPUT` selects a new destination.
+Every bundled Mach-O binary is checked for arm64 support and a deployment target no
+newer than the app's declared minimum OS. A Python built with newer Homebrew libraries
+can fail this check even when the outer app targets macOS 14; use the CI build or a
+Python distribution whose bundled libraries support the declared minimum.
 
 For Developer ID signing, set `LOGIC_MCP_SIGN_IDENTITY`. For notarization also set
 `LOGIC_MCP_NOTARY_PROFILE` to a configured notarytool keychain profile. Nested executables

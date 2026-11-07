@@ -1,5 +1,6 @@
 import os
 from pathlib import Path
+import plistlib
 import signal
 import subprocess
 import sys
@@ -92,6 +93,22 @@ class ManualModeTests(unittest.TestCase):
             mode._write(record, {**row, 'active': False})
             self.assertEqual(mode.inventory({123: row})[0], set())
             mode._write(record, {**row, 'active': True})
+            self.assertEqual(mode.inventory({123: row})[0], {123})
+
+    def test_launch_agent_protects_supervisor_before_registration(self):
+        arguments = ['/Applications/Logic MCP.app/Contents/Resources/runtime/logic-mcp', '--service']
+        row = {'pid': 123, 'ppid': 1, 'birth': 'now', 'status': 'S',
+               'command': ' '.join(arguments), 'argv': arguments}
+        with tempfile.TemporaryDirectory() as directory, patch.object(mode.Path, 'home', return_value=Path(directory)), \
+                patch.object(mode, 'STATE_DIR', Path(directory) / 'state'):
+            path = Path(directory) / 'Library/LaunchAgents/com.avispanf.logic-pro-mcp-bridge.plist'
+            path.parent.mkdir(parents=True)
+            agent = {'Label': 'com.avispanf.logic-pro-mcp-bridge', 'ProgramArguments': arguments}
+            path.write_bytes(plistlib.dumps(agent))
+            self.assertEqual(mode.inventory({123: row})[0], set())
+            other = {**row, 'pid': 124, 'argv': [arguments[0], '--plugins']}
+            self.assertEqual(mode.inventory({123: row, 124: other})[0], {124})
+            path.write_bytes(plistlib.dumps({**agent, 'Label': 'another-service'}))
             self.assertEqual(mode.inventory({123: row})[0], {123})
 
     def test_other_installation_state_directory_is_not_touched(self):

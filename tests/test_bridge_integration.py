@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 from pathlib import Path
+import signal
 import socket
 import subprocess
 import sys
@@ -12,6 +13,7 @@ from unittest.mock import patch
 from urllib.request import urlopen
 from mcp import ClientSession
 from mcp.client.streamable_http import streamable_http_client
+from mcp.shared.exceptions import MCPError
 import logic_manual_mode as mode
 
 
@@ -27,7 +29,10 @@ class HTTPIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 port_socket.bind(('127.0.0.1', 0))
                 port = port_socket.getsockname()[1]
             env = {**os.environ, 'LOGIC_MCP_STATE_DIR': directory, 'PYTHONDONTWRITEBYTECODE': '1'}
-            cmd = [sys.executable, '-B', 'logic_pro_http_bridge.py', '--port', str(port), '--backend', str(backend)]
+            launcher = ('import faulthandler,runpy,signal; '
+                        'faulthandler.register(signal.SIGUSR1); '
+                        'runpy.run_path("logic_pro_http_bridge.py",run_name="__main__")')
+            cmd = [sys.executable, '-B', '-c', launcher, '--port', str(port), '--backend', str(backend)]
             log = (root / 'service.log').open('w+')
             process = subprocess.Popen(cmd, env=env, stdout=log, stderr=log)
             def health():
@@ -56,31 +61,45 @@ class HTTPIntegrationTests(unittest.IsolatedAsyncioTestCase):
                         break
                     selected.update(children)
                 return {p: r for p,r in rows.items() if p in selected}
-            async def client():
+            async def client(blocked=False):
                 async with streamable_http_client(f'http://127.0.0.1:{port}/mcp') as streams:
                     async with ClientSession(streams[0],streams[1]) as session:
                         await session.initialize()
                         self.assertEqual(len((await session.list_tools()).tools), 1)
-                        self.assertFalse((await session.call_tool('echo', {'test': 1})).is_error)
+                        if blocked:
+                            with self.assertRaisesRegex(MCPError, 'manual mode'):
+                                await session.call_tool('echo', {'test': 1})
+                        else:
+                            self.assertFalse((await session.call_tool('echo', {'test': 1})).is_error)
             try:
                 await wait_backend()
                 await asyncio.gather(client(),client(),client())
-                with patch.object(mode, 'STATE_DIR', root), patch.object(mode, 'STATE_FILE', root / 'manual-mode.json'), \
-                        patch.object(mode, 'processes', side_effect=test_processes_only):
-                    self.assertEqual(len([r for r in test_processes_only().values() if str(backend) in (r.get('argv') or [])]), 1)
-                    paused = mode.operate('pause')
-                    self.assertTrue(paused['verified'], paused)
-                    snapshot = test_processes_only()
-                    if 'T' in snapshot[process.pid]['status']:
-                        log.seek(0)
-                        self.fail('Supervisor was suspended: ' + json.dumps({
-                            'rows': snapshot, 'registration': (root / 'supervisor.json').read_text(),
-                            'journal': mode.read_state(), 'log': log.read()}))
-                    self.assertEqual(health()['state'], 'manual')
-                    self.assertIsNone(process.poll())
-                    self.assertTrue(mode.operate('resume')['verified'])
-                await wait_backend()
-                await client()
+                for _ in range(3):
+                    with patch.object(mode, 'STATE_DIR', root), patch.object(mode, 'STATE_FILE', root / 'manual-mode.json'), \
+                            patch.object(mode, 'processes', side_effect=test_processes_only):
+                        self.assertEqual(len([r for r in test_processes_only().values() if str(backend) in (r.get('argv') or [])]), 1)
+                        paused = mode.operate('pause')
+                        self.assertTrue(paused['verified'], paused)
+                        snapshot = test_processes_only()
+                        if 'T' in snapshot[process.pid]['status']:
+                            log.seek(0)
+                            self.fail('Supervisor was suspended: ' + json.dumps({
+                                'rows': snapshot, 'registration': (root / 'supervisor.json').read_text(),
+                                'journal': mode.read_state(), 'log': log.read()}))
+                        try:
+                            paused_health = await asyncio.to_thread(health)
+                        except OSError:
+                            process.send_signal(signal.SIGUSR1)
+                            await asyncio.sleep(.1)
+                            log.seek(0)
+                            self.fail('Manual-mode health did not respond: ' + log.read())
+                        self.assertEqual(paused_health['state'], 'manual')
+                        self.assertFalse(paused_health['backend_ready'])
+                        self.assertIsNone(process.poll())
+                        await client(blocked=True)
+                        self.assertTrue(mode.operate('resume')['verified'])
+                    await wait_backend()
+                    await client()
                 # Singleton protection must fail before a second backend is spawned.
                 other = subprocess.run(cmd, env=env, capture_output=True, text=True, timeout=5)
                 self.assertNotEqual(other.returncode, 0)

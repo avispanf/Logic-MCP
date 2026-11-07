@@ -14,6 +14,8 @@ distribution route for smoother Gatekeeper handling, not a requirement to share 
 See the [Logic 13 runtime validation](docs/validation-2026-11-07.md) and
 [installed build 8 polish checks](docs/validation-build-8-2026-11-07.md) for tested
 behaviour and the remaining release gates.
+The [build 10 installer record](docs/validation-build-10-2026-11-07.md) covers the
+guided installer, two-client configuration and unsigned-preview package checks.
 
 ## Use the application
 

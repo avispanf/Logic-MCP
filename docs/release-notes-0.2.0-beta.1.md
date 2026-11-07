@@ -28,6 +28,9 @@ ffmpeg/ffprobe. Checksums are in SHA256SUMS.
 Current runtime evidence is from macOS 26.6 / Logic Pro 13.0 on Apple Silicon;
 earlier work used Logic 12.3. The app targets macOS 14+, not Intel.
 Consult the candidate acceptance record for minimum-OS and clean-Mac testing.
+The [build 10 validation record](https://github.com/avispanf/Logic-MCP/blob/main/docs/validation-build-10-2026-11-07.md)
+lists completed checks and unrun scenarios. Full fresh-account installation/permissions,
+client restart, clean-Mac quarantine and minimum-OS runtime are not yet verified end-to-end.
 Some plugin parameters, instrument UIs, group/bus relationships and live analyzer meters
 remain unsupported or unverified. Native insertion on Logic 13 can expose generic labels
 and is refused/rolled back when identity cannot be verified. Idle MCU feedback can go stale

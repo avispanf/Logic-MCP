@@ -1,7 +1,7 @@
 # Public beta release runbook
 
-No public app release has been made yet. The first intended release is
-`v0.2.0-beta.1`, not a stable/all-plugins-supported release.
+The initial developer-preview tag is `v0.2.0-beta.1`, not a stable/all-plugins-supported
+release. Consult GitHub Releases for the current publication state.
 
 ## Distribution choices
 

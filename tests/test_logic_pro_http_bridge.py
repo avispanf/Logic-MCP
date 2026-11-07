@@ -1,6 +1,6 @@
 import types
 import unittest
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from pathlib import Path
 import tempfile
 import logic_manual_mode as manual
@@ -101,6 +101,85 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([tool.name for tool in result.tools], ["cached"])
         self.assertEqual(self.session.calls, [])
 
+    async def test_slow_diagnostic_does_not_recreate_backend(self):
+        entered, completed = [], []
+        async def slow_health(*args):
+            await asyncio.sleep(10)
+        fake = types.SimpleNamespace(
+            initialize=AsyncMock(return_value=types.SimpleNamespace(
+                server_info=types.SimpleNamespace(version="3.13.0", name="fake"))),
+            list_tools=AsyncMock(return_value=ListToolsResult(tools=[Tool(name="logic_system", input_schema={"type": "object"})])),
+            send_ping=AsyncMock(), call_tool=AsyncMock(side_effect=slow_health))
+        @asynccontextmanager
+        async def transport(*args):
+            entered.append(True)
+            yield None, None
+        @asynccontextmanager
+        async def session(*args, **kwargs):
+            yield fake
+        original_probe = bridge.probe_backend
+        async def quick_probe(state):
+            await original_probe(state, timeout=.01)
+            completed.append(True)
+        args = types.SimpleNamespace(backend="/fake/backend", instance_id="bridge", share_dir="/fake", tool_timeout=1, health_interval=0)
+        with patch.object(bridge, "gated_backend", transport), patch.object(bridge, "ClientSession", session), \
+                patch.object(bridge, "validate_backend"), patch.object(bridge, "probe_backend", quick_probe):
+            task = asyncio.create_task(bridge.backend_loop(self.state, args))
+            try:
+                with anyio.fail_after(3):
+                    while len(completed) < 2:
+                        await asyncio.sleep(.01)
+                self.assertEqual(len(entered), 1)
+                self.assertIs(self.state.session, fake)
+                self.assertIn("preserving", self.state.error)
+                self.assertEqual(self.state.capabilities, {})
+            finally:
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+
+    async def test_ping_timeout_preserves_session(self):
+        session = types.SimpleNamespace(send_ping=AsyncMock(side_effect=TimeoutError))
+        self.state.session = session
+        await bridge.probe_backend(self.state)
+        self.assertIs(self.state.session, session)
+        self.assertIn("ping timed out", self.state.error)
+
+    async def test_health_probe_recovers_without_replacing_session(self):
+        payload = {"permissions": {"accessibility": True}, "mcu": {"registered_as_device": False}}
+        session = types.SimpleNamespace(send_ping=AsyncMock(), call_tool=AsyncMock(side_effect=[
+            TimeoutError(), CallToolResult(content=[], structured_content=payload)]))
+        self.state.session = session
+        self.state.tools = ListToolsResult(tools=[Tool(name="logic_system", input_schema={"type": "object"})])
+        await bridge.probe_backend(self.state)
+        self.assertEqual(self.state.capabilities, {})
+        self.assertIn("timed out", self.state.error)
+        await bridge.probe_backend(self.state)
+        self.assertIs(self.state.session, session)
+        self.assertEqual(self.state.capabilities, payload)
+        self.assertIsNone(self.state.error)
+
+    async def test_transport_failure_is_not_silently_ignored(self):
+        self.state.session = types.SimpleNamespace(send_ping=AsyncMock(side_effect=ConnectionError("closed")))
+        with self.assertRaises(ConnectionError):
+            await bridge.probe_backend(self.state)
+
+    def test_readiness_uses_reported_mcu_fields_and_fails_closed(self):
+        permissions = dict.fromkeys(("accessibility", "automation_granted", "automation_system_events", "post_event_access"), True)
+        mcu = {"registered_as_device": True, "connected": True, "feedback_stale": False}
+        self.assertEqual(bridge.capability_readiness({"permissions": permissions, "mcu": mcu}), "ready")
+        cases = (({}, "checking"),
+                 ({**mcu, "registered_as_device": False}, "mcu-setup-required"),
+                 ({**mcu, "connected": False}, "mcu-feedback-required"),
+                 ({**mcu, "feedback_stale": True}, "mcu-feedback-stale"))
+        for value, expected in cases:
+            with self.subTest(mcu=value):
+                self.assertEqual(bridge.capability_readiness({"permissions": permissions, "mcu": value}), expected)
+        self.assertEqual(bridge.capability_readiness({}), "checking")
+        for malformed in (None, {"permissions": None}, {"permissions": permissions, "mcu": []}):
+            self.assertEqual(bridge.capability_readiness(malformed), "checking")
+        self.assertEqual(bridge.capability_readiness({"permissions": {**permissions, "accessibility": False}, "mcu": mcu}), "permissions-required")
+
     def test_defaults_are_loopback_only(self):
         args = bridge.parse_args([])
         self.assertEqual(args.host, "127.0.0.1")
@@ -112,3 +191,5 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+import asyncio
+from contextlib import asynccontextmanager

@@ -2664,13 +2664,27 @@ def ax_subtree(
 
 def find_control_bar(process: str, window: int = 0) -> dict:
     window = window or main_window_index(process)
-    elements = walk_window(process, window, 2, root="6")
-    index: dict[str, dict] = {}
-    for entry in elements:
-        label = entry["name"] or entry["description"]
-        if label and label not in index:
-            index[label] = entry
-    return index
+    roots = walk_window(process, window, 0, budget=200, seconds=5)
+    preferred = [entry for entry in roots if entry["role"] == "AXToolbar"
+                 or "control bar" in (entry["name"] + " " + entry["description"]).lower()]
+    fallback = [entry for entry in roots if entry not in preferred and entry["role"] == "AXGroup"]
+    for candidates in (preferred, fallback):
+        matches = []
+        for root in candidates:
+            elements = walk_window(process, window, 2, root=root["path"], budget=250, seconds=8)
+            index: dict[str, dict] = {}
+            for entry in elements:
+                label = re.split(r"\s{2,}", entry["name"] or entry["description"], maxsplit=1)[0]
+                label = {"Metronome": "Metronome Click"}.get(label, label)
+                if label and label not in index:
+                    index[label] = entry
+            if all(index.get(label, {}).get("role") in {"AXCheckBox", "AXButton"} for label in ("Play", "Record")):
+                matches.append(index)
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ProbeError("Control Bar identity is ambiguous")
+    raise ProbeError("Control Bar with readable Play and Record controls was not found")
 
 
 @tool
@@ -2687,17 +2701,20 @@ def control_bar(window_index: int = 0) -> dict:
     def path_of(label):
         entry = index.get(label)
         return entry["path"] if entry else None
+    def state_of(label):
+        value = value_of(label)
+        return None if value is None else value == "1"
     return {
-        "playing": value_of("Play") == "1",
-        "recording": value_of("Record") == "1",
-        "cycle": value_of("Cycle") == "1",
-        "solo": value_of("Solo") == "1",
-        "metronome": value_of("Metronome Click") == "1",
+        "playing": state_of("Play"),
+        "recording": state_of("Record"),
+        "cycle": state_of("Cycle"),
+        "solo": state_of("Solo"),
+        "metronome": state_of("Metronome Click"),
         "tempo": value_of("Tempo"),
         "time_signature": value_of("Time Signature"),
         "key_signature": value_of("Key Signature"),
         "master_volume": value_of("Master Volume"),
-        "mixer_open": value_of("Mixer") == "1",
+        "mixer_open": state_of("Mixer"),
         "paths": {k: path_of(k) for k in ("Play", "Record", "Cycle", "Solo", "Go to Beginning", "Metronome Click", "Master Volume", "Mixer")},
         "available": sorted(index),
     }

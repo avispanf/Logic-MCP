@@ -123,6 +123,72 @@ def validate_backend(path):
         raise RuntimeError("Backend lacks deterministic MIDI namespace support. Install the supported build.")
 
 
+def capability_readiness(capabilities):
+    if not isinstance(capabilities, dict):
+        return "checking"
+    permissions = capabilities.get("permissions", {})
+    if not isinstance(permissions, dict):
+        return "checking"
+    for key in ("accessibility", "automation_granted", "automation_system_events", "post_event_access"):
+        if permissions.get(key) is False:
+            return "permissions-required"
+        if permissions.get(key) is not True:
+            return "checking"
+    mcu = capabilities.get("mcu", {})
+    if not isinstance(mcu, dict):
+        return "checking"
+    if mcu.get("registered_as_device") is False:
+        return "mcu-setup-required"
+    if mcu.get("registered_as_device") is not True:
+        return "checking"
+    if mcu.get("connected") is False:
+        return "mcu-feedback-required"
+    if mcu.get("connected") is not True:
+        return "checking"
+    if mcu.get("feedback_stale") is True:
+        return "mcu-feedback-stale"
+    return "ready" if mcu.get("feedback_stale") is False else "checking"
+
+
+async def probe_backend(state, timeout=5):
+    async with state.lock:
+        try:
+            with anyio.fail_after(timeout):
+                await state.session.send_ping()
+        except TimeoutError:
+            state.capabilities = {}
+            state.error = "Backend ping timed out; preserving the process and MIDI endpoints"
+            return
+        state.last_ping = time.monotonic()
+        if not any(tool.name == "logic_system" for tool in state.tools.tools):
+            state.error = None
+            return
+        try:
+            with control.operation():
+                with anyio.fail_after(timeout):
+                    report = await state.session.call_tool("logic_system", {"command": "health", "params": {}})
+        except TimeoutError:
+            state.capabilities = {}
+            state.error = "Diagnostic health request timed out; preserving the process and MIDI endpoints"
+            return
+        except RuntimeError:
+            return
+        if report.is_error:
+            state.capabilities = {}
+            state.error = "Backend health reported an error; preserving the process and MIDI endpoints"
+            return
+        try:
+            payload = getattr(report, "structured_content", None)
+            if not isinstance(payload, dict):
+                payload = next((json.loads(block.text) for block in report.content
+                                if getattr(block, "text", "").lstrip().startswith("{")), {})
+        except ValueError:
+            state.capabilities = {}
+            state.error = "Invalid backend health payload"
+            return
+        state.capabilities, state.error = payload, None
+
+
 async def backend_loop(state, args):
     parameters = StdioServerParameters(command=str(Path(args.backend).expanduser().resolve()),
         env={"LOGIC_PRO_MCP_MIDI_INSTANCE_ID": args.instance_id,
@@ -150,24 +216,14 @@ async def backend_loop(state, args):
                     state.tools, state.tool_count = tools, len(tools.tools)
                     manual._write(manual.STATE_DIR / "tools.json", tools.model_dump(mode="json"))
                     state.last_ping, state.error = time.monotonic(), None
+                    state.capabilities = {}
+                    last_probe = state.last_ping
                     state.session = session
                     while not manual.STATE_FILE.exists():
                         await anyio.sleep(0.2)
-                        if time.monotonic() - state.last_ping > args.health_interval and not state.lock.locked():
-                            async with state.lock:
-                                with anyio.fail_after(5):
-                                    await session.send_ping()
-                                    if any(tool.name == "logic_system" for tool in state.tools.tools):
-                                        try:
-                                            with control.operation():
-                                                report = await session.call_tool("logic_system", {"command": "health", "params": {}})
-                                            payload = getattr(report, "structured_content", None)
-                                            if not isinstance(payload, dict):
-                                                payload = next((json.loads(block.text) for block in report.content if getattr(block, "text", "").lstrip().startswith("{")), {})
-                                            state.capabilities = payload
-                                        except RuntimeError:
-                                            pass  # Another client holds the complete audit lease.
-                                state.last_ping = time.monotonic()
+                        if time.monotonic() - last_probe > args.health_interval and not state.lock.locked():
+                            await probe_backend(state)
+                            last_probe = time.monotonic()
                     # Withdraw the old session before cleanup; no queued command may reuse it.
                     state.session = None
         except Exception as exc:
@@ -227,14 +283,7 @@ async def serve(args):
                     ["/usr/bin/pgrep", "-x", "Logic Pro"], capture_output=True, timeout=3).returncode == 0)
             status = "manual" if paused else "offline" if not backend_ready else "logic-closed" if not running else "ready"
             if status == "ready" and any(tool.name == "logic_system" for tool in state.tools.tools):
-                permissions = state.capabilities.get("permissions", {})
-                mcu = state.capabilities.get("mcu", {})
-                if not state.capabilities:
-                    status = "checking"
-                elif permissions.get("accessibility") is False:
-                    status = "permissions-required"
-                elif mcu.get("registeredAsDevice") is False:
-                    status = "mcu-setup-required"
+                status = capability_readiness(state.capabilities)
             return JSONResponse({"service": "logic-mcp", "ready": status == "ready", "state": status,
                 "backend_ready": backend_ready and not paused, "instance_id": args.instance_id,
                 "tools": state.tool_count, "version": state.upstream_version,

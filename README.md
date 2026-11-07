@@ -124,6 +124,11 @@ Right-click offers diagnostics, repair, service removal and an overlay preferenc
 `MCP · offline` / `MCP · logic-closed` means automation is allowed but not ready.
 `MCP CHECK` is unverified. The service's `/health` remains reachable in manual mode and
 reports `state=manual`, `ready=false`.
+Background ping or diagnostic timeouts do not restart a live backend or recreate its
+MIDI ports. Readiness becomes unverified and the health response explains the timeout;
+the next probe can recover in place. A closed transport still triggers backend recovery.
+MCU setup and feedback are checked from the reported `registered_as_device`, `connected`
+and `feedback_stale` fields; missing data is not reported as ready.
 
 ```bash
 "/Applications/Logic MCP.app/Contents/Resources/runtime/logic-mcp" --control status

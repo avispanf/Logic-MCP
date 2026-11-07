@@ -62,6 +62,35 @@ class ProjectIdentityTests(unittest.TestCase):
 
 
 class TransportPositionTests(unittest.TestCase):
+    def test_control_bar_is_discovered_without_a_fixed_root_index(self):
+        for root_path in ("1", "6", "9"):
+            roots = [{"path": root_path, "role": "AXToolbar", "name": "", "description": "toolbar", "value": ""}]
+            controls = [
+                {"path": root_path + ".1", "role": "AXCheckBox", "name": "", "description": "Play", "value": "1"},
+                {"path": root_path + ".2", "role": "AXCheckBox", "name": "", "description": "Record", "value": "0"},
+                {"path": root_path + ".3", "role": "AXButton", "name": "", "description": "Stop   0", "value": ""},
+                {"path": root_path + ".4", "role": "AXCheckBox", "name": "", "description": "Metronome", "value": "0"},
+            ]
+            with self.subTest(root=root_path), mock.patch.object(plugins, "walk_window", side_effect=[roots, controls]):
+                result = plugins.find_control_bar("Logic Pro", 2)
+            self.assertEqual(result["Play"]["path"], root_path + ".1")
+            self.assertIn("Stop", result)
+            self.assertIn("Metronome Click", result)
+
+    def test_missing_control_bar_fails_closed(self):
+        with mock.patch.object(plugins, "walk_window", return_value=[]):
+            with self.assertRaisesRegex(plugins.ProbeError, "not found"):
+                plugins.find_control_bar("Logic Pro", 1)
+
+    def test_missing_optional_transport_flags_are_unknown_not_false(self):
+        controls = {"Play": {"value": "0", "path": "1.1"}, "Record": {"value": "0", "path": "1.2"}}
+        with mock.patch.object(plugins, "require_logic", return_value="Logic Pro"), \
+                mock.patch.object(plugins, "find_control_bar", return_value=controls):
+            result = plugins.control_bar(window_index=1)
+        self.assertFalse(result["playing"])
+        self.assertIsNone(result["cycle"])
+        self.assertIsNone(result["solo"])
+
     def test_position_normalisation_reads_segmented_ax_value(self):
         self.assertEqual(plugins.normalise_logic_position("\t101\t3\t1\t1"), "101.3.1.1")
         self.assertIsNone(plugins.normalise_logic_position("101.3.1"))

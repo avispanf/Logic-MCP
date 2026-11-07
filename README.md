@@ -4,6 +4,10 @@ Logic Pro automation with a verified manual-work switch and one shared MIDI back
 
 **Status: 0.2.0 beta.** Apple Silicon; build target macOS 14+. Logic integration was measured
 on Logic Pro 12.3 / macOS 26. Earlier supported OS builds require device validation.
+Logic 13.0 validation on macOS 26.6 covers transport discovery, stable MCU ports,
+Inspector-verified selection and a restored Limiter gain edit; it is not a complete
+plugin or mix/mastering qualification. Native plugin insertion on Logic 13 remains
+unverified when Logic exposes only a generic slot label, and is rolled back.
 Development packages use ad hoc signing. A stable public download must be Developer ID
 signed and notarized.
 
@@ -54,6 +58,9 @@ control and verifies it; checkboxes are pressed rather than assigned. `plugin_pl
 `plugin_apply` batch edits behind an explicit confirmation. `au_list` and `au_parameters`
 read parameter dictionaries straight from the Audio Unit, so a parameter index is never
 guessed.
+Wrapped Controls values retain their display units during verified writes. Decimal
+commas and Unicode minus signs are accepted; incompatible units or a unit change during
+stepping stop the operation. No display-to-raw unit conversion is guessed.
 
 **Mixer.** `mixer_strips` indexes the channel strips; `mixer_survey` reads name, fader level
 in decibels, pan, mute, solo, clipping state, output bus, sends and insert chain for each.
@@ -85,6 +92,10 @@ A persistent loopback-only HTTP supervisor owns one restartable backend at
 `http://127.0.0.1:8765/mcp`. All plugin/audio MCP tools use a cross-process operation
 lock. The audit runner holds exclusive ownership for its entire run and connects to that
 same HTTP backend; it never creates another MCU namespace.
+The shared backend selects tracks through its registered MCU first. A sent selection
+is not a verified selection: audit operations independently check the exact selected-track
+Inspector name before changing solo, mute or plugin parameters. The standalone core keeps
+its AX-first route, since its private MCU may not be registered in Logic.
 
 For an HTTP-capable MCP client:
 
@@ -220,9 +231,12 @@ code update so its long-running stdio process registers the current tool set.
 
 The companion MCU server used for the verified three-server setup is the patched
 [avispanf/logic-pro-mcp](https://github.com/avispanf/logic-pro-mcp) fork at commit
-`2cb0dfa`. It coalesces overlapping background/explicit AX refreshes, gives the measured
+`7979bc7`. It coalesces overlapping background/explicit AX refreshes, gives the measured
 full-cache operation a bounded 90-second deadline, and returns schema-valid structured
-content even for legacy prose responses. Run it through the shared HTTP bridge described
+content even for legacy prose responses. On Logic 13 it prefers the transport toolbar over
+the other Control Bar group, and rejects non-chooser window titles before scanning chooser
+contents. Track-header discovery stops at the matching container, and mixer discovery
+skips hidden panes, Library rows and channel-strip control subtrees. Run it through the shared HTTP bridge described
 above so all desktop clients use one stable MIDI namespace:
 
 ```toml
@@ -304,10 +318,10 @@ Everything below was established against Logic Pro 12.3 on macOS 26.5, not assum
 be dereferenced inside a `tell process` block; `contents of` fails with -1700. Index
 recursion with bulk per-container property queries works and is what the walker uses.
 
-**Controls view exposes every Audio Unit.** Logic draws the parameter list itself, so
-third-party plugins that render custom interfaces are fully readable and writable while
-that view is active. Instrument editors are the exception: they expose thousands of
-elements and are skipped by a size probe.
+**Controls view exposes host-rendered Audio Unit parameters.** It worked with the tested
+third-party custom interfaces. This does not guarantee every parameter is writable:
+read-only controls or buttons without readable state are refused or left unverified.
+Instrument editors expose thousands of elements and are skipped by a size probe.
 
 **Native editor restoration is orientation-aware.** Apple's Loudness Meter offers
 `Vertical` and `Horizontal` rather than a generic `Editor` menu item. Snapshots preserve
@@ -386,6 +400,16 @@ and overrun any sensible budget. Audio-effect editors are opened automatically f
 verified signal-flow insert; stale strip paths, changed plugin names and ambiguous duplicate
 inserts are refused. Insert order cannot be changed and plugins cannot be removed.
 `ProjectData` is not parsed, so arrangement data comes from a MIDI export.
+Automatic file-project discovery requires one exact Tracks-window/bundle-name match.
+Templates retained in Logic's open file descriptors are never selected by shortest path.
+An unsaved project or ambiguous identity resolves to no project; save it before a file audit.
+
+On Logic 13, some Controls rows can expose a state-less AXButton instead of a readable
+checkbox. Those states are not guessed. Native insertion may expose only `audio plug-in`;
+the verified insertion path rolls it back rather than accepting an unknown plugin.
+MCU feedback can age while stopped even though the ports and registration are intact.
+The health display conservatively reports stale feedback; this alone is not evidence of
+endpoint churn, and each actual write still needs independent readback.
 
 The audit coordinator is deliberately a cross-server state machine: the MCP client must
 execute each returned dispatch and feed its result to `mix_audit_advance`. It cannot call
@@ -427,9 +451,12 @@ LOGIC_MCP_BACKEND="/path/to/patched/LogicProMCP" \\
 LOGIC_MCP_SHARE_DIR="/path/to/core/Scripts" scripts/build_app.sh
 ```
 
-Build provenance: backend source commit `2cb0dfa8b77ac57b64271ffe59558d6023d0bef7`
+Build provenance: backend source commit `7979bc7623c36d2cb911b3baa5c1c0ff98e06ff4`
 from the linked fork. The build workflow compiles this pinned source rather than using an
 unversioned Homebrew binary. The package rejects backends lacking namespace support.
+Native dependency and vendored notices are collected from that exact source checkout.
+If the binary has been moved away from its build tree, set `LOGIC_MCP_BACKEND_SOURCE`
+to the pinned checkout. Missing notices or a different source commit fail packaging.
 `scripts/install.sh` builds and installs a development app with a versioned backup.
 Legacy installer script names delegate to the new installer.
 

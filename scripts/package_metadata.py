@@ -2,9 +2,12 @@
 import hashlib
 import importlib.metadata
 import json
+import os
 from pathlib import Path
 import shutil
+import subprocess
 import sys
+from package_native_licenses import collect_native_licenses, locate_backend_source
 
 app, backend = map(Path, sys.argv[1:3])
 resources = app / 'Contents/Resources'
@@ -35,8 +38,14 @@ else:
     if 'PYTHON SOFTWARE FOUNDATION' not in license_text:
         raise RuntimeError('Unexpected CPython license response')
     target.write_text(license_text)
-manifest = {'version': '0.2.0-beta', 'backend_commit': '2cb0dfa8b77ac57b64271ffe59558d6023d0bef7',
+manifest = {'version': '0.2.0-beta', 'backend_commit': '7979bc7623c36d2cb911b3baa5c1c0ff98e06ff4',
     'backend_sha256': hashlib.sha256(backend.read_bytes()).hexdigest(),
     'python': sys.version, 'architecture': 'arm64', 'minimum_macos': '14.0',
     'packages': sorted(packages, key=lambda row: row['name'].lower())}
+native_source = locate_backend_source(Path(sys.argv[3]), os.environ.get('LOGIC_MCP_BACKEND_SOURCE'))
+native_commit = subprocess.run(['git', '-C', str(native_source), 'rev-parse', 'HEAD'],
+                               capture_output=True, text=True, check=True, timeout=5).stdout.strip()
+if native_commit != manifest['backend_commit']:
+    raise RuntimeError('Native notice checkout does not match the pinned backend commit')
+manifest['native_license_files'] = collect_native_licenses(native_source, resources)
 (resources / 'build-manifest.json').write_text(json.dumps(manifest, indent=2))

@@ -47,7 +47,7 @@ while IFS= read -r -d '' binary; do
   fi
 done < <(find "$app_dir/Contents/Resources" -type f -print0)
 codesign "${executable_sign_args[@]}" "$app_dir/Contents/MacOS/LogicMCPMenuBar"
-"$python_path" "$repo_dir/scripts/package_metadata.py" "$app_dir" "$app_dir/Contents/Resources/bin/LogicProMCP"
+"$python_path" "$repo_dir/scripts/package_metadata.py" "$app_dir" "$app_dir/Contents/Resources/bin/LogicProMCP" "$backend_path"
 codesign "${executable_sign_args[@]}" "$app_dir"
 codesign --verify --deep --strict "$app_dir"
 "$python_path" "$repo_dir/scripts/verify_bundle.py" "$app_dir" --signatures

@@ -15,8 +15,13 @@ jobs:
       - name: Build the pinned, namespaced core
         run: |
           git clone https://github.com/avispanf/logic-pro-mcp.git "$RUNNER_TEMP/core"
-          git -C "$RUNNER_TEMP/core" checkout --detach 2cb0dfa8b77ac57b64271ffe59558d6023d0bef7
+          git -C "$RUNNER_TEMP/core" checkout --detach 7979bc7623c36d2cb911b3baa5c1c0ff98e06ff4
           cd "$RUNNER_TEMP/core"
+          if ! swift test --filter 'testAXLogicProElements|testGetTrackHeaders|testMainWindow|projectChooserProbe|creatorStudioChooser' > "$RUNNER_TEMP/core-discovery-tests.log" 2>&1; then
+            tail -n 100 "$RUNNER_TEMP/core-discovery-tests.log"
+            exit 1
+          fi
+          tail -n 25 "$RUNNER_TEMP/core-discovery-tests.log"
           swift build -c release --product LogicProMCP
       - name: Package development app
         env:

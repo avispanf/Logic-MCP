@@ -15,6 +15,14 @@ from mcp.client.stdio import stdio_client
 async def main():
     bundle = Path(sys.argv[1]).resolve()
     runtime = bundle / 'Contents/Resources/runtime/logic-mcp'
+    resources = bundle / 'Contents/Resources'
+    manifest = json.loads((resources / 'build-manifest.json').read_text())
+    native_notices = manifest.get('native_license_files', [])
+    assert len(native_notices) > 1, 'Native dependency notices must be bundled'
+    for name in native_notices:
+        relative = Path(name)
+        assert not relative.is_absolute() and '..' not in relative.parts
+        assert (resources / relative).is_file(), name
     for args in (['--help'], ['--plugins', '--help'], ['--service', '--help']):
         subprocess.run([str(runtime), *args], check=True, stdout=subprocess.DEVNULL, timeout=10)
     with tempfile.TemporaryDirectory(prefix='Logic MCP Smoke ') as directory:
@@ -55,7 +63,7 @@ async def main():
                 service.kill()
                 service.wait(timeout=3)
             log.close()
-    print('Packaged app: help, 77 tools, manual request rejection and HTTP health verified')
+    print('Packaged app: native notices, help, 77 tools, manual request rejection and HTTP health verified')
 
 
 if __name__ == '__main__':

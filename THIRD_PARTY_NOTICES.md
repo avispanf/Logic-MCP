@@ -1,9 +1,13 @@
 # Third-party components
 
 The packaged backend is built from https://github.com/avispanf/logic-pro-mcp at
-`2cb0dfa8b77ac57b64271ffe59558d6023d0bef7` (upstream: MongLong0214/logic-pro-mcp).
+`7979bc7623c36d2cb911b3baa5c1c0ff98e06ff4` (upstream: MongLong0214/logic-pro-mcp).
 Its MIT notice follows. Python runtime and package notices are retained by the frozen
 distribution; release builds must include their collected license files.
+The build also retains the pinned native checkout's dependency and vendored notices
+under `licenses/Native/`, including notices for its build/test dependencies. The app's
+build manifest lists the collected files. Packaging fails if the matching source
+checkout or dependency notices are missing.
 
 MIT License
 

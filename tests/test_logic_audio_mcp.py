@@ -1,6 +1,26 @@
 import unittest
+from pathlib import Path
+from unittest import mock
 
 import logic_audio_mcp as audio
+import logic_plugins_mcp as plugins
+
+
+class OpenProjectIdentityTests(unittest.TestCase):
+    def test_audio_uses_the_title_verified_project(self):
+        project = Path("/Volumes/Work/Song.logicx")
+        with mock.patch.object(plugins, "find_open_logic_project", return_value=project):
+            self.assertEqual(audio.find_open_project(), project)
+
+    def test_missing_or_ambiguous_identity_does_not_fall_back_to_a_template(self):
+        with mock.patch.object(plugins, "find_open_logic_project", return_value=None), \
+             mock.patch.object(audio.subprocess, "run") as process:
+            self.assertIsNone(audio.find_open_project())
+        process.assert_not_called()
+
+    def test_unreadable_ui_identity_fails_closed(self):
+        with mock.patch.object(plugins, "find_open_logic_project", side_effect=plugins.ProbeError("UI unavailable")):
+            self.assertIsNone(audio.find_open_project())
 
 
 class NamingConventionTests(unittest.TestCase):

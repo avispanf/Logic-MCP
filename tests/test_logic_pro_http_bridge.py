@@ -112,7 +112,7 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
             send_ping=AsyncMock(), call_tool=AsyncMock(side_effect=slow_health))
         @asynccontextmanager
         async def transport(*args):
-            entered.append(True)
+            entered.append(args[0])
             yield None, None
         @asynccontextmanager
         async def session(*args, **kwargs):
@@ -130,6 +130,8 @@ class BridgeTests(unittest.IsolatedAsyncioTestCase):
                     while len(completed) < 2:
                         await asyncio.sleep(.01)
                 self.assertEqual(len(entered), 1)
+                self.assertEqual(entered[0].env["LOGIC_PRO_MCP_MIDI_INSTANCE_ID"], "bridge")
+                self.assertEqual(entered[0].env["LOGIC_PRO_MCP_TRACK_SELECT_MCU_FIRST"], "1")
                 self.assertIs(self.state.session, fake)
                 self.assertIn("preserving", self.state.error)
                 self.assertEqual(self.state.capabilities, {})

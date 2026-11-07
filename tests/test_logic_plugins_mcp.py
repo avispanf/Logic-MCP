@@ -7,6 +7,21 @@ import itertools
 import logic_plugins_mcp as plugins
 
 
+class AppleScriptTimeoutTests(unittest.TestCase):
+    def test_timeout_cancels_process_group_without_guessing_the_cause(self):
+        process = mock.Mock(pid=12345)
+        process.communicate.side_effect = [plugins.subprocess.TimeoutExpired("osascript", 1), ("", "")]
+        with mock.patch.object(plugins.shutil, "which", return_value="/usr/bin/osascript"), \
+             mock.patch.object(plugins.subprocess, "Popen", return_value=process), \
+             mock.patch.object(plugins.os, "getpgid", return_value=12345), \
+             mock.patch.object(plugins.os, "killpg") as kill_group:
+            with self.assertRaisesRegex(plugins.ProbeError, "No write result is verified") as caught:
+                plugins.osa("return 1", timeout=1)
+        process.kill.assert_called_once_with()
+        kill_group.assert_called_once_with(12345, plugins.signal.SIGKILL)
+        self.assertNotIn("is too large", str(caught.exception))
+
+
 class NumberHandlingTests(unittest.TestCase):
     def test_fourcc_preserves_spaces_and_symbols(self):
         self.assertEqual(plugins.fourcc(int.from_bytes(b"aac ", "big")), "aac ")
@@ -62,6 +77,14 @@ class ProjectIdentityTests(unittest.TestCase):
 
 
 class TransportPositionTests(unittest.TestCase):
+    def test_control_bar_scan_never_bulk_reads_container_values(self):
+        script = plugins.walk_script("Logic Pro", 1, 2, 250, 8, root="1", value_roles=("AXCheckBox", "AXSlider"), descend_roles=("AXGroup",))
+        self.assertNotIn("value of every UI element", script)
+        self.assertIn('is in {"AXCheckBox", "AXSlider"}', script)
+        self.assertIn("set end of vs to nextValue", script)
+        self.assertIn('if rr is in {"AXGroup"}', script)
+        self.assertIn("value of every UI element", plugins.walk_script("Logic Pro", 1, 2, 250, 8))
+
     def test_control_bar_is_discovered_without_a_fixed_root_index(self):
         for root_path in ("1", "6", "9"):
             roots = [{"path": root_path, "role": "AXToolbar", "name": "", "description": "toolbar", "value": ""}]
@@ -81,6 +104,18 @@ class TransportPositionTests(unittest.TestCase):
         with mock.patch.object(plugins, "walk_window", return_value=[]):
             with self.assertRaisesRegex(plugins.ProbeError, "not found"):
                 plugins.find_control_bar("Logic Pro", 1)
+
+    def test_logic13_transport_toolbar_wins_over_the_other_control_bar_group(self):
+        roots = [
+            {"path": "1", "role": "AXToolbar", "name": "", "description": "Control Bar", "value": ""},
+            {"path": "7", "role": "AXGroup", "name": "", "description": "Control Bar", "value": ""},
+        ]
+        controls = [{"path": "1." + str(i), "role": "AXCheckBox", "name": label,
+                     "description": "", "value": "0"} for i, label in enumerate(("Play", "Record"), 1)]
+        with mock.patch.object(plugins, "walk_window", side_effect=[roots, controls]) as walk:
+            result = plugins.find_control_bar("Logic Pro", 1)
+        self.assertEqual(result["Play"]["path"], "1.1")
+        self.assertEqual(walk.call_count, 2)
 
     def test_missing_optional_transport_flags_are_unknown_not_false(self):
         controls = {"Play": {"value": "0", "path": "1.1"}, "Record": {"value": "0", "path": "1.2"}}
@@ -1009,6 +1044,48 @@ class PluginWriteSafetyTests(unittest.TestCase):
             expected_plugin="Loudness Meter",
             expected_channel="Stereo Out",
         )
+
+    def test_wrapped_slider_accepts_localized_units_and_unicode_minus(self):
+        displays = iter(["−0,10 dB", "199", "-1,10 dB", "189", "-1,00 dB", "190"])
+        with mock.patch.object(plugins, "resolve_group_control", return_value=("child", "AXSlider")), \
+             mock.patch.object(plugins, "read_value", side_effect=lambda *_: next(displays)), \
+             mock.patch.object(plugins, "osa"), mock.patch.object(plugins, "send_value") as send, \
+             mock.patch.object(plugins.time, "sleep"):
+            result = plugins.write_group_display_control(
+                "Logic Pro", "group", "10.1.1", "-1.00 dB", dry_run=False, max_steps=64)
+        self.assertTrue(result["verified"])
+        self.assertEqual(result["after"], "-1,00 dB")
+        self.assertEqual(result["method"], "calibrated raw stepping")
+        self.assertEqual(send.call_args.args[2], "190")
+
+    def test_wrapped_slider_rejects_incompatible_units_before_any_write(self):
+        for dry_run in (True, False):
+            with self.subTest(dry_run=dry_run), \
+                 mock.patch.object(plugins, "resolve_group_control", return_value=("child", "AXSlider")), \
+                 mock.patch.object(plugins, "read_value", return_value="0.0 dB"), \
+                 mock.patch.object(plugins, "osa") as action, mock.patch.object(plugins, "send_value") as send:
+                result = plugins.write_group_display_control(
+                    "Logic Pro", "group", "10.1.1", "-1 ms", dry_run=dry_run, max_steps=64)
+            self.assertFalse(result["ok"])
+            self.assertFalse(result["write_attempted"])
+            self.assertIn("units are incompatible", result["error"])
+            action.assert_not_called()
+            send.assert_not_called()
+
+    def test_wrapped_slider_stops_when_display_unit_changes(self):
+        displays = iter(["0.0 dB", "200", "-0.5 ms", "195"])
+        with mock.patch.object(plugins, "resolve_group_control", return_value=("child", "AXSlider")), \
+             mock.patch.object(plugins, "read_value", side_effect=lambda *_: next(displays)), \
+             mock.patch.object(plugins, "osa") as action, mock.patch.object(plugins, "send_value") as send, \
+             mock.patch.object(plugins.time, "sleep"):
+            result = plugins.write_group_display_control(
+                "Logic Pro", "group", "10.1.1", "-1 dB", dry_run=False, max_steps=64)
+        self.assertFalse(result["verified"])
+        self.assertTrue(result["write_attempted"])
+        self.assertEqual(result["steps"], 1)
+        self.assertIn("unit changed", result["note"])
+        action.assert_called_once()
+        send.assert_not_called()
 
     def test_wrapped_slider_steps_by_display_not_encoded_raw_value(self):
         displays = iter(["-0.10", "199", "-1.10", "189", "-1.00", "190"])

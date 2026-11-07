@@ -119,9 +119,10 @@ def osa(script: str, timeout: float = 40.0) -> str:
         except subprocess.TimeoutExpired:
             pass
         raise ProbeError(
-            f"osascript exceeded {timeout:.0f}s and was killed. The element tree under "
-            "this branch is too large for Accessibility. Reduce max_depth, target a "
-            "narrower path, or use the MCU channel for mixer-scale data"
+            f"osascript exceeded {timeout:.0f}s and was killed. Logic or System Events "
+            "may be busy, or the Accessibility branch may be too large. No write result "
+            "is verified. Inspect the current state before retrying a mutation; for reads, "
+            "reduce max_depth or target a narrower path"
         )
     if process.returncode != 0:
         raise ProbeError((err or "").strip() or "osascript failed")
@@ -505,30 +506,56 @@ def normalise_number(value: str) -> str:
         return value.strip()
 
 
+def parse_display_value(value: str) -> tuple[float, str] | None:
+    match = re.fullmatch(
+        r"\s*([-+]?\d+(?:[.,]\d+)?)\s*([^\d]*)\s*",
+        str(value).replace("−", "-"),
+    )
+    if not match:
+        return None
+    number = float(match.group(1).replace(",", "."))
+    return (number, match.group(2).strip().casefold()) if math.isfinite(number) else None
+
+
 def values_match(requested: str, observed: str) -> bool:
     if requested == observed:
         return True
     if normalise_number(requested) == normalise_number(observed):
         return True
 
-    def number_and_unit(value):
-        match = re.fullmatch(
-            r"\s*([-+]?\d+(?:[.,]\d+)?)\s*([^\d]*)\s*",
-            str(value),
-        )
-        if not match:
-            return None
-        return float(match.group(1).replace(",", ".")), match.group(2).strip().casefold()
-
-    left, right = number_and_unit(requested), number_and_unit(observed)
+    left, right = parse_display_value(requested), parse_display_value(observed)
     if left is None or right is None:
         return False
     units_compatible = not left[1] or not right[1] or left[1] == right[1]
     return units_compatible and left[0] == right[0]
 
 
-def walk_script(process: str, window: int, max_depth: int, budget: int, seconds: int, root: str = "") -> str:
+def walk_script(
+    process: str,
+    window: int,
+    max_depth: int,
+    budget: int,
+    seconds: int,
+    root: str = "",
+    value_roles: tuple[str, ...] | None = None,
+    descend_roles: tuple[str, ...] | None = None,
+) -> str:
     skip = ", ".join(f'"{r}"' for r in SKIP_DESCENT)
+    descent_condition = (
+        f"rr is not in {{{skip}}}" if descend_roles is None
+        else "rr is in {" + ", ".join(apple_script_string(role) for role in descend_roles) + "}"
+    )
+    if value_roles is None:
+        value_script = "try\nset vs to value of every UI element of parent\nend try\n"
+    else:
+        allowed = ", ".join(apple_script_string(role) for role in value_roles)
+        value_script = (
+            "repeat with valueIndex from 1 to n\n"
+            'set nextValue to ""\n'
+            f"if (item valueIndex of rs) is in {{{allowed}}} then\n"
+            "try\nset nextValue to value of UI element valueIndex of parent\nend try\n"
+            "end if\nset end of vs to nextValue\nend repeat\n"
+        )
     return (
         "global outText\n"
         "global seen\n"
@@ -552,9 +579,7 @@ def walk_script(process: str, window: int, max_depth: int, budget: int, seconds:
         "try\n"
         "set ds to description of every UI element of parent\n"
         "end try\n"
-        "try\n"
-        "set vs to value of every UI element of parent\n"
-        "end try\n"
+        + value_script +
         "repeat with i from 1 to n\n"
         'set rr to ""\n'
         'set nn to ""\n'
@@ -581,7 +606,7 @@ def walk_script(process: str, window: int, max_depth: int, budget: int, seconds:
         "try\n"
         "set rr to (item i of rs) as string\n"
         "end try\n"
-        "if rr is not in {" + skip + "} then\n"
+        "if " + descent_condition + " then\n"
         "try\n"
         'my grab(UI element i of parent, prefix & i & ".", depth + 1, maxDepth)\n'
         "end try\n"
@@ -679,9 +704,11 @@ def walk_window(
     budget: int = 1500,
     seconds: int = 90,
     root: str = "",
+    value_roles: tuple[str, ...] | None = None,
+    descend_roles: tuple[str, ...] | None = None,
 ) -> list[dict]:
     raw = osa(
-        walk_script(process, window, max_depth, budget, seconds, root),
+        walk_script(process, window, max_depth, budget, seconds, root, value_roles, descend_roles),
         timeout=seconds + 15,
     )
     elements = []
@@ -2087,6 +2114,29 @@ def write_group_display_control(
     }
     if values_match(value, before):
         return {"ok": True, "verified": True, "changed": False, **preview, "after": before}
+    discrete = control_role in ("AXCheckBox", "AXRadioButton")
+    current_display, target_display = parse_display_value(before), parse_display_value(value)
+    if not discrete:
+        if current_display is None or target_display is None:
+            return {
+                "ok": False, "verified": False, "write_attempted": False, **preview,
+                "error": "display value is not numeric, so a direction cannot be proven",
+            }
+        if current_display[1] and target_display[1] and current_display[1] != target_display[1]:
+            return {
+                "ok": False, "verified": False, "write_attempted": False, **preview,
+                "error": "display units are incompatible; conversion was not proven",
+            }
+
+    def display_number(text):
+        parsed = parse_display_value(text)
+        if parsed is None:
+            return None
+        for expected in (current_display, target_display):
+            if expected and expected[1] and parsed[1] and expected[1] != parsed[1]:
+                return None
+        return parsed[0]
+
     if dry_run:
         return {
             "ok": True,
@@ -2097,20 +2147,12 @@ def write_group_display_control(
             "write_mode": "display-directed control action",
             "note": "nothing was changed",
         }
-    if control_role in ("AXCheckBox", "AXRadioButton"):
+    if discrete:
         action = "AXPress"
         budget = 3
         control_raw = None
     else:
-        current_number, target_number = as_number(before), as_number(value)
-        if current_number is None or target_number is None:
-            return {
-                "ok": False,
-                "verified": False,
-                "write_attempted": False,
-                **preview,
-                "error": "display value is not numeric, so a direction cannot be proven",
-            }
+        current_number, target_number = current_display[0], target_display[0]
         action = "AXIncrement" if target_number > current_number else "AXDecrement"
         budget = max(1, min(int(max_steps), 256))
         control_raw = read_value(process, control_reference, atomic_preamble)
@@ -2167,11 +2209,11 @@ def write_group_display_control(
             reason = "display stopped moving before the requested value"
             break
         if control_role not in ("AXCheckBox", "AXRadioButton"):
-            previous_number = as_number(previous)
-            observed_number = as_number(observed)
-            target_number = as_number(value)
+            previous_number = display_number(previous)
+            observed_number = display_number(observed)
+            target_number = display_number(value)
             if None in (previous_number, observed_number, target_number):
-                reason = "display stopped being numeric"
+                reason = "display stopped being numeric or its unit changed"
                 break
             crossed = (target_number - previous_number) * (
                 target_number - observed_number
@@ -2664,14 +2706,19 @@ def ax_subtree(
 
 def find_control_bar(process: str, window: int = 0) -> dict:
     window = window or main_window_index(process)
-    roots = walk_window(process, window, 0, budget=200, seconds=5)
-    preferred = [entry for entry in roots if entry["role"] == "AXToolbar"
-                 or "control bar" in (entry["name"] + " " + entry["description"]).lower()]
-    fallback = [entry for entry in roots if entry not in preferred and entry["role"] == "AXGroup"]
-    for candidates in (preferred, fallback):
+    roots = walk_window(process, window, 0, budget=200, seconds=5, value_roles=())
+    toolbars = [entry for entry in roots if entry["role"] == "AXToolbar"]
+    groups = [entry for entry in roots if entry["role"] == "AXGroup"
+              and "control bar" in (entry["name"] + " " + entry["description"]).lower()]
+    fallback = [entry for entry in roots if entry not in groups and entry["role"] == "AXGroup"]
+    for candidates in (toolbars, groups, fallback):
         matches = []
         for root in candidates:
-            elements = walk_window(process, window, 2, root=root["path"], budget=250, seconds=8)
+            elements = walk_window(
+                process, window, 2, root=root["path"], budget=250, seconds=8,
+                value_roles=("AXCheckBox", "AXButton", "AXSlider", "AXTextField", "AXStaticText", "AXPopUpButton"),
+                descend_roles=("AXGroup",),
+            )
             index: dict[str, dict] = {}
             for entry in elements:
                 label = re.split(r"\s{2,}", entry["name"] or entry["description"], maxsplit=1)[0]

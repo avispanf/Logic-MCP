@@ -192,6 +192,7 @@ async def probe_backend(state, timeout=5):
 async def backend_loop(state, args):
     parameters = StdioServerParameters(command=str(Path(args.backend).expanduser().resolve()),
         env={"LOGIC_PRO_MCP_MIDI_INSTANCE_ID": args.instance_id,
+             "LOGIC_PRO_MCP_TRACK_SELECT_MCU_FIRST": "1",
              "LOGIC_MCP_STATE_DIR": str(manual.STATE_DIR),
              "LOGIC_PRO_MCP_SHARE_DIR": args.share_dir})
     while True:

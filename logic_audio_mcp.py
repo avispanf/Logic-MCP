@@ -698,22 +698,11 @@ def logic_pid() -> int | None:
 
 
 def find_open_project() -> Path | None:
-    process_id = logic_pid()
-    if process_id is None:
+    from logic_plugins_mcp import ProbeError, find_open_logic_project
+    try:
+        return find_open_logic_project()
+    except ProbeError:
         return None
-    proc = subprocess.run(
-        ["lsof", "-p", str(process_id), "-Fn"], capture_output=True, text=True
-    )
-    candidates = []
-    for line in proc.stdout.splitlines():
-        if not line.startswith("n"):
-            continue
-        match = re.search(r"^(.*?\.logicx)(/|$)", line[1:])
-        if match:
-            candidates.append(Path(match.group(1)))
-    if not candidates:
-        return None
-    return sorted(set(candidates), key=lambda p: len(str(p)))[0]
 
 
 def alternative_dir(root: Path) -> Path | None:

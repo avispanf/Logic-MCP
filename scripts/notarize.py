@@ -9,9 +9,14 @@ def notarize(archive, profile, label):
     log_path = archive.parent / f'notary-{label}-log.json'
     if result_path.exists() or log_path.exists():
         raise RuntimeError('Notary records already exist; inspect the previous submission instead of submitting it again')
-    result = subprocess.run(['xcrun', 'notarytool', 'submit', str(archive), '--keychain-profile', profile,
-                             '--wait', '--timeout', '20m', '--output-format', 'json'],
-                            capture_output=True, text=True, timeout=1260)
+    try:
+        result = subprocess.run(['xcrun', 'notarytool', 'submit', str(archive), '--keychain-profile', profile,
+                                 '--wait', '--timeout', '20m', '--output-format', 'json'],
+                                capture_output=True, text=True, timeout=1260)
+    except subprocess.TimeoutExpired as exc:
+        output = exc.stdout.decode('utf-8', errors='replace') if isinstance(exc.stdout, bytes) else exc.stdout
+        result_path.write_text(output or json.dumps({'error': 'Submission timed out; inspect notarytool history before retrying'}))
+        raise RuntimeError(f'Submission timed out and may still be processing. Inspect {result_path} and notarytool history before retrying.') from exc
     result_path.write_text(result.stdout or json.dumps({'error': 'notarytool returned no JSON', 'exit_code': result.returncode}))
     try:
         data = json.loads(result.stdout)

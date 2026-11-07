@@ -11,6 +11,11 @@ No public app release has been made yet. The first intended release is
    Mac's login Keychain. Apple Development, Mac Distribution and Developer ID Installer
    are not substitutes. Certificate creation may require the team's Account Holder.
    See [Apple's Developer ID guide](https://developer.apple.com/developer-id/).
+   Full Xcode is optional: alternatively create a CSR with Keychain Access's
+   Certificate Assistant, upload it in the developer portal under Certificates →
+   **Developer ID Application**, and open the downloaded certificate on the same Mac.
+   See [Apple's portal procedure](https://developer.apple.com/help/account/certificates/create-developer-id-certificates)
+   and [CSR instructions](https://developer.apple.com/help/account/certificates/create-a-certificate-signing-request).
 3. In Terminal, run `security find-identity -v -p codesigning`. There must be a valid
    Developer ID Application entry. Its displayed name or SHA-1 identifier is safe to
    provide to the release operator; the private key is not.

@@ -1,5 +1,6 @@
 """Verify a packaged app without connecting to Logic or publishing MIDI ports."""
 import asyncio
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -17,6 +18,10 @@ async def main():
     runtime = bundle / 'Contents/Resources/runtime/logic-mcp'
     resources = bundle / 'Contents/Resources'
     manifest = json.loads((resources / 'build-manifest.json').read_text())
+    notice = manifest['python_third_party_notice']
+    notice_path = Path(notice['path'])
+    assert not notice_path.is_absolute() and '..' not in notice_path.parts
+    assert hashlib.sha256((resources / notice_path).read_bytes()).hexdigest() == notice['sha256']
     native_notices = manifest.get('native_license_files', [])
     assert len(native_notices) > 1, 'Native dependency notices must be bundled'
     for name in native_notices:

@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 from package_native_licenses import collect_native_licenses, locate_backend_source
+from package_python_notices import collect_python_notices
 
 app, backend = map(Path, sys.argv[1:3])
 resources = app / 'Contents/Resources'
@@ -61,4 +62,5 @@ manifest['backend_source_dirty'] = bool(subprocess.check_output(
 if os.environ.get('LOGIC_MCP_NOTARY_PROFILE') and (dirty or manifest['backend_source_dirty']):
     raise RuntimeError('Notarized builds require clean app and backend source checkouts')
 manifest['native_license_files'] = collect_native_licenses(native_source, resources)
+manifest['python_third_party_notice'] = collect_python_notices(resources, '.'.join(map(str, sys.version_info[:3])))
 (resources / 'build-manifest.json').write_text(json.dumps(manifest, indent=2))

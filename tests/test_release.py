@@ -9,6 +9,7 @@ import unittest
 from unittest.mock import patch
 
 from scripts.notarize import notarize
+from scripts.package_python_notices import collect_python_notices
 from scripts.release_draft import create_draft, draft_command
 from scripts.release_preflight import preflight, resolve_identity, validate_configuration
 from scripts.verify_bundle import developer_team, verify_provenance
@@ -16,6 +17,35 @@ from scripts.verify_distribution import ASSETS, verify_checksums, verify_distrib
 
 
 class ReleaseTests(unittest.TestCase):
+    def test_python_notices_use_exact_version_and_reject_unexpected_content(self):
+        from io import BytesIO
+        with tempfile.TemporaryDirectory() as directory:
+            folder = Path(directory)
+            content = b'History and License\nPYTHON SOFTWARE FOUNDATION\nOpenSSL\n'
+            def fetch(url, timeout):
+                self.assertEqual(url, 'https://raw.githubusercontent.com/python/cpython/v3.14.6/Doc/license.rst')
+                return BytesIO(content)
+            notice = collect_python_notices(folder, '3.14.6', fetch)
+            self.assertEqual((folder / notice['path']).read_bytes(), content)
+            self.assertEqual(notice['sha256'], hashlib.sha256(content).hexdigest())
+            with self.assertRaises(RuntimeError):
+                collect_python_notices(folder, '3.14.6', lambda *args, **kwargs: BytesIO(b'<html>Error</html>'))
+            with self.assertRaises(RuntimeError):
+                collect_python_notices(folder, '../main')
+
+    def test_notary_timeout_retains_submission_record_and_prevents_resubmission(self):
+        with tempfile.TemporaryDirectory() as directory:
+            archive = Path(directory) / 'app.zip'
+            with patch('scripts.notarize.subprocess.run', side_effect=subprocess.TimeoutExpired('notarytool', 1260, output=b'{"id":"existing-submission"}')):
+                with self.assertRaisesRegex(RuntimeError, 'may still be processing'):
+                    notarize(archive, 'profile', 'app')
+            saved = json.loads((Path(directory) / 'notary-app-result.json').read_text())
+            self.assertEqual(saved['id'], 'existing-submission')
+            with patch('scripts.notarize.subprocess.run') as run:
+                with self.assertRaises(RuntimeError):
+                    notarize(archive, 'profile', 'app')
+                run.assert_not_called()
+
     @unittest.skipUnless(sys.platform == 'darwin', 'macOS build script')
     def test_actual_release_build_fails_before_creating_output_without_identity(self):
         import os
@@ -170,9 +200,13 @@ class ReleaseTests(unittest.TestCase):
             (resources / 'bin').mkdir()
             (resources / 'runtime/logic-mcp').write_bytes(b'python')
             (resources / 'bin/LogicProMCP').write_bytes(b'native')
+            notice = resources / 'licenses/Python/THIRD-PARTY-LICENSES.rst'
+            notice.parent.mkdir(parents=True)
+            notice.write_bytes(b'notices')
             (bundle / 'Contents/Info.plist').write_bytes(plistlib.dumps({'CFBundleShortVersionString': '0.2.0', 'CFBundleVersion': '9'}))
             data = {'source_commit': 'a' * 40, 'source_dirty': False, 'signing_mode': 'developer-id', 'release_channel': 'beta',
                     'backend_source_dirty': False, 'backend_commit': '7979bc7623c36d2cb911b3baa5c1c0ff98e06ff4',
+                    'python_third_party_notice': {'path': 'licenses/Python/THIRD-PARTY-LICENSES.rst', 'sha256': hashlib.sha256(b'notices').hexdigest()},
                     'version': '0.2.0-beta', 'build': '9', 'runtime_sha256': hashlib.sha256(b'python').hexdigest(),
                     'backend_sha256': hashlib.sha256(b'native').hexdigest()}
             manifest = resources / 'build-manifest.json'
@@ -180,6 +214,7 @@ class ReleaseTests(unittest.TestCase):
             verify_provenance(bundle)
             for field, value in [('source_dirty', True), ('source_dirty', 0), ('source_commit', 'unknown'),
                                  ('backend_source_dirty', True), ('backend_commit', 'different'),
+                                 ('python_third_party_notice', {}),
                                  ('signing_mode', 'ad-hoc'), ('release_channel', 'stable'), ('build', '8'),
                                  ('version', '0.1.0'), ('runtime_sha256', 'wrong'), ('backend_sha256', 'wrong')]:
                 manifest.write_text(json.dumps({**data, field: value}))

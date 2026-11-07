@@ -4,6 +4,9 @@ The packaged backend is built from https://github.com/avispanf/logic-pro-mcp at
 `7979bc7623c36d2cb911b3baa5c1c0ff98e06ff4` (upstream: MongLong0214/logic-pro-mcp).
 Its MIT notice follows. Python runtime and package notices are retained by the frozen
 distribution; release builds must include their collected license files.
+The package additionally retains the exact CPython version's `Doc/license.rst`,
+including its incorporated-software notices (such as OpenSSL), under
+`licenses/Python/THIRD-PARTY-LICENSES.rst`. Its source URL and SHA-256 are in the manifest.
 The build also retains the pinned native checkout's dependency and vendored notices
 under `licenses/Native/`, including notices for its build/test dependencies. The app's
 build manifest lists the collected files. Packaging fails if the matching source

@@ -153,6 +153,10 @@ def verify_provenance(bundle):
                         ('runtime_sha256', resources / 'runtime/logic-mcp')]:
         if hashlib.sha256(path.read_bytes()).hexdigest() != manifest.get(field):
             raise RuntimeError(f'Release provenance hash mismatch: {field}')
+    notice = manifest.get('python_third_party_notice', {})
+    expected_path = 'licenses/Python/THIRD-PARTY-LICENSES.rst'
+    if notice.get('path') != expected_path or hashlib.sha256((resources / expected_path).read_bytes()).hexdigest() != notice.get('sha256'):
+        raise RuntimeError('Missing or mismatched CPython third-party notices')
 
 
 if __name__ == '__main__':

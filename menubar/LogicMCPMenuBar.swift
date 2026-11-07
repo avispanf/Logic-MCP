@@ -7,29 +7,15 @@ private func logError(_ message: String) {
     FileHandle.standardError.write(Data(line.utf8))
 }
 
-private enum SurfaceState: Equatable {
-    case active
-    case bypassed
-    case unavailable(String)
-    case notReady(String)
-    case message(String)
-
-    var commandValue: String {
-        switch self {
-        case .active: return "automatic"
-        case .bypassed: return "manual"
-        case .unavailable(let message): return "unavailable:\(message)"
-        case .notReady(let reason): return "not-ready:\(reason)"
-        case .message(let detail): return detail
-        }
-    }
+private func bundledRuntimeURL() -> URL {
+    Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/runtime/logic-mcp")
 }
 
 private final class LogicSurfaceController: @unchecked Sendable {
     func run(_ command: String) -> SurfaceState {
         let process = Process()
         let pipe = Pipe()
-        let runtime = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/runtime/logic-mcp")
+        let runtime = bundledRuntimeURL()
         let action = command == "diagnose" ? "status" : command
         guard FileManager.default.isExecutableFile(atPath: runtime.path) else {
             return .unavailable("Bundled runtime is missing. Reinstall Logic MCP.")
@@ -44,21 +30,10 @@ private final class LogicSurfaceController: @unchecked Sendable {
             try process.run()
             guard finished.wait(timeout: .now() + 15) == .success else {
                 process.terminate()
-                return .unavailable("Pause helper timed out; state needs verification")
+                return .unavailable("Control helper timed out; mode needs verification")
             }
             let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            guard let result = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  result["verified"] as? Bool == true, process.terminationStatus == 0 else {
-                return .unavailable(String(data: data, encoding: .utf8) ?? "Helper failed")
-            }
-            if command == "diagnose" || command == "setup" || command == "uninstall" || command == "repair" {
-                return .message(String(data: data, encoding: .utf8) ?? "Completed")
-            }
-            switch result["mode"] as? String {
-            case "manual": return .bypassed
-            case "automatic": return result["ready"] as? Bool == true ? .active : .notReady(result["service_state"] as? String ?? "offline")
-            default: return .unavailable("Unknown helper state")
-            }
+            return SurfaceState.decode(data, exitStatus: process.terminationStatus, command: command)
         } catch {
             return .unavailable(error.localizedDescription)
         }
@@ -73,7 +48,8 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     private var overlayButton: NSButton?
     private var timer: Timer?
     private var busy = false
-    private var pendingToggle = false
+    private var pendingCommand: String?
+    private var currentState: SurfaceState = .unavailable("Waiting for the first status check.")
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         guard let button = statusItem.button else { return }
@@ -122,6 +98,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         if NSApp.currentEvent?.type == .rightMouseUp {
             let menu = NSMenu()
             for (title, action) in [("Setup instructions", #selector(showHelp)),
+                                    ("Manual mode — MCP OFF", #selector(pauseAutomation)),
+                                    ("Enable NEW automation", #selector(resumeAutomation)),
+                                    ("Copy MCP client configuration", #selector(copyClientConfiguration)),
+                                    ("Reveal permission helper", #selector(revealPermissionHelper)),
+                                    ("Accessibility settings", #selector(openAccessibility)),
                                     ("Install / repair service", #selector(setupService)),
                                     ("Diagnostics", #selector(diagnose)),
                                     ("Repair manual state", #selector(repair)),
@@ -130,6 +111,7 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                                     ("Quit", #selector(quit))] {
                 let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
                 item.target = self
+                if action == #selector(pauseAutomation), currentState == .bypassed { item.state = .on }
                 menu.addItem(item)
             }
             statusItem.menu = menu
@@ -137,27 +119,54 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             statusItem.menu = nil
             return
         }
-        if busy {
-            pendingToggle = true
-            return
-        }
-        perform("toggle")
+        request("toggle")
     }
 
     @objc private func showHelp() {
         let url = Bundle.main.bundleURL.appendingPathComponent("Contents/Resources/Help.html")
         NSWorkspace.shared.open(url)
     }
-    @objc private func setupService() { perform("setup") }
-    @objc private func diagnose() { perform("diagnose") }
-    @objc private func repair() { perform("repair") }
+    @objc private func pauseAutomation() { request("pause") }
+    @objc private func resumeAutomation() { request("resume") }
+    @objc private func setupService() { request("setup") }
+    @objc private func diagnose() { request("diagnose") }
+    @objc private func repair() { request("repair") }
+    @objc private func revealPermissionHelper() {
+        if let runtime = permissionHelper() { NSWorkspace.shared.activateFileViewerSelecting([runtime]) }
+    }
+    private func permissionHelper() -> URL? {
+        let runtime = bundledRuntimeURL()
+        guard FileManager.default.isExecutableFile(atPath: runtime.path) else {
+            let alert = NSAlert()
+            alert.messageText = "Permission helper is missing"
+            alert.informativeText = "Reinstall the complete Logic MCP.app, then try again."
+            alert.runModal()
+            return nil
+        }
+        return runtime
+    }
+    @objc private func copyClientConfiguration() {
+        guard let runtime = permissionHelper() else { return }
+        do {
+            let text = try MCPClientConfiguration.text(runtimePath: runtime.path)
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(text, forType: .string)
+        } catch {
+            logError(error.localizedDescription)
+        }
+    }
+    @objc private func openAccessibility() {
+        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+            NSWorkspace.shared.open(url)
+        }
+    }
     @objc private func removeService() {
         let alert = NSAlert()
         alert.messageText = "Remove Logic MCP service?"
         alert.informativeText = "Paused automation will be cancelled. The manual barrier is retained. Remove MCP client entries afterwards."
         alert.addButton(withTitle: "Remove service")
         alert.addButton(withTitle: "Cancel")
-        if alert.runModal() == .alertFirstButtonReturn { perform("uninstall") }
+        if alert.runModal() == .alertFirstButtonReturn { request("uninstall") }
     }
     @objc private func toggleOverlay() {
         UserDefaults.standard.set(!UserDefaults.standard.bool(forKey: "hideOverlay"), forKey: "hideOverlay")
@@ -166,14 +175,19 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc private func quit() { NSApp.terminate(nil) }
 
     private func refresh() {
-        updateOverlayVisibility()
         perform("status")
     }
 
-    private func perform(_ command: String) {
+    private func request(_ command: String) {
+        if busy { pendingCommand = command }
+        else { perform(command) }
+    }
+
+    private func perform(_ requestedCommand: String) {
         guard !busy else { return }
+        let command = currentState.safeCommand(requestedCommand)
         busy = true
-        if command != "status" {
+        if command != "status" && command != "diagnose" {
             statusItem.button?.isEnabled = false
             overlayButton?.isEnabled = false
             statusItem.button?.title = "MCP …"
@@ -185,9 +199,20 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.async {
                 guard let self else { return }
                 self.apply(state)
-                if case .message(let detail) = state {
+                if case .message(let notice) = state {
+                    if let observed = notice.state { self.apply(observed) }
                     let alert = NSAlert()
                     alert.messageText = "Logic MCP"
+                    alert.informativeText = notice.message
+                    alert.addButton(withTitle: "Close")
+                    alert.addButton(withTitle: "Copy diagnostics")
+                    if alert.runModal() == .alertSecondButtonReturn {
+                        NSPasteboard.general.clearContents()
+                        NSPasteboard.general.setString(notice.details, forType: .string)
+                    }
+                } else if case .unavailable(let detail) = state, command != "status" {
+                    let alert = NSAlert()
+                    alert.messageText = "Logic MCP needs attention"
                     alert.informativeText = detail
                     alert.runModal()
                 }
@@ -195,9 +220,11 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.overlayButton?.isEnabled = true
                 self.busy = false
                 self.updateOverlayVisibility()
-                if self.pendingToggle {
-                    self.pendingToggle = false
-                    self.perform("toggle")
+                if let pending = self.pendingCommand {
+                    self.pendingCommand = nil
+                    self.perform(pending)
+                } else if case .message = state {
+                    self.perform("status")
                 }
             }
         }
@@ -208,17 +235,16 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
         let logicIsFrontmost = NSWorkspace.shared.frontmostApplication?.bundleIdentifier
             == "com.apple.logic10" || NSWorkspace.shared.frontmostApplication?.bundleIdentifier == "com.apple.mobilelogic"
         guard !UserDefaults.standard.bool(forKey: "hideOverlay"), logicIsFrontmost, let screen = logicScreen() else {
-            panel.orderOut(nil)
+            if panel.isVisible { panel.orderOut(nil) }
             return
         }
         let visible = screen.visibleFrame
-        panel.setFrameOrigin(
-            NSPoint(
+        let origin = NSPoint(
                 x: visible.maxX - panel.frame.width - 14,
                 y: visible.maxY - panel.frame.height - 10
             )
-        )
-        panel.orderFrontRegardless()
+        if panel.frame.origin != origin { panel.setFrameOrigin(origin) }
+        if !panel.isVisible { panel.orderFrontRegardless() }
     }
 
     private func logicScreen() -> NSScreen? {
@@ -263,23 +289,20 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func apply(_ state: SurfaceState) {
         guard let button = statusItem.button else { return }
+        if case .message = state { return }
+        let changed = state != currentState
+        currentState = state
+        button.title = state.title
+        button.toolTip = state.guidance
         switch state {
         case .active:
-            button.title = "MCP ON"
-            button.toolTip = "Automation enabled. Click to pause all Logic MCP workers for manual editing."
             overlayButton?.bezelColor = .systemOrange
         case .bypassed:
-            button.title = "MANUAL · MCP OFF"
-            button.toolTip = "Manual mode verified. Click to cancel paused jobs and allow NEW automation requests."
             overlayButton?.bezelColor = .systemGreen
         case .unavailable(let message):
-            button.title = "MCP CHECK"
-            button.toolTip = "Manual mode could not be verified: \(message)"
             overlayButton?.bezelColor = .systemRed
-            logError(message)
-        case .notReady(let reason):
-            button.title = "MCP · \(reason)"
-            button.toolTip = "Automation is allowed but not ready. Right-click for setup and diagnostics."
+            if changed { logError(message) }
+        case .notReady:
             overlayButton?.bezelColor = .systemOrange
         case .message:
             break

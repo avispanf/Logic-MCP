@@ -1,23 +1,55 @@
-<!doctype html><html lang="en"><meta charset="utf-8"><title>Logic MCP setup</title>
-<style>body{font:17px system-ui;max-width:780px;margin:50px auto;padding:0 24px;line-height:1.6}pre{padding:18px;background:#eee;overflow:auto}h1{font-size:28px}</style>
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Logic MCP setup</title>
+<style>
+:root{font:17px system-ui;line-height:1.6;color-scheme:light dark;--panel:#f1f3f5;--border:#cbd0d7}
+body{max-width:780px;margin:40px auto;padding:0 22px 50px}h1{font-size:30px;line-height:1.2}h2{font-size:22px;margin-top:34px}li{margin:10px 0}code{font-size:.9em;overflow-wrap:anywhere}pre{padding:18px;background:var(--panel);border:1px solid var(--border);border-radius:10px;overflow:auto}.note{padding:14px 18px;border:1px solid var(--border);border-radius:10px;background:var(--panel)}dt{font-weight:650;margin-top:14px}dd{margin-left:0}a{color:LinkText}@media(prefers-color-scheme:dark){:root{--panel:#22262d;--border:#464d58}}
+</style>
 <h1>Logic MCP</h1>
-<p>Move Logic MCP.app into Applications, open it, then choose <b>Install / repair service</b> from its menu. The service runs at login and diagnostics remain available in manual mode.</p>
-<p>Left-click the menu-bar button to switch modes. Right-click for setup and diagnostics. <b>MANUAL · MCP OFF</b> means known workers are stopped and unknown candidates were not detected. Enabling automation cancels paused jobs; start a new task afterwards. Interrupted audits can leave solo/transport settings in their last state: inspect the project before starting another audit.</p>
+<p>One shared backend for Logic Pro, with a manual-work switch. Start with a copy of a project.</p>
+<h2>First installation</h2>
+<ol>
+<li>Move <b>Logic MCP.app</b> into Applications or your user Applications folder and open it.</li>
+<li>Right-click the menu-bar button and choose <b>Install / repair service</b>.</li>
+<li>Choose <b>Reveal permission helper</b>. Finder selects the exact installed <code>logic-mcp</code> executable. Choose <b>Accessibility settings</b> and use <b>+</b> to add that executable. Only you can approve Touch ID or your Mac password.</li>
+<li>Choose <b>Enable NEW automation</b>. Open Logic and approve Automation access to Logic Pro and System Events when macOS requests it.</li>
+<li>In Logic → Control Surfaces → Setup, use one Logic Control / MCU-compatible surface and assign <b>both</b> input and output to <code>LogicProMCP-MCU-Internal [bridge]</code>. Keep unrelated hardware controllers unchanged.</li>
+<li>Open <b>Diagnostics</b>, then connect your MCP client. The first backend connection populates the tool cache. Diagnostics can copy detailed status for troubleshooting.</li>
+</ol>
+<p class="note">For the shared service, Accessibility belongs to <code>Logic MCP.app/Contents/Resources/runtime/logic-mcp</code>. Granting only the menu app or <code>bin/LogicProMCP</code> is not sufficient. The mode button itself needs no Accessibility permission.</p>
 <h2>Connect your MCP client</h2>
-<p>On a fresh installation, enable automation once and wait for Diagnostics to report that the backend is online before connecting your client. This populates the tool cache, which is otherwise empty. Approve macOS permissions when requested, then return to manual mode whenever you want to edit by hand.</p>
-<p>Use a client with Streamable HTTP support. Configure the core server:</p>
+<p>Choose <b>Copy MCP client configuration</b> from the menu. It copies the actual installation path, including a user Applications folder or spaces in the path. The copied example is TOML; use the equivalent fields if your client uses JSON or another format. The core connection requires Streamable HTTP support.</p>
+<p>Example for an app installed in the system Applications folder:</p>
 <pre>[mcp_servers.logic-pro]
 url = "http://127.0.0.1:8765/mcp"
-tool_timeout_sec = 180</pre>
-<p>For plugin inspection and audio analysis, add two STDIO connections. Executable:</p>
-<pre>/Applications/Logic MCP.app/Contents/Resources/runtime/logic-mcp</pre>
-<p>Arguments are <code>["--plugins"]</code> and <code>["--audio"]</code>, respectively. If installed in ~/Applications use that path instead. Restart the client after saving its configuration.</p>
-<h2>Logic and permissions</h2>
-<p>Open Logic. In Control Surfaces → Setup, assign Logic Control input and output to <code>LogicProMCP-MCU-Internal [bridge]</code>. The backend and the client running plugin tools need Accessibility and Automation access to Logic Pro / System Events. Grant these only in macOS System Settings when requested. The mode button itself needs no Accessibility permission.</p>
-<p>Use <b>Diagnostics</b> to check the mode and backend. No open project is changed by the mode button. Start with a copy of a project when testing mixing tools. Numeric meters must actually be readable; unavailable measurements are reported as unavailable.</p>
-<p>The application declares an Apple Events purpose string and its executables carry the automation entitlement. These do not grant permission: only you can approve the request in System Settings. If macOS reports denied access, check Privacy &amp; Security → Accessibility and Automation for the app or MCP host named in the request. A missing bundled runtime requires reinstalling the app; developer scripts are never used as a fallback.</p>
-<p>For the shared login service, Accessibility is attributed to <code>Logic MCP.app/Contents/Resources/runtime/logic-mcp</code>. Adding only <code>bin/LogicProMCP</code> is not sufficient. Ad hoc development updates can invalidate a grant while its switch still looks enabled: remove the old <code>logic-mcp</code> entry, add the installed runtime again, restart the service and verify Diagnostics. Do not reset other applications' permissions.</p>
-<h2>Recovery and removal</h2>
-<p><b>Repair manual state</b> keeps automation blocked and backs up damaged state. <b>Remove service</b> cancels old workers and removes its login service. Remove MCP client entries afterwards, quit this app, then move it to the Trash. Keep project journals for manual recovery of interrupted audits.</p>
-<p>Initial supported distribution: Apple Silicon, macOS 14+, with Logic integration measured on Logic Pro 12.3. Other combinations require validation. Unsigned development builds are for local testing; public stable downloads must be signed and notarized.</p>
+tool_timeout_sec = 180
+
+[mcp_servers.logic-plugins]
+command = "/Applications/Logic MCP.app/Contents/Resources/runtime/logic-mcp"
+args = ["--plugins"]
+
+[mcp_servers.logic-audio]
+command = "/Applications/Logic MCP.app/Contents/Resources/runtime/logic-mcp"
+args = ["--audio"]</pre>
+<p>Reload your client after changing its configuration. End users do not need Python, a compiler, a source checkout or Homebrew for the mode switch and plugin control. Audio-file loudness analysis additionally requires ffmpeg/ffprobe.</p>
+<h2>Everyday use</h2>
+<p>Left-click the top button to switch modes; right-click for explicit <b>Manual mode — MCP OFF</b> and <b>Enable NEW automation</b> actions. The floating button is optional. Turning off the floating button does not disable the service.</p>
+<dl>
+<dt>MANUAL · MCP OFF</dt><dd>Manual mode is verified. New automation requests are rejected. Re-enabling cancels old paused jobs; start a new request.</dd>
+<dt>MCP ON</dt><dd>The latest readiness check passed. Individual edits still require independent readback.</dd>
+<dt>MCP · MCU check</dt><dd>MCU feedback is old. This can happen while stopped and does not by itself mean ports disappeared. Readiness remains unverified. Check the assignments and Logic's Bypass All Control Surfaces setting if commands do not work.</dd>
+<dt>MCP · access / setup MCU / offline</dt><dd>Follow the tooltip and Diagnostics for the missing permission, port assignment or service.</dd>
+<dt>MCP CHECK</dt><dd>The mode could not be verified. A left-click requests manual mode; it does not silently enable automation.</dd>
+</dl>
+<p>The MCU ports disappear in manual mode and return after enabling, keeping stable identities. A change once per mode transition is expected; repeated changes while the mode stays unchanged are not.</p>
+<p class="note">Pausing an audit may interrupt its restoration steps. Inspect solo, mute, transport and plugin settings before starting another task. The button does not change project settings or repair an interrupted mix automatically.</p>
+<h2>Updates, recovery and removal</h2>
+<p>Ad hoc development updates can invalidate an Accessibility grant while its switch still looks enabled. Remove only the old <code>logic-mcp</code> entry, reveal the current helper, add it again, then verify Diagnostics. Do not reset other applications' permissions. A missing bundled runtime requires reinstalling the complete app.</p>
+<p><b>Repair manual state</b> backs up damaged state and keeps automation blocked. <b>Remove service</b> cancels old workers and removes the login service; the manual barrier is deliberately retained. Remove MCP client entries, quit the app and move it to the Trash. Keep audit journals for manual recovery.</p>
+<h2>Scope of the beta</h2>
+<p>Tested on Apple Silicon with macOS 26.6 and Logic Pro 13.0; earlier work used Logic 12.3. The build targets macOS 14+, but runtime validation on that minimum OS is outstanding. No guarantee covers every plugin parameter, instrument, group or analyzer meter. Unreadable states are not guessed.</p>
+<p>Development packages are ad hoc signed. A stable public release still requires Developer ID signing, notarization and a downloaded-build test on a clean Mac.</p>
 </html>

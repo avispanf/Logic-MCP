@@ -27,6 +27,14 @@ behaviour and the remaining release gates.
    `LogicProMCP-MCU-Internal [bridge]` in Logic.
 6. Left-click the button to switch between manual work and automation.
 
+The right-click menu also has explicit **Manual mode — MCP OFF** and **Enable NEW
+automation** actions. **Copy MCP client configuration** uses the actual installed path;
+the copied example is TOML, so adapt it if your client uses another format.
+**Reveal permission helper** selects the correct executable in Finder, and
+**Accessibility settings** opens the matching macOS pane. Permissions still require
+your approval. Diagnostics show an explanation; **Copy diagnostics** copies the full
+helper response only when you choose it.
+
 The package includes Python and the patched backend. End users do not need a compiler,
 a venv, a source checkout, or Homebrew for the mode switch and plugin control. Audio-file
 analysis additionally needs ffmpeg/ffprobe; the audio diagnostics report missing helpers.
@@ -137,6 +145,10 @@ Right-click offers diagnostics, repair, service removal and an overlay preferenc
 `MCP · offline` / `MCP · logic-closed` means automation is allowed but not ready.
 `MCP CHECK` is unverified. The service's `/health` remains reachable in manual mode and
 reports `state=manual`, `ready=false`.
+The compact label **MCP · MCU check** means old feedback, not a confirmed port failure.
+Its tooltip explains idle telemetry and keeps readiness unverified. Technical state
+codes remain available in copied diagnostics. If the mode itself cannot be verified,
+left-clicking **MCP CHECK** requests a pause rather than enabling automation.
 Background ping or diagnostic timeouts do not restart a live backend or recreate its
 MIDI ports. Readiness becomes unverified and the health response explains the timeout;
 the next probe can recover in place. A closed transport still triggers backend recovery.

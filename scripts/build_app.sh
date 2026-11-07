@@ -12,7 +12,7 @@ trap 'rm -rf "$build_dir"' EXIT
 app_dir="$build_dir/Logic MCP.app"
 mkdir -p "$app_dir/Contents/MacOS" "$app_dir/Contents/Resources/bin" "$output_dir"
 xcrun swiftc -parse-as-library -O -target arm64-apple-macos14.0 \
-  -framework AppKit -framework Foundation "$repo_dir/menubar/LogicMCPMenuBar.swift" \
+  -framework AppKit -framework Foundation "$repo_dir/menubar/LogicMCPMenuBar.swift" "$repo_dir/menubar/LogicMCPStatus.swift" \
   -o "$app_dir/Contents/MacOS/LogicMCPMenuBar"
 "$python_path" -m PyInstaller --noconfirm --clean --onedir --name logic-mcp \
   --distpath "$build_dir/frozen" --workpath "$build_dir/work" --specpath "$build_dir" \

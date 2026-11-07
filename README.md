@@ -18,6 +18,8 @@ behaviour and the remaining release gates.
 
 See the [end-user installation guide](docs/INSTALL.md). Maintainers preparing the first
 signed public beta should follow the [release runbook](docs/RELEASING.md).
+The [release readiness record](docs/release-readiness-2026-11-07.md) separates completed
+development checks from signing and signed-candidate runtime checks still outstanding.
 Security/privacy and safe reporting are described in [SECURITY.md](SECURITY.md).
 
 1. Download the app ZIP or DMG from [Releases](https://github.com/avispanf/Logic-MCP/releases)

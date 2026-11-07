@@ -20,7 +20,9 @@ def draft_command(directory, tag, verified):
     commit = manifest.get('source_commit', '')
     if not isinstance(commit, str) or not re.fullmatch(r'[0-9a-f]{40}', commit):
         raise RuntimeError('Missing verified source commit')
-    notes = Path(__file__).resolve().parents[1] / 'docs/release-notes-0.2.0-beta.1.md'
+    notes = Path(__file__).resolve().parents[1] / f'docs/release-notes-{tag[1:]}.md'
+    if not notes.is_file():
+        raise RuntimeError('Version-matched release notes are required before creating a draft')
     return ['gh', 'release', 'create', tag, '--repo', REPOSITORY, '--target', commit,
             '--draft', '--prerelease', '--title', 'Logic MCP ' + tag, '--notes-file', str(notes),
             *[str(directory / name) for name in (*ASSETS, 'SHA256SUMS')]]

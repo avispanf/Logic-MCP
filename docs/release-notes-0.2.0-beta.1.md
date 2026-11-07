@@ -1,8 +1,7 @@
 # Logic MCP 0.2.0 beta 1
 
-First public beta candidate for Apple Silicon. Not a stable release or a guarantee
-of complete automatic mixing/mastering. Publish only after the signed-candidate
-acceptance record in `docs/RELEASING.md` is complete.
+Public beta for Apple Silicon. Not a stable release or a guarantee of complete
+automatic mixing/mastering.
 
 ## Included
 

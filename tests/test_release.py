@@ -100,6 +100,8 @@ class ReleaseTests(unittest.TestCase):
         for tag in ['v0.2.0', 'v0.2.0-beta.0', 'v0.3.0-beta.1', 'v0.2.0-beta.1;anything']:
             with self.subTest(tag=tag), self.assertRaises(RuntimeError):
                 draft_command(directory, tag, verified)
+        with self.assertRaisesRegex(RuntimeError, 'Version-matched release notes'):
+            draft_command(directory, 'v0.2.0-beta.2', verified)
         with patch('scripts.release_draft.subprocess.check_output', return_value='b' * 40), \
                 patch('scripts.release_draft.subprocess.run') as run:
             with self.assertRaisesRegex(RuntimeError, 'pushed'):

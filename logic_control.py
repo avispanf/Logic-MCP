@@ -6,6 +6,7 @@ import functools
 import json
 import os
 import uuid
+import anyio
 import logic_manual_mode as mode
 
 _depth = ContextVar("logic_operation_depth", default=0)
@@ -71,8 +72,14 @@ def transaction():
 
 def guard_tool(fn):
     @functools.wraps(fn)
-    def guarded(*args, **kwargs):
-        with operation():
+    async def guarded(*args, **kwargs):
+        initial = epoch()
+        with operation(expected_epoch=initial):
             with mode.worker_activity():
-                return fn(*args, **kwargs)
+                def invoke():
+                    require_automatic()
+                    if initial != epoch():
+                        raise RuntimeError("Request cancelled by mode transition. Submit a new request.")
+                    return fn(*args, **kwargs)
+                return await anyio.to_thread.run_sync(invoke)
     return guarded

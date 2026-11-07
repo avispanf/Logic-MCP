@@ -25,6 +25,10 @@ enum StatusPresentationTests {
         check(SurfaceState.bypassed.safeCommand("toggle") == "toggle", "Verified manual toggle remains explicit")
         check(SurfaceState.unavailable("timeout").safeCommand("resume") == "resume", "Explicit new automation intent is retained")
         check(SurfaceState.notReady("checking").safeCommand("toggle") == "toggle", "Known automatic mode still pauses normally")
+        let queuedPause = SurfaceState.unavailable("checking").safeCommand("toggle")
+        check(SurfaceState.bypassed.safeCommand(queuedPause) == "pause", "Queued pause intent survives a status refresh")
+        let queuedToggle = SurfaceState.bypassed.safeCommand("toggle")
+        check(SurfaceState.unavailable("timeout").safeCommand(queuedToggle) == "pause", "Queued toggle fails closed if status becomes unverified")
         for reason in ["offline", "logic-closed", "permissions-required", "mcu-setup-required", "mcu-feedback-required", "mcu-feedback-stale", "checking", "future-state"] {
             var value = automatic
             value["ready"] = false

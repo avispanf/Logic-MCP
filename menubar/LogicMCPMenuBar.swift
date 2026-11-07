@@ -179,8 +179,9 @@ private final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func request(_ command: String) {
-        if busy { pendingCommand = command }
-        else { perform(command) }
+        let requested = currentState.safeCommand(command)
+        if busy { pendingCommand = requested }
+        else { perform(requested) }
     }
 
     private func perform(_ requestedCommand: String) {

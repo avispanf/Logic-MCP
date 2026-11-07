@@ -48,6 +48,7 @@ class ManualModeTests(unittest.TestCase):
                     patch.object(mode, 'STATE_DIR', Path(directory)), \
                     patch.object(mode, 'STATE_FILE', Path(directory) / 'state.json'), \
                     patch.object(mode, 'managed', side_effect=lambda cmd: cmd.endswith(token)), \
+                    patch.object(mode, 'managed_argv', side_effect=lambda argv: bool(argv) and argv[-1] == token), \
                     patch.object(mode, 'processes', side_effect=isolated_processes):
                 paused = mode.operate('pause')
                 self.assertTrue(paused['verified'], paused)
@@ -161,9 +162,11 @@ class ManualModeTests(unittest.TestCase):
                     patch.object(mode, 'STATE_DIR', Path(directory)), \
                     patch.object(mode, 'STATE_FILE', Path(directory) / 'state.json'), \
                     patch.object(mode, 'managed', side_effect=lambda cmd: cmd == command), \
+                    patch.object(mode, 'managed_argv', return_value=True), \
                     patch.object(mode, 'processes', side_effect=lambda: {p:r for p,r in original_processes().items() if p == worker.pid}):
-                mode.operate('pause')
-                mode.operate('resume')
+                self.assertTrue(mode.operate('pause')['verified'])
+                self.assertFalse(mode.operate('resume')['verified'])
+                self.assertTrue(mode.STATE_FILE.exists())
                 self.assertIn('T', mode.processes()[worker.pid]['status'])
         finally:
             os.kill(worker.pid, signal.SIGKILL)
